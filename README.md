@@ -8,18 +8,25 @@ However, if you are interested in collaborating/testing, please open an issue.
 While I have tried to make the code work for all, I can only test on my limited
 set of available devices.
 
+Some files contain paths which are hard coded for my personal system. Trying to
+build may result in errors. File paths and names may change from one push to the
+next, as may function prototypes.
+
+I will state this again, this is a work in progress. I've pushed the code for
+the benefit of testers, issue tracking and version control.
+
 structure
 ---------
 
 The code is a collection of kernel modules.
-* lights
+* *lights*  
 This is the main module, which all others depend upon. It exports an interface
 for creating files within the `/dev/lights/` and `/sys/class/lights/` directories.
-* aura
+* *aura*  
 A module for interacting with ASUS AURA devices, including:
-    1. Motherboard (including headers)
-    1. RAM
-    1. GPU
+    + Motherboard (including headers)
+    + RAM
+    + GPU
 * *more to follow*
 
 sysfs
@@ -53,3 +60,8 @@ Once the modules are working without problems, I intend to create a system
 service and GUI application. The service will be able to handle creating extra
 effects which are not natively supported, and handle synchronizing colors
 between devices which may cycle at differing speeds.
+
+Known Issues
+------------
+* Navi GPU's have changed the i2c bus. I am having a difficult time trying to
+figure out the new registers. It may be a while before they are supported.
