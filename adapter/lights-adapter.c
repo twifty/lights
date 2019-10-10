@@ -8,7 +8,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/uaccess.h>
-#include "lights-class.h"
+#include "lights-adapter.h"
 
 #define LIGHTS_ERR(_fmt, ...)\
     pr_err("lights: " _fmt "\n", ##__VA_ARGS__)

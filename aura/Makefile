@@ -1,4 +1,3 @@
-KBUILD_EXTRA_SYMBOLS := /home/owen/Work/kernel/lights/Module.symvers
 CONFIG_MODULE_SIG=n
 CONFIG_STACK_VALIDATION=n
 MODULE_NAME = aura
@@ -21,6 +20,7 @@ SRCS = aura-module.c \
 
 KERNELDIR = /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
+KBUILD_EXTRA_SYMBOLS := $(ADAPTERDIR)/Module.symvers
 OBJS = $(SRCS:.c=.o)
 
 ifeq ($(KERNELRELEASE),)
@@ -29,18 +29,8 @@ all:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -DDEBUG"
 	rm -rf *.o *~ core .depend .*.cmd *.mod.c .tmp_versions
 
-parent:
-	sudo rmmod $(MODULE_NAME).ko || true
-	$(MAKE) -C ../lights install
-
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-
-install: clean all
-	sudo insmod ../lights/lights.ko || true
-	sudo rmmod $(MODULE_NAME).ko || true
-	sudo insmod $(MODULE_NAME).ko
-	rm -rf *.o *~ core .depend .*.cmd *.mod.c .tmp_versions
 
 .PHONY: all clean
 

@@ -17,7 +17,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-#include "../lights/lights-class.h"
+#include "../adapter/lights-adapter.h"
 
 typedef s32 error_t;
 

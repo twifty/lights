@@ -1,7 +1,7 @@
 CONFIG_MODULE_SIG=n
 MODULE_NAME = lights
 
-SRCS = lights-class.c
+SRCS = lights-adapter.c
 
 KERNELDIR = /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
@@ -15,11 +15,6 @@ all:
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-
-install: clean all
-	sudo rmmod $(MODULE_NAME).ko || true
-	sudo insmod $(MODULE_NAME).ko
-	rm -rf *.o *~ core .depend .*.cmd *.mod.c .tmp_versions *.order
 
 .PHONY: all clean
 
