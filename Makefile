@@ -26,7 +26,7 @@ uninstall:
 install: all uninstall
 	sudo insmod build/lights.ko;
 	for module in $(MODULES); do \
-		sudo insmod $$module.ko; \
+		sudo insmod build/$$module.ko; \
 	done
 
 clean:

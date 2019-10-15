@@ -3,7 +3,8 @@ CONFIG_STACK_VALIDATION=n
 MODULE_NAME = aura
 
 SRCS = aura-module.c \
-	aura-controller.c \
+	lib/aura-controller.c \
+	lib/async.c \
 	memory/aura-memory.c \
 	motherboard/aura-smbus-piix4.c \
 	motherboard/aura-smbus-nuvoton.c \
