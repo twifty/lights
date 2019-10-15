@@ -13,7 +13,7 @@ build may result in errors. File paths and names may change from one push to the
 next, as may function prototypes.
 
 I will state this again, this is a work in progress. I've pushed the code for
-the benefit of testers, issue tracking and version control. bar.
+the benefit of testers, issue tracking and version control.
 
 structure
 ---------
@@ -65,3 +65,8 @@ Known Issues
 ------------
 * Navi GPU's have changed the i2c bus. I am having a difficult time trying to
 figure out the new registers. It may be a while before they are supported.
+
+disclaimer
+----------
+Neither I nor any contributer take responsibility for hardware issues or damage
+resulting from the use of this package. The package is provided AS IS.
