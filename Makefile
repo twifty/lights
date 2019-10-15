@@ -3,7 +3,7 @@ export ADAPTERDIR
 MODULES = \
 	aura
 
-.PHONY: all clean adapter install uninstall $(MODULES)
+.PHONY: build clean adapter install uninstall $(MODULES)
 
 adapter:
 	mkdir -p build
@@ -15,7 +15,7 @@ $(MODULES): adapter
 	mv $@/$@.ko build/$@.ko
 
 .DEFAULT_GOAL :=
-all: adapter $(MODULES)
+build: adapter $(MODULES)
 
 uninstall:
 	for module in $(MODULES); do \
@@ -23,7 +23,10 @@ uninstall:
 	done
 	sudo rmmod build/lights.ko || true;
 
-install: all uninstall
+install: uninstall
+	if [[ ! -d build ]]; \
+		then $(MAKE) build; \
+	fi
 	sudo insmod build/lights.ko;
 	for module in $(MODULES); do \
 		sudo insmod build/$$module.ko; \
