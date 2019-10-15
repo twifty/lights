@@ -382,7 +382,7 @@ static int usb_get_zone_count (
         return err;
     }
 
-    if (packet.cmd != PACKET_CMD_CAPS) {
+    if (packet.command != PACKET_CMD_CAPS) {
         AURA_DBG("Unexpected reply while handshaking");
         dump_packet("PACKET_CMD_CAPS: ", &packet);
 
@@ -424,7 +424,7 @@ static error_t usb_get_name (
         return err;
     }
 
-    if (packet.cmd != PACKET_CMD_NAME) {
+    if (packet.command != PACKET_CMD_NAME) {
         AURA_DBG("Unexpected reply while handshaking");
         dump_packet("0xB0 packet: ", &packet);
 
@@ -454,7 +454,7 @@ static error_t usb_detect_oled (
         return err;
     }
 
-    if (packet.cmd != PACKET_CMD_OLED_CAPS) {
+    if (packet.command != PACKET_CMD_OLED_CAPS) {
         AURA_DBG("Unexpected reply while handshaking");
         dump_packet("0x30 packet: ", &packet);
 
@@ -1055,6 +1055,8 @@ static error_t aura_header_speed_read (
     spin_lock_irq(&zone->lock);
     io->data.speed = zone->effect.speed;
     spin_unlock_irq(&zone->lock);
+
+    return 0;
 }
 
 static error_t aura_header_speed_write (

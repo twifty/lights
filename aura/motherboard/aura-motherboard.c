@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "../aura.h"
-#include "../lib/aura-controller.h"
+#include "../trait/aura-controller.h"
 #include "aura-smbus.h"
 
 struct aura_smbus_factory smbus_factory[] = {
