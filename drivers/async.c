@@ -16,6 +16,7 @@ struct async_job {
     struct async_context    *context;
     bool                    unique;
     async_execute           callback;
+    async_free              release;
     void                    *data;
 };
 
@@ -85,7 +86,7 @@ static void __pool_free (
         clear_bit(index, context->pool_usage);
         spin_unlock(&context->lock);
     } else {
-        AURA_ERR("Job index (%ld) out of range", index);
+        LIGHTS_HW_ERR("Job index (%ld) out of range", index);
     }
 
     kref_put(&context->refs, __context_release);
@@ -101,7 +102,7 @@ static void __execute_job (
     while (0 < max_attempts--) {
         switch (context->state) {
             case STATE_IDLE:
-                AURA_ERR("STATE_IDLE detected when running a job");
+                LIGHTS_HW_ERR("STATE_IDLE detected when running a job");
                 // Fall through
             case STATE_CANCELLED:
                 goto free;
@@ -128,13 +129,16 @@ free:
         context->state = STATE_IDLE;
     spin_unlock(&context->lock);
 
+    if (job->release)
+        job->release(job->data);
     __pool_free(job);
 }
 
 static error_t __create_job (
     struct async_context *context,
-    async_execute callback,
     void *data,
+    async_execute callback,
+    async_free release,
     bool unique
 ){
     struct async_job *job;
@@ -146,6 +150,7 @@ static error_t __create_job (
     job->callback = callback;
     job->data = data;
     job->unique = unique;
+    job->release = release;
 
     if (unique)
         atomic_inc(&context->unique_count);
@@ -160,14 +165,14 @@ static error_t __create_job (
         case STATE_PAUSED:
             spin_unlock(&context->lock);
             if (!queue_work(context->queue, &job->work)) {
-                AURA_ERR("Failed to queue work item");
+                LIGHTS_HW_ERR("Failed to queue work item");
                 goto error;
             }
             return 0;
 
         case STATE_CANCELLED:
             spin_unlock(&context->lock);
-            AURA_ERR("Cannot add job to a closed queue");
+            LIGHTS_HW_ERR("Cannot add job to a closed queue");
             goto error;
     }
 
@@ -208,7 +213,7 @@ struct async_queue *async_queue_create (
     context->queue = create_singlethread_workqueue(name);
 
     if (!context->queue) {
-        AURA_ERR("Failed to create (%s) workqueue", name);
+        LIGHTS_HW_ERR("Failed to create (%s) workqueue", name);
         kfree(context->pool_usage);
         kfree(context);
         return NULL;
@@ -289,22 +294,24 @@ void async_queue_resume (
 
 error_t async_queue_add (
     struct async_queue *queue,
+    void *data,
     async_execute callback,
-    void *data
+    async_free release
 ){
     if (WARN_ON(NULL == queue || NULL == callback))
         return -EINVAL;
 
-    return __create_job(context_from_public(queue), callback, data, false);
+    return __create_job(context_from_public(queue), data, callback, release, false);
 }
 
 error_t async_queue_add_unique (
     struct async_queue *queue,
+    void *data,
     async_execute callback,
-    void *data
+    async_free release
 ){
     if (WARN_ON(NULL == queue || NULL == callback))
         return -EINVAL;
 
-    return __create_job(context_from_public(queue), callback, data, true);
+    return __create_job(context_from_public(queue), data, callback, release, true);
 }
