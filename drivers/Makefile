@@ -1,7 +1,10 @@
-CONFIG_MODULE_SIG=n
-MODULE_NAME = lights
+# CONFIG_MODULE_SIG=n
+MODULE_NAME = test
 
-SRCS = lights-adapter.c
+SRCS = \
+	async.c \
+	smbus/piix4.c \
+	smbus/adapter.c
 
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
@@ -10,8 +13,7 @@ OBJS = $(SRCS:.c=.o)
 ifeq ($(KERNELRELEASE),)
 
 all:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -DDEBUG"
-	rm -rf *.o *~ core .depend .*.cmd *.mod.c .tmp_versions *.order
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) EXTRA_CFLAGS="-g -DDEBUG"
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
