@@ -105,6 +105,10 @@ static void __exit aura_module_exit (
 module_init(aura_module_init);
 module_exit(aura_module_exit);
 
+#ifdef MODULE_IMPORT_NS
+MODULE_IMPORT_NS(LIGHTS);
+#endif
+
 MODULE_AUTHOR("Owen Parry <waldermort@gmail.com>");
 MODULE_DESCRIPTION("ASUS AURA SMBus driver");
 MODULE_LICENSE("GPL");

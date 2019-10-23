@@ -28,7 +28,7 @@ ifeq ($(KERNELRELEASE),)
 
 all:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -DDEBUG"
-	rm -rf *.o *~ core .depend .*.cmd *.mod.c .tmp_versions
+	# rm -rf *.o *~ core .depend .*.cmd *.mod *.mod.c .tmp_versions
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
