@@ -38,6 +38,10 @@ static inline void list_swap(struct list_head *entry1, struct list_head *entry2)
 #define is_user_memory access_ok
 #endif
 
+#ifndef EXPORT_SYMBOL_NS_GPL
+#define EXPORT_SYMBOL_NS_GPL(sym, ns) EXPORT_SYMBOL_GPL(sym)
+#endif
+
 #define LIGHTS_FIRST_MINOR          0
 #define LIGHTS_MAX_MINORS           512
 #define LIGHTS_MAX_DEVICES          64
@@ -361,7 +365,7 @@ ssize_t lights_read_color (
 
     return -EINVAL;
 }
-EXPORT_SYMBOL_GPL(lights_read_color);
+EXPORT_SYMBOL_NS_GPL(lights_read_color, LIGHTS);
 
 ssize_t lights_read_mode (
     const char *buffer,
@@ -388,7 +392,7 @@ ssize_t lights_read_mode (
 
     return -EINVAL;
 }
-EXPORT_SYMBOL_GPL(lights_read_mode);
+EXPORT_SYMBOL_NS_GPL(lights_read_mode, LIGHTS);
 
 ssize_t lights_read_speed (
     const char *buffer,
@@ -414,14 +418,14 @@ ssize_t lights_read_speed (
 
     return 1;
 }
-EXPORT_SYMBOL_GPL(lights_read_speed);
+EXPORT_SYMBOL_NS_GPL(lights_read_speed, LIGHTS);
 
 void lights_get_state (
     struct lights_state *state
 ){
     *state = lights_global_state;
 }
-EXPORT_SYMBOL_GPL(lights_get_state);
+EXPORT_SYMBOL_NS_GPL(lights_get_state, LIGHTS);
 
 
 static error_t update_dev_mode (
@@ -1242,7 +1246,7 @@ error_free_intf:
 
     return err;
 }
-EXPORT_SYMBOL_GPL(lights_device_register);
+EXPORT_SYMBOL_NS_GPL(lights_device_register, LIGHTS);
 
 void lights_device_unregister (
     struct lights_dev *lights
@@ -1266,7 +1270,7 @@ void lights_device_unregister (
 
     lights_interface_release(intf);
 }
-EXPORT_SYMBOL_GPL(lights_device_unregister);
+EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
 
 error_t lights_create_file (
     struct lights_dev *dev,
@@ -1294,7 +1298,7 @@ error_t lights_create_file (
 
     return 0;
 }
-EXPORT_SYMBOL_GPL(lights_create_file);
+EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
 
 
 static struct lights_dev lights_global_dev = {
