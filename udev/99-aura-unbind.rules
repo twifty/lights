@@ -1,0 +1,16 @@
+# Unbinds the aura argb motherboard headers from usbhid
+
+ACTION != "add", GOTO="aura_end"
+SUBSYSTEM == "usb", ENV{DEVTYPE} == "usb_interface", DRIVER=="usbhid", GOTO="aura_check"
+GOTO="aura_end"
+
+LABEL="aura_check"
+ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1867", GOTO="aura_unbind"
+ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1872", GOTO="aura_unbind"
+GOTO="aura_end"
+
+LABEL="aura_unbind"
+RUN+="/bin/sh -c 'echo -n %k >/sys%p/driver/unbind'"
+RUN+="/bin/sh -c 'echo -n %k >/sys/bus/usb/drivers/aura-mb-headers/bind'"
+
+LABEL="aura_end"
