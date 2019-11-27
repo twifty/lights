@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/delay.h>
+
+#include <aura/debug.h>
 #include "aura-gpu-reg.h"
 
 #define mmMM_INDEX            0x0000

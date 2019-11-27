@@ -13,5 +13,5 @@ build
 
 aura/usb
 aura/err.h
-aura/dump
+*dump
 drivers/Makefile

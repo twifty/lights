@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "../aura.h"
-#include "../trait/aura-controller.h"
+#include <linux/types.h>
+
+#include <aura/debug.h>
+#include <aura/controller/aura-controller.h>
 
 enum {
     SPD_TYPE_DDR0 = 0x7,
@@ -9,15 +11,36 @@ enum {
     SPD_TYPE_DDR4 = 0xC
 };
 
+/**
+ * struct aura_memory_spd - Data from a DIMM's SPD
+ *
+ * @size:   Size of the SPD
+ * @addr:   Address of the DIMM on the bus
+ * @type:   Type of DIMM (DDR2/3/4)
+ * @slot:   Slot number
+ * @aura:   Address of aura controller on the bus
+ * @offset: Offset into available_addresses
+ */
 struct aura_memory_spd {
     u16     size;
     uint8_t addr;
     uint8_t type;
     uint8_t slot;
-    uint8_t aura;                   /* The bus address of the aura device */
-    uint8_t offset;                 /* The offset into the available_addresses array */
+    uint8_t aura;
+    uint8_t offset;
 };
 
+/**
+ * struct aura_memory_controller - Data for a single DIMM
+ *
+ * @siblings:  Next and prev pointers
+ * @spd:       SPD data
+ * @aura_ctrl: Associated controller
+ * @lights:    Userland access
+ * @version:   Controller version
+ * @led_count: Number of LEDs
+ * @name:      Name as seen in /dev/lights/
+ */
 struct aura_memory_controller {
     struct list_head        siblings;
     struct aura_memory_spd  spd;
@@ -55,19 +78,33 @@ static const uint8_t aura_memory_available_addresses[] = {
 
 static LIST_HEAD(aura_memory_controller_list);
 
-static uint8_t aura_memory_rgb_triplet_exists (
+/**
+ * aura_memory_rgb_triplet_exists() - Checks if a 3 byte triplet is known
+ *
+ * @rgb: 3 bytes
+ *
+ * @return: True or false
+ */
+static bool aura_memory_rgb_triplet_exists (
     uint8_t *rgb
 ){
     const uint8_t *p = aura_memory_rgb_triplets;
 
     for (p = aura_memory_rgb_triplets; *p; p += 3) {
         if (memcmp(p, rgb, 3) == 0)
-            return 1;
+            return true;
     }
 
-    return 0;
+    return false;
 }
 
+/**
+ * aura_memory_create_aura_address() - Creates a bus address based on the SPD
+ *
+ * @node: Controller needing an address
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_create_aura_address (
     struct aura_memory_controller *node
 ){
@@ -94,6 +131,14 @@ static error_t aura_memory_create_aura_address (
 }
 
 
+/**
+ * aura_memory_color_read() - Reads the color of a single zone
+ *
+ * @data: A struct aura_zone
+ * @io:   Buffer to read into
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_color_read (
     void *data,
     struct lights_io *io
@@ -104,6 +149,14 @@ static error_t aura_memory_color_read (
     return aura_controller_get_zone_color(data, &io->data.color);
 }
 
+/**
+ * aura_memory_color_write() - Writes a single zone color
+ *
+ * @data: A struct aura_zone
+ * @io:   Buffer to read from
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_color_write (
     void *data,
     const struct lights_io *io
@@ -114,6 +167,13 @@ static error_t aura_memory_color_write (
     return aura_controller_set_zone_color(data, &io->data.color);
 }
 
+/**
+ * aura_memory_color_update() - Writes a color to all zones on all DIMMS
+ *
+ * @state: Buffer to read from
+ *
+ * @return: Zero or a negative error code
+ */
 static error_t aura_memory_color_update (
     const struct lights_state *state
 ){
@@ -131,6 +191,14 @@ static error_t aura_memory_color_update (
     return 0;
 }
 
+/**
+ * aura_memory_mode_read() - Reads the mode of a single zone
+ *
+ * @data: A struct aura_zone
+ * @io:   Buffer to read into
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_mode_read (
     void *data,
     struct lights_io *io
@@ -141,6 +209,14 @@ static error_t aura_memory_mode_read (
     return aura_controller_get_mode(data, &io->data.mode);
 }
 
+/**
+ * aura_memory_color_write() - Writes a single zone mode
+ *
+ * @data: A struct aura_zone
+ * @io:   Buffer to read from
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_mode_write (
     void *data,
     const struct lights_io *io
@@ -151,6 +227,13 @@ static error_t aura_memory_mode_write (
     return aura_controller_set_mode(data, &io->data.mode);
 }
 
+/**
+ * aura_memory_color_update() - Writes a mode to all zones on all DIMMS
+ *
+ * @state: Buffer to read from
+ *
+ * @return: Zero or a negative error code
+ */
 static error_t aura_memory_mode_update (
     const struct lights_state *state
 ){
@@ -163,6 +246,13 @@ static error_t aura_memory_mode_update (
     return 0;
 }
 
+/**
+ * aura_memory_create_zone() - Creates userland access
+ *
+ * @ctrl: Controller being built
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_create_zone (
     struct aura_memory_controller *ctrl
 ){
@@ -237,70 +327,81 @@ error_unregister:
     return err;
 }
 
-
-static error_t aura_memory_test_address (
-    struct i2c_adapter *adap,
-    uint8_t addr
-){
-    uint8_t data = 0x01;
-    struct i2c_msg msg = {
-        .addr = addr,
-        .flags = 0,
-        .buf = &data,
-        .len = 1
-    };
-
-    if (1 == i2c_transfer(adap, &msg, 1))
-        return 0;
-
-    return -ENODEV;
-}
-
+/**
+ * smbus_read_byte() - Reads a single byte from the bus
+ *
+ * @adapter: Bus adapter
+ * @addr:    Address on the bus
+ * @reg:     Offset into device on the bus
+ * @value:   Buffer to read into
+ *
+ * @return: Error code
+ */
 static error_t smbus_read_byte (
-    struct i2c_adapter *adap,
+    struct i2c_adapter *adapter,
     uint8_t addr,
-    uint8_t offset,
+    uint8_t reg,
     uint8_t *value
 ){
-    int response;
-    struct i2c_client client = {
-        .adapter = adap,
-        .addr = addr
+    error_t err;
+    struct lights_adapter_msg msgs[] = {
+        ADAPTER_READ_BYTE_DATA(reg)
     };
 
-    response = i2c_smbus_read_byte_data(&client, offset);
-    if (response < 0)
-        return response;
+    err = lights_adapter_xfer(&LIGHTS_I2C_CLIENT(adapter, addr, 0), msgs, ARRAY_SIZE(msgs));
+    if (!err)
+        *value = msgs[0].data.byte;
 
-    *value = (response & 0xff);
-
-    return 0;
+    return err;
 }
 
+/**
+ * smbus_write_byte() - Writes a single byte to the bus
+ *
+ * @adapter: Bus adapter
+ * @addr:    Address on the bus
+ * @reg:     Offset into device on the bus
+ * @value:   Value to write
+ *
+ * @return: Error code
+ */
 static error_t smbus_write_byte (
-    struct i2c_adapter *adap,
+    struct i2c_adapter *adapter,
     uint8_t addr,
-    uint8_t offset,
+    uint8_t reg,
     uint8_t value
 ){
-    struct i2c_client client = {
-        .adapter = adap,
-        .addr = addr
+    struct lights_adapter_msg msgs[] = {
+        ADAPTER_WRITE_BYTE_DATA(reg, value)
     };
 
-    return i2c_smbus_write_byte_data(&client, offset, value);
+    return lights_adapter_xfer(&LIGHTS_I2C_CLIENT(adapter, addr, 0), msgs, ARRAY_SIZE(msgs));
 }
 
+/**
+ * aura_memory_create_controller() - Converts SPDs into controllers
+ *
+ * @i2c_adapter: Bus adapter
+ * @spd:         SPD of a single DIMM
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_create_controller (
-    struct i2c_adapter *adap,
+    struct i2c_adapter *i2c_adapter,
     const struct aura_memory_spd *spd
 ){
     struct aura_memory_controller *node;
     struct aura_controller *aura_ctrl;
-    struct i2c_client client = {
-        .adapter = adap,
-        .addr = 0x77
-    };
+    struct lights_adapter_client smbus = LIGHTS_SMBUS_CLIENT(
+        i2c_adapter,
+        0x77,
+        0
+    );
+    struct lights_adapter_client aura = LIGHTS_I2C_CLIENT(
+        i2c_adapter,
+        0,
+        0
+    );
     uint8_t i;
     error_t err;
 
@@ -314,7 +415,7 @@ static error_t aura_memory_create_controller (
     // TODO - Should we use a muxed region?
 
     // Attempt to write a word to 0x80F8
-    err = i2c_smbus_write_word_swapped(&client, 0x00, 0x80F8);
+    err = lights_adapter_xfer(&smbus, &ADAPTER_WRITE_WORD_DATA_SWAPPED(0x00, 0x80F8), 1);
     if (err == 0) {
         AURA_DBG("Loading aura devices");
 
@@ -324,20 +425,21 @@ static error_t aura_memory_create_controller (
                 goto error;
 
             // Register the slot change
-            err = i2c_smbus_write_byte_data(&client, 0x01, node->spd.slot);
+            err = lights_adapter_xfer(&smbus, &ADAPTER_WRITE_BYTE_DATA(0x01, node->spd.slot), 1);
             if (err) {
                 AURA_DBG("Failed to set slot number");
                 continue;
             }
 
             // Test the address
-            err = aura_memory_test_address(adap, node->spd.aura);
+            LIGHTS_I2C_CLIENT_UPDATE(&aura, node->spd.aura);
+            err = lights_adapter_xfer(&aura, &ADAPTER_WRITE_BYTE(0x01), 1);
             if (err == 0) {
                 AURA_DBG("bus address 0x%02x is in use", node->spd.aura);
 
                 // This could happen if only some of the DIMMs were mapped
                 AURA_DBG("Attempting to load aura controller");
-                aura_ctrl = aura_controller_create(adap, node->spd.aura);
+                aura_ctrl = aura_controller_create(&aura);
                 if (IS_ERR(aura_ctrl)) {
                     AURA_DBG("attempt failed with %ld", PTR_ERR(aura_ctrl));
                     continue;
@@ -350,19 +452,20 @@ static error_t aura_memory_create_controller (
         }
 
         // Register the new address
-        err = i2c_smbus_write_word_swapped(&client, 0x00, 0x80F9);
+        err = lights_adapter_xfer(&smbus, &ADAPTER_WRITE_WORD_DATA_SWAPPED(0x00, 0x80F9), 1);
         if (err) {
             AURA_DBG("Failed to register new address");
             goto error;
         }
 
-        err = i2c_smbus_write_byte_data(&client, 0x01, node->spd.aura << 1);
+        err = lights_adapter_xfer(&smbus, &ADAPTER_WRITE_BYTE_DATA(0x01, node->spd.aura << 1), 1);
         if (err) {
             AURA_DBG("Failed to apply new address");
             goto error;
         }
 
-        aura_ctrl = aura_controller_create(adap, node->spd.aura);
+        LIGHTS_I2C_CLIENT_UPDATE(&aura, node->spd.aura);
+        aura_ctrl = aura_controller_create(&aura);
         if (IS_ERR(aura_ctrl)) {
             AURA_DBG("aura_controller_create() failed with %ld", PTR_ERR(aura_ctrl));
             err = PTR_ERR(aura_ctrl);
@@ -381,7 +484,8 @@ static error_t aura_memory_create_controller (
         for (i = 0; i < sizeof(aura_memory_available_addresses); i++) {
             err = aura_memory_create_aura_address(node);
             if (!err) {
-                aura_ctrl = aura_controller_create(adap, node->spd.aura);
+                LIGHTS_I2C_CLIENT_UPDATE(&aura, node->spd.aura);
+                aura_ctrl = aura_controller_create(&aura);
                 if (IS_ERR(aura_ctrl)) {
                     AURA_DBG("aura_controller_create() failed with %ld", PTR_ERR(aura_ctrl));
                     err = PTR_ERR(aura_ctrl);
@@ -412,11 +516,19 @@ error:
     return err;
 }
 
+/**
+ * aura_memory_probe_adapter() - Reads all SPDs and creates a controller for each
+ *
+ * @dev:  Bus
+ * @data: callback data
+ *
+ * @return: Error code
+ */
 static error_t aura_memory_probe_adapter (
     struct device *dev,
     void *data
 ){
-    struct i2c_adapter *adap = to_i2c_adapter(dev);
+    struct i2c_adapter *smbus = to_i2c_adapter(dev);
     struct callback_data *cb_data;
     struct aura_memory_spd spd[16] = {0};
     uint8_t addr, page, size, count, rgb[3], c, i;
@@ -428,24 +540,24 @@ static error_t aura_memory_probe_adapter (
         return cb_data->count;
 
     for (count = 0, addr = 0x50; addr <= 0x5F; addr++) {
-        AURA_DBG("Pinging %s address 0x%02x", adap->name, addr);
+        AURA_DBG("Pinging %s address 0x%02x", smbus->name, addr);
 
         // Select page 0 on all DIMMs
-        err = smbus_write_byte(adap, 0x36, 0x00, 0x00);
+        err = smbus_write_byte(smbus, 0x36, 0x00, 0x00);
         if (err) {
             /* No pager on this bus indicates no DIMMs */
             break;
         }
 
         // Read SPD type
-        err = smbus_read_byte(adap, addr, 0x02, &spd[count].type);
+        err = smbus_read_byte(smbus, addr, 0x02, &spd[count].type);
         if (err) {
             AURA_DBG("Failed to read SPD type");
             continue;
         }
 
         // Read SPD size
-        err = smbus_read_byte(adap, addr, 0x00, &size);
+        err = smbus_read_byte(smbus, addr, 0x00, &size);
         if (err) {
             AURA_DBG("Failed to read SPD size");
             continue;
@@ -482,12 +594,12 @@ static error_t aura_memory_probe_adapter (
         // Select page according to size
         page = spd[i].size >= 0x100 ? 0x37 : 0x36;
         AURA_DBG("Selecting page %d for all DIMMs", page == 0x36 ? 0 : 1);
-        err = smbus_write_byte(adap, page, 0x00, 0x00);
+        err = smbus_write_byte(smbus, page, 0x00, 0x00);
         if (err)
             goto error;
 
         for (c = 0; c < 3; c++ ) {
-            err = smbus_read_byte(adap, spd[i].addr, 0xF0 + c, &rgb[c]);
+            err = smbus_read_byte(smbus, spd[i].addr, 0xF0 + c, &rgb[c]);
             if (err)
                 goto error;
         }
@@ -497,12 +609,12 @@ static error_t aura_memory_probe_adapter (
         // Return to page 1
         if (page == 0x37) {
             AURA_DBG("Selecting page 0 for all DIMMs");
-            smbus_write_byte(adap, 0x36, 0x00, 0x00);
+            smbus_write_byte(smbus, 0x36, 0x00, 0x00);
         }
 
         // Check if they are known values
         if (aura_memory_rgb_triplet_exists(rgb)) {
-            err = aura_memory_create_controller(adap, &spd[i]);
+            err = aura_memory_create_controller(smbus, &spd[i]);
             if (err) {
                 AURA_DBG("aura_memory_create_controller() failed with code %d", err);
                 goto error;
@@ -518,6 +630,13 @@ error:
     return err;
 }
 
+/**
+ * aura_memory_probe() - Entry point
+ *
+ * @state: Initial state to apply to found controllers
+ *
+ * @return: Error code
+ */
 error_t aura_memory_probe (
     const struct lights_state *state
 ){
@@ -539,7 +658,12 @@ error_t aura_memory_probe (
     return err;
 }
 
-void aura_memory_ctrl_destroy (
+/**
+ * aura_memory_ctrl_destroy() - Destroys a single controller
+ *
+ * @ctrl: Controller to destroy
+ */
+static void aura_memory_ctrl_destroy (
     struct aura_memory_controller *ctrl
 ){
     if (ctrl->aura_ctrl)
@@ -549,6 +673,9 @@ void aura_memory_ctrl_destroy (
     kfree(ctrl);
 }
 
+/**
+ * aura_memory_release() - Exit
+ */
 void aura_memory_release (
     void
 ){

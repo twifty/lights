@@ -2,7 +2,9 @@
 #ifndef _UAPI_AURA_GPU_REGISTRY_H
 #define _UAPI_AURA_GPU_REGISTRY_H
 
-#include "../aura.h"
+#include <linux/pci.h>
+#include <linux/types.h>
+#include <include/types.h>
 
 struct reg_fields {
     uint32_t mask;

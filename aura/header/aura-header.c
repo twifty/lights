@@ -7,8 +7,13 @@
  * Authors:
  * Owen Parry <twifty@zoho.com>
  */
+#include <linux/module.h>
+#include <linux/slab.h>
+
+#include <adapter/lights-interface.h>
+#include <aura/debug.h>
+
 #include "usb-driver.h"
-#include "../aura.h"
 
 static uint16_t header_led_count[5] = {60, 60, 60, 60, 60};
 
@@ -114,6 +119,7 @@ static uint8_t get_aura_mode (
     return (uint8_t)aura_mode;
 }
 
+__used
 static const struct lights_mode *get_lights_mode (
     enum aura_header_mode header_mode
 ){
@@ -1071,6 +1077,7 @@ static error_t aura_header_speed_write (
     return zone_set_speed(zone, io->data.speed);
 }
 
+__used
 static error_t aura_header_speed_update (
     const struct lights_state *state
 ){

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/i2c.h>
+#include <linux/delay.h>
+
+#include <aura/debug.h>
 #include "aura-gpu-reg.h"
 #include "aura-gpu-i2c.h"
 #include "asic/asic-registers.h"
@@ -6,7 +10,6 @@
 enum {
     GPU_I2C_TIMEOUT_DELAY    = 1000,
     GPU_I2C_TIMEOUT_INTERVAL = 10,
-
 };
 
 enum aura_i2c_result {
@@ -46,7 +49,7 @@ enum aura_i2c_status {
     DC_I2C_REG_RW_CNTL_STATUS_DMCU_ONLY = 2,
 };
 
-struct aura_i2c_engine {
+struct aura_i2c_context {
     struct aura_reg_service     *reg_service;
     enum aura_asic_type         asic_type;
 
@@ -60,16 +63,14 @@ struct aura_i2c_engine {
     const struct i2c_shift      *shifts;
     const struct i2c_mask       *masks;
 
-    struct i2c_adapter          adapter;
+    struct i2c_adapter          i2c_adapter;
     struct mutex                mutex;
 };
 
-struct aura_i2c_context {
-    struct aura_i2c_service         service;
+#define context_from_adapter(ptr) ( \
+    container_of(ptr, struct aura_i2c_context, i2c_adapter) \
+)
 
-    enum aura_asic_type             asic_type;
-    struct aura_i2c_engine          *engine;
-};
 
 struct aura_i2c_payload {
 	bool       write;
@@ -88,36 +89,35 @@ struct aura_i2c_transaction {
 
 
 static void clear_ack (
-    struct aura_i2c_engine *engine
+    struct aura_i2c_context *context
 ){
-    struct aura_reg_service *reg = engine->reg_service;
+    struct aura_reg_service *reg = context->reg_service;
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_INTERRUPT_CONTROL, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_INTERRUPT_CONTROL, (struct reg_fields[]){
         /*
             Acknowledge bit for GENERIC_I2C_DONE. Write 1 to
             clear interrupt.
          */
-        PIN_FIELDS(engine, GENERIC_I2C_DONE_ACK, 1),
+        PIN_FIELDS(context, GENERIC_I2C_DONE_ACK, 1),
     }, 1);
 }
 
-static struct aura_i2c_engine *open_engine (
+static error_t open_engine (
     struct aura_i2c_context *context
 ){
-    struct aura_i2c_engine *engine = context->engine;
     struct aura_reg_service *reg;
 
-    if (NULL == engine)
-        return NULL;
+    if (IS_NULL(context))
+        return -EINVAL;
 
-    mutex_lock(&engine->mutex);
-    reg = engine->reg_service;
+    mutex_lock(&context->mutex);
+    reg = context->reg_service;
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
         /*
 
          */
-        PIN_FIELDS(engine, GENERIC_I2C_ENABLE, 1),
+        PIN_FIELDS(context, GENERIC_I2C_ENABLE, 1),
     }, 1);
 
     /*
@@ -130,7 +130,7 @@ static struct aura_i2c_engine *open_engine (
         Writing    reg mmOUTPUT_PAYLOAD_CAPABILITY           0
      */
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_PIN_SELECTION, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_PIN_SELECTION, (struct reg_fields[]){
         /*
             GPIO pin selection to use for SCL, if
             GENERIC_I2C_SCL_PIN_SEL ==
@@ -139,24 +139,24 @@ static struct aura_i2c_engine *open_engine (
             TODO: Where do these values come from and are they
                   specific to asic types?
          */
-        PIN_FIELDS(engine, GENERIC_I2C_SCL_PIN_SEL, 0x29),
-        PIN_FIELDS(engine, GENERIC_I2C_SDA_PIN_SEL, 0x28),
+        PIN_FIELDS(context, GENERIC_I2C_SCL_PIN_SEL, 0x29),
+        PIN_FIELDS(context, GENERIC_I2C_SDA_PIN_SEL, 0x28),
     }, 2);
 
     // set_speed(engine, 100);
 
-    return engine;
+    return 0;
 }
 
 static void close_engine (
-    struct aura_i2c_engine *engine
+    struct aura_i2c_context *context
 ){
-    struct aura_reg_service *reg = engine->reg_service;
+    struct aura_reg_service *reg = context->reg_service;
     // struct reg_fields sw_status = PIN_FIELDS(engine, GENERIC_I2C_STATUS, 0);
 
     // set_speed(engine, engine->original_speed);
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_PIN_SELECTION, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_PIN_SELECTION, (struct reg_fields[]){
         /*
             GPIO pin selection to use for SCL, if
             GENERIC_I2C_SCL_PIN_SEL ==
@@ -165,34 +165,34 @@ static void close_engine (
             TODO: Where do these values come from and are they
                   specific to asic types?
          */
-        PIN_FIELDS(engine, GENERIC_I2C_SCL_PIN_SEL, 0),
-        PIN_FIELDS(engine, GENERIC_I2C_SDA_PIN_SEL, 0),
+        PIN_FIELDS(context, GENERIC_I2C_SCL_PIN_SEL, 0),
+        PIN_FIELDS(context, GENERIC_I2C_SDA_PIN_SEL, 0),
     }, 2);
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
         /*
             Reset the controller
          */
-        PIN_FIELDS(engine, GENERIC_I2C_ENABLE, 0),
-        PIN_FIELDS(engine, GENERIC_I2C_SOFT_RESET, 1),
+        PIN_FIELDS(context, GENERIC_I2C_ENABLE, 0),
+        PIN_FIELDS(context, GENERIC_I2C_SOFT_RESET, 1),
     }, 2);
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
         /*
             Clear the reset flag
          */
-        PIN_FIELDS(engine, GENERIC_I2C_SOFT_RESET, 0),
+        PIN_FIELDS(context, GENERIC_I2C_SOFT_RESET, 0),
     }, 1);
 
-    mutex_unlock(&engine->mutex);
+    mutex_unlock(&context->mutex);
 }
 
 
 static bool process_transaction (
-    const struct aura_i2c_engine *engine,
+    const struct aura_i2c_context *context,
     struct aura_i2c_transaction *request
 ){
-    struct aura_reg_service *reg = engine->reg_service;
+    struct aura_reg_service *reg = context->reg_service;
     uint32_t length = request->length;
     uint8_t *buffer = request->data;
     uint32_t value = 0;
@@ -200,7 +200,7 @@ static bool process_transaction (
     /*
         Configure the transaction register
      */
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_TRANSACTION, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_TRANSACTION, (struct reg_fields[]){
         /*
             Read/write indicator for second transaction - set to 0 for
             write, 1 for read. This bit only controls DC_I2C behaviour -
@@ -210,7 +210,7 @@ static bool process_transaction (
              1=READ
             MASK == 0x1
          */
-        PIN_FIELDS(engine, GENERIC_I2C_RW, 0 != (request->action & DCE_I2C_TRANSACTION_ACTION_I2C_READ)),
+        PIN_FIELDS(context, GENERIC_I2C_RW, 0 != (request->action & DCE_I2C_TRANSACTION_ACTION_I2C_READ)),
         /*
             Determines whether the current transfer will stop if a NACK
             is received during the transaction (current transaction
@@ -220,7 +220,7 @@ static bool process_transaction (
              1=STOP ALL TRANSACTIONS, SEND STOP BIT
             MASK == 0x100
          */
-        PIN_FIELDS(engine, GENERIC_I2C_STOP_ON_NACK, 1),
+        PIN_FIELDS(context, GENERIC_I2C_STOP_ON_NACK, 1),
         /*
             Determines whether hardware will send an ACK after the
             last byte on a read in the second transaction.
@@ -228,7 +228,7 @@ static bool process_transaction (
              1=Send ACK
             MASK == 0x200
          */
-        PIN_FIELDS(engine, GENERIC_I2C_ACK_ON_READ, 0),
+        PIN_FIELDS(context, GENERIC_I2C_ACK_ON_READ, 0),
         /*
             Determines whether a start bit will be sent before the
             second transaction
@@ -236,7 +236,7 @@ static bool process_transaction (
              1=START
             MASK == 0x1000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_START, 1),
+        PIN_FIELDS(context, GENERIC_I2C_START, 1),
         /*
             Determines whether a stop bit will be sent after the second
             transaction
@@ -244,13 +244,13 @@ static bool process_transaction (
              1=STOP
             MASK == 0x2000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_STOP, true ? 1 : 0),
+        PIN_FIELDS(context, GENERIC_I2C_STOP, true ? 1 : 0),
         /*
             Byte count for the transaction (excluding the first byte,
             which is usually the address).
            MASK == 0xf0000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_COUNT, length),
+        PIN_FIELDS(context, GENERIC_I2C_COUNT, length),
     }, 6);
 
     /* Write the I2C address and I2C data
@@ -261,7 +261,7 @@ static bool process_transaction (
      * for I2C receive operation, the LSB must be programmed to 1.
      *
      */
-    value = reg_set_ex(reg, engine->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
+    value = reg_set_ex(reg, context->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
         /*
             Select whether buffer access will be a read or write. For
             writes, address auto-increments on write to DC_I2C_DATA.
@@ -271,34 +271,34 @@ static bool process_transaction (
              1=Read
             MASK == 0x1
          */
-        PIN_FIELDS(engine, GENERIC_I2C_DATA_RW, false),
+        PIN_FIELDS(context, GENERIC_I2C_DATA_RW, false),
         /*
             Use to fill or read the generic I2C buffer
             MASK == 0xff00
          */
-        PIN_FIELDS(engine, GENERIC_I2C_DATA, request->address),
+        PIN_FIELDS(context, GENERIC_I2C_DATA, request->address),
         /*
             Use to set index into I2C buffer for next read or current
             write, or to read index of current read or next write. Writable
             only when GENERIC_I2C_INDEX_WRITE=1.
             MASK == 0xf0000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_INDEX, 0),
+        PIN_FIELDS(context, GENERIC_I2C_INDEX, 0),
         /*
             To write index field, set this bit to 1 while writing
             GENERIC_I2C_DATA
             MASK == 0x80000000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_INDEX_WRITE, 1),
+        PIN_FIELDS(context, GENERIC_I2C_INDEX_WRITE, 1),
     }, 4);
 
     if (!(request->action & DCE_I2C_TRANSACTION_ACTION_I2C_READ)) {
         // TODO this should auto increment
         uint8_t index = 1;
         while (length) {
-            reg_set_ex(reg, engine->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
-                PIN_FIELDS(engine, GENERIC_I2C_INDEX, index),
-                PIN_FIELDS(engine, GENERIC_I2C_DATA, *buffer++),
+            reg_set_ex(reg, context->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
+                PIN_FIELDS(context, GENERIC_I2C_INDEX, index),
+                PIN_FIELDS(context, GENERIC_I2C_DATA, *buffer++),
             }, 2);
 
             ++index;
@@ -310,34 +310,34 @@ static bool process_transaction (
 }
 
 static void execute_transaction (
-    const struct aura_i2c_engine *engine
+    const struct aura_i2c_context *context
 ){
-    struct aura_reg_service *reg = engine->reg_service;
+    struct aura_reg_service *reg = context->reg_service;
 
-    reg_update_ex(reg, engine->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
+    reg_update_ex(reg, context->registers->GENERIC_I2C_CONTROL, (struct reg_fields[]){
         /*
             Write 1 to start I2C transfer
          */
-        PIN_FIELDS(engine, GENERIC_I2C_GO, 1),
+        PIN_FIELDS(context, GENERIC_I2C_GO, 1),
     }, 1);
 }
 
 static void process_reply (
-    struct aura_i2c_engine *engine,
+    struct aura_i2c_context *context,
     struct aura_i2c_payload *reply
 ){
-    struct aura_reg_service *reg = engine->reg_service;
+    struct aura_reg_service *reg = context->reg_service;
     uint32_t length = reply->length;
     uint8_t *buffer = reply->data;
     uint8_t index = 1;
     struct reg_fields data[] = {
-        PIN_FIELDS(engine, GENERIC_I2C_INDEX, 1),
-        PIN_FIELDS(engine, GENERIC_I2C_DATA, 0)
+        PIN_FIELDS(context, GENERIC_I2C_INDEX, 1),
+        PIN_FIELDS(context, GENERIC_I2C_DATA, 0)
     };
 
     // AURA_DBG("process_reply");
 
-    reg_set_ex(reg, engine->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
+    reg_set_ex(reg, context->registers->GENERIC_I2C_DATA, 0, (struct reg_fields[]){
         /*
             Select whether buffer access will be a read or write. For
             writes, address auto-increments on write to DC_I2C_DATA.
@@ -346,7 +346,7 @@ static void process_reply (
              0=Write
              1=Read
          */
-        PIN_FIELDS(engine, GENERIC_I2C_DATA_RW, 1),
+        PIN_FIELDS(context, GENERIC_I2C_DATA_RW, 1),
         /*
             Use to set index into I2C buffer for next read or current
             write, or to read index of current read or next write. Writable
@@ -355,13 +355,13 @@ static void process_reply (
 
             Note, the byte at index 0 is the slave_address
          */
-        PIN_FIELDS(engine, GENERIC_I2C_INDEX, 1),
+        PIN_FIELDS(context, GENERIC_I2C_INDEX, 1),
         /*
             To write index field, set this bit to 1 while writing
             GENERIC_I2C_DATA
             MASK == 0x80000000
          */
-        PIN_FIELDS(engine, GENERIC_I2C_INDEX_WRITE, 1),
+        PIN_FIELDS(context, GENERIC_I2C_INDEX_WRITE, 1),
     }, 3);
 
     /*
@@ -374,7 +374,7 @@ static void process_reply (
             The register buffer auto increments. To get its current index
             use DC_I2C_INDEX above
          */
-        reg_get_ex(reg, engine->registers->GENERIC_I2C_DATA, data, 2);
+        reg_get_ex(reg, context->registers->GENERIC_I2C_DATA, data, 2);
         *buffer++ = data[1].value;
 
         --length;
@@ -382,42 +382,42 @@ static void process_reply (
 
     // AURA_DBG("Reading %d bytes: 0x%02x", reply->length, reply->data[0]);
 
-    clear_ack(engine);
+    clear_ack(context);
 }
 
 static enum aura_i2c_result get_channel_status (
-    const struct aura_i2c_engine *engine
+    const struct aura_i2c_context *context
 ){
-    struct aura_reg_service *reg = engine->reg_service;
-    struct reg_fields status = PIN_FIELDS(engine, GENERIC_I2C_STATUS, 0);
-    uint32_t value = reg_get_ex(reg, engine->registers->GENERIC_I2C_STATUS, &status, 1);
+    struct aura_reg_service *reg = context->reg_service;
+    struct reg_fields status = PIN_FIELDS(context, GENERIC_I2C_STATUS, 0);
+    uint32_t value = reg_get_ex(reg, context->registers->GENERIC_I2C_STATUS, &status, 1);
 
     if (status.value || value == 0) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_ENGINE_BUSY");
         return I2C_CHANNEL_OPERATION_ENGINE_BUSY;
     }
 
-    if (value & engine->masks->GENERIC_I2C_STOPPED_ON_NACK) {
+    if (value & context->masks->GENERIC_I2C_STOPPED_ON_NACK) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_NO_RESPONSE");
         return I2C_CHANNEL_OPERATION_NO_RESPONSE;
     }
 
-    if (value & engine->masks->GENERIC_I2C_TIMEOUT) {
+    if (value & context->masks->GENERIC_I2C_TIMEOUT) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_TIMEOUT");
         return I2C_CHANNEL_OPERATION_TIMEOUT;
     }
 
-    if (value & engine->masks->GENERIC_I2C_ABORTED) {
+    if (value & context->masks->GENERIC_I2C_ABORTED) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_FAILED");
         return I2C_CHANNEL_OPERATION_FAILED;
     }
 
-    if (value & engine->masks->GENERIC_I2C_DONE) {
+    if (value & context->masks->GENERIC_I2C_DONE) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_SUCCEEDED");
         return I2C_CHANNEL_OPERATION_SUCCEEDED;
     }
 
-    if (value & engine->masks->GENERIC_I2C_NACK) {
+    if (value & context->masks->GENERIC_I2C_NACK) {
         // AURA_DBG("I2C_CHANNEL_OPERATION_NO_RESPONSE");
         return I2C_CHANNEL_OPERATION_NO_RESPONSE;
     }
@@ -426,42 +426,41 @@ static enum aura_i2c_result get_channel_status (
 }
 
 enum aura_i2c_result poll_engine (
-    struct aura_i2c_engine *engine
+    struct aura_i2c_context *context
 ){
     enum aura_i2c_result result;
-    uint32_t timeout = engine->timeout_interval;
+    uint32_t timeout = context->timeout_interval;
 
     do {
-        result = get_channel_status(engine);
+        result = get_channel_status(context);
         if (result != I2C_CHANNEL_OPERATION_ENGINE_BUSY)
             break;
 
-        udelay(engine->timeout_delay);
+        udelay(context->timeout_delay);
     } while (timeout--);
 
-    clear_ack(engine);
+    clear_ack(context);
 
     return timeout != 0 ? result : I2C_CHANNEL_OPERATION_TIMEOUT;
 }
 
 
 static void submit_transaction (
-    struct aura_i2c_engine *engine,
+    struct aura_i2c_context *context,
     struct aura_i2c_transaction *request
 ){
     request->status = I2C_CHANNEL_OPERATION_SUCCEEDED;
 
-    if (!process_transaction(engine, request)) {
+    if (!process_transaction(context, request)) {
         AURA_DBG("Failed to process transaction");
         return;
     }
 
-    execute_transaction(engine);
+    execute_transaction(context);
 }
 
-
 static bool submit_payload (
-    struct aura_i2c_engine *engine,
+    struct aura_i2c_context *context,
     struct aura_i2c_payload *payload,
     bool middle_of_transaction
 ){
@@ -486,18 +485,18 @@ static bool submit_payload (
     /* obtain timeout value before submitting request */
     // transaction_timeout = calculate_timeout(engine, payload->length + 1);
 
-    submit_transaction(engine, &request);
+    submit_transaction(context, &request);
 
     if ((request.status == I2C_CHANNEL_OPERATION_FAILED) || (request.status == I2C_CHANNEL_OPERATION_ENGINE_BUSY))
         return false;
 
     /* wait until transaction proceed */
-    operation_result = poll_engine(engine);
+    operation_result = poll_engine(context);
 
     /* update transaction status */
     if (operation_result == I2C_CHANNEL_OPERATION_SUCCEEDED) {
         if (!(payload->write))
-            process_reply(engine, payload);
+            process_reply(context, payload);
 
         return true;
     }
@@ -507,22 +506,19 @@ static bool submit_payload (
 
 
 static int aura_gpu_i2c_xfer (
-    struct i2c_adapter *i2c_adap,
+    struct i2c_adapter *i2c_adapter,
     struct i2c_msg *msgs,
     int num
 ){
-    struct aura_i2c_context *context = i2c_get_adapdata(i2c_adap);
-    struct aura_i2c_engine *engine;
+    struct aura_i2c_context *context = i2c_get_adapdata(i2c_adapter);
     struct aura_i2c_payload payload;
     bool mot, result = true;
     int i;
 
-    if (!context)
+    if (IS_NULL(context))
         return -EIO;
 
-    engine = open_engine(context);
-    if (!engine)
-        return -EIO;
+    open_engine(context);
 
     // for (i = 0; i < num; i++) {
     //     if (msgs[i].flags & I2C_M_RD) {
@@ -553,13 +549,13 @@ static int aura_gpu_i2c_xfer (
         payload.length  = msgs[i].len;
         payload.data    = msgs[i].buf;
 
-        if (!submit_payload(engine, &payload, mot)) {
+        if (!submit_payload(context, &payload, mot)) {
             result = false;
             break;
         }
     }
 
-    close_engine(engine);
+    close_engine(context);
 
     return result ? num : -EIO;
 }
@@ -576,192 +572,181 @@ static const struct i2c_algorithm aura_gpu_i2c_algo = {
 };
 
 
-static error_t aura_gpu_i2c_engine_create (
-    struct aura_i2c_context* ctx,
-    struct pci_dev *pci_dev,
-    enum aura_asic_type asic_type,
-    const struct asic_context *ddc_context
+static const struct asic_context* aura_gpu_i2c_get_ddc_context (
+    enum aura_asic_type asic_type
 ){
-    struct aura_reg_service *registry;
-    struct aura_i2c_engine *engine;
-    error_t err;
-
-    engine = kzalloc(sizeof(*engine), GFP_KERNEL);
-    if (!engine)
-        return -ENOMEM;
-
-    registry = aura_gpu_reg_create(pci_dev);
-    if (IS_ERR(registry)) {
-        err = PTR_ERR(registry);
-        goto error_free_engine;
+    switch (asic_type) {
+        case CHIP_POLARIS10:
+        case CHIP_POLARIS11:
+        case CHIP_POLARIS12:
+        case CHIP_VEGAM:
+            return &asic_context_polaris;
+        case CHIP_VEGA10:
+        case CHIP_VEGA12:
+        case CHIP_VEGA20:
+            /*
+             * FIXME -
+             * Vega cards do not currently work
+             */
+            return &asic_context_vega;
+        case CHIP_NAVI10:
+            /*
+                TODO -
+                The GENERIC_I2C_ masks and shifts are not present in the AMDGPU
+                sources. Test if they are the same across asics and place their
+                definitions in gpu-registers.h
+            */
+            return &asic_context_navi;
+        default:
+            return NULL;
     }
-
-    mutex_init(&engine->mutex);
-    engine->asic_type              = asic_type;
-    engine->reg_service            = registry;
-
-    engine->registers              = ddc_context->i2c_registers;
-    engine->masks                  = ddc_context->i2c_masks;
-    engine->shifts                 = ddc_context->i2c_shifts;
-
-    engine->original_speed         = 50;
-    engine->default_speed          = 50;
-    engine->timeout_delay          = GPU_I2C_TIMEOUT_DELAY;
-    engine->timeout_interval       = GPU_I2C_TIMEOUT_INTERVAL;
-
-    engine->adapter.owner          = THIS_MODULE;
-    engine->adapter.class          = I2C_CLASS_DDC;
-    engine->adapter.dev.parent     = aura_dev;
-    engine->adapter.algo           = &aura_gpu_i2c_algo;
-
-    snprintf(engine->adapter.name, sizeof(engine->adapter.name), "AURA GPU adapter");
-    i2c_set_adapdata(&engine->adapter, ctx);
-
-    // TODO - Do we really need to expose this?
-    err = i2c_add_adapter(&engine->adapter);
-    if (err)
-        goto error_free_registry;
-
-    ctx->engine = engine;
-
-    // err = aura_gpu_discover(&engine->adapter);
-    // if (err) {
-    //     AURA_DBG("No chipset found");
-    //     ctx->engine = NULL;
-    //     goto error_free_registry;
-    // }
-
-    ctx->service.adapter = &engine->adapter;
-
-    return err;
-
-error_free_registry:
-    aura_gpu_reg_destroy(registry);
-error_free_engine:
-    kfree(engine);
-
-    return err;
 }
-
-// static error_t aura_gpu_for_each_adapter(
-//     struct device *dev,
-//     void *data
-// ){
-//     struct aura_i2c_context* context = data;
-//     struct i2c_adapter *adapter;
-//
-//     if (context->service.adapter != NULL)
-//         return 0;
-//
-//     if (dev->type == &i2c_adapter_type) {
-//         adapter = to_i2c_adapter(dev);
-//
-//         if (0 == aura_gpu_discover(adapter))
-//             context->service.adapter = adapter;
-//     }
-//
-//     return 0;
-// }
-//
-// static error_t aura_gpu_find_i2c_adapter (
-//     struct aura_i2c_context* context
-// ){
-//     i2c_for_each_dev(context, aura_gpu_for_each_adapter);
-//
-//     if (context->service.adapter == NULL)
-//         return -ENODEV;
-//
-//     return 0;
-// }
 
 static struct aura_i2c_context* aura_gpu_i2c_context_create (
     struct pci_dev *pci_dev,
     enum aura_asic_type asic_type
 ){
-    struct aura_i2c_context *service;
+    struct aura_reg_service *registry;
+    struct aura_i2c_context *context;
+    const struct asic_context *ddc_context;
     error_t err;
 
-    service = kzalloc(sizeof(*service), GFP_KERNEL);
-    if (!service)
+    ddc_context = aura_gpu_i2c_get_ddc_context(asic_type);
+    if (!ddc_context)
+        return ERR_PTR(-ENODEV);
+
+    context = kzalloc(sizeof(*context), GFP_KERNEL);
+    if (!context)
         return ERR_PTR(-ENOMEM);
 
-    /*
-        TODO:
-          The detected i2c_adapter needs matching against the pci_dev for
-          the rare instance when multiple NVIDIA cards are installed.
-     */
-    // err = aura_gpu_find_i2c_adapter(service);
+    registry = aura_gpu_reg_create(pci_dev);
+    if (IS_ERR(registry)) {
+        err = PTR_ERR(registry);
+        goto error_free_context;
+    }
 
-    // if (err) {
-        switch (asic_type) {
-            case CHIP_POLARIS10:
-            case CHIP_POLARIS11:
-            case CHIP_POLARIS12:
-            case CHIP_VEGAM:
-                err = aura_gpu_i2c_engine_create(service, pci_dev, asic_type, &asic_context_polaris);
-                break;
-            case CHIP_VEGA10:
-            case CHIP_VEGA12:
-            case CHIP_VEGA20:
-                err = aura_gpu_i2c_engine_create(service, pci_dev, asic_type, &asic_context_vega);
-                break;
-            case CHIP_NAVI10:
-                /*
-                    TODO -
-                    The GENERIC_I2C_ masks and shifts are not present in the AMDGPU
-                    sources. Test if they are the same across asics and place their
-                    definitions in gpu-registers.h
-                */
-                err = aura_gpu_i2c_engine_create(service, pci_dev, asic_type, &asic_context_navi);
-                // err = -ENODEV;
-                break;
-            default:
-                err = -EINVAL;
-                break;
-        }
-    // }
+    mutex_init(&context->mutex);
+    context->asic_type          = asic_type;
+    context->reg_service        = registry;
 
+    context->registers          = ddc_context->i2c_registers;
+    context->masks              = ddc_context->i2c_masks;
+    context->shifts             = ddc_context->i2c_shifts;
+
+    context->original_speed     = 50;
+    context->default_speed      = 50;
+    context->timeout_delay      = GPU_I2C_TIMEOUT_DELAY;
+    context->timeout_interval   = GPU_I2C_TIMEOUT_INTERVAL;
+
+    context->i2c_adapter.owner  = THIS_MODULE;
+    context->i2c_adapter.class  = I2C_CLASS_DDC;
+    context->i2c_adapter.algo   = &aura_gpu_i2c_algo;
+
+    // TODO: Add a unique number
+    snprintf(context->i2c_adapter.name, sizeof(context->i2c_adapter.name), "AURA GPU adapter");
+    i2c_set_adapdata(&context->i2c_adapter, context);
+
+    // TODO - Do we really need to expose this?
+    err = i2c_add_adapter(&context->i2c_adapter);
     if (err)
-        goto error_free_service;
+        goto error_free_registry;
 
-    return service;
+    return context;
 
-error_free_service:
-    kfree(service);
+error_free_registry:
+    aura_gpu_reg_destroy(registry);
+error_free_context:
+    kfree(context);
+
     return ERR_PTR(err);
 }
 
 
-struct aura_i2c_service *aura_gpu_i2c_create (
-    struct pci_dev *pci_dev,
-    enum aura_asic_type asic_type
+void gpu_adapter_destroy (
+    struct i2c_adapter *i2c_adapter
 ){
-    struct aura_i2c_context *context;
+    struct aura_i2c_context *context = context_from_adapter(i2c_adapter);
 
-    context = aura_gpu_i2c_context_create(pci_dev, asic_type);
+    if (IS_NULL(i2c_adapter))
+        return;
 
-    if (IS_ERR(context))
-        return ERR_CAST(context);
+    AURA_DBG("Destroying '%s'", context->i2c_adapter.name);
 
-
-    return &context->service;
-}
-
-static void aura_gpu_i2c_engine_destroy(
-    struct aura_i2c_engine *engine
-){
-    i2c_del_adapter(&engine->adapter);
-    aura_gpu_reg_destroy(engine->reg_service);
-    kfree(engine);
-}
-
-void aura_gpu_i2c_destroy (
-    struct aura_i2c_service *service
-){
-    struct aura_i2c_context *context = container_of(service, struct aura_i2c_context, service);
-
-    if (context->engine)
-        aura_gpu_i2c_engine_destroy(context->engine);
-
+    i2c_del_adapter(&context->i2c_adapter);
+    aura_gpu_reg_destroy(context->reg_service);
     kfree(context);
+}
+
+struct i2c_adapter *gpu_adapter_create (
+    void
+){
+    struct pci_dev *pci_dev;
+    const struct pci_device_id *match;
+    struct aura_i2c_context *context = NULL;
+
+    /* Handle the case of mixed GPU types */
+    pci_dev = NULL;
+
+    while (NULL != (pci_dev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pci_dev))) {
+        match = pci_match_id(pciidlist, pci_dev);
+        if (match) {
+            AURA_DBG("Detected AURA capable GPU %x:%x", pci_dev->subsystem_vendor, pci_dev->subsystem_device);
+
+            context = aura_gpu_i2c_context_create(pci_dev, match->driver_data);
+            if (!IS_ERR_OR_NULL(context)) {
+                AURA_DBG("Created '%s'", context->i2c_adapter.name);
+                return &context->i2c_adapter;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+int gpu_adapters_create (
+    struct i2c_adapter *i2c_adapters[2],
+    uint8_t count
+){
+    struct pci_dev *pci_dev;
+    const struct pci_device_id *match;
+    struct aura_i2c_context *context = NULL;
+    error_t err;
+    int found;
+
+    if (IS_NULL(i2c_adapters) || IS_FALSE(count == 2))
+        return -EINVAL;
+
+    /* Handle the case of mixed GPU types */
+    pci_dev = NULL;
+    found = 0;
+
+    while (NULL != (pci_dev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pci_dev))) {
+        match = pci_match_id(pciidlist, pci_dev);
+        if (match) {
+            AURA_DBG("Detected AURA capable GPU %x:%x", pci_dev->subsystem_vendor, pci_dev->subsystem_device);
+
+            context = aura_gpu_i2c_context_create(pci_dev, match->driver_data);
+            if (IS_ERR(context)) {
+                err = CLEAR_ERR(context);
+                goto error_free;
+            }
+
+            if (context) {
+                AURA_DBG("Created '%s'", context->i2c_adapter.name);
+                i2c_adapters[found++] = &context->i2c_adapter;
+                if (found >= count)
+                    break;
+            }
+        }
+    }
+
+    return found;
+
+error_free:
+    while (found > 0) {
+        found--;
+        gpu_adapter_destroy(i2c_adapters[found]);
+    }
+
+    return err;
 }

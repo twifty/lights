@@ -1,11 +1,6 @@
 ADAPTERDIR = $(shell pwd)/adapter
 export ADAPTERDIR
 
-KERNEL ?= $(shell uname -r)
-_KERNELDIRS = $(wildcard /lib/modules/${KERNEL}*/build)
-KERNELDIR = $(shell echo $(_KERNELDIRS) | cut -d' ' -f1)
-export KERNELDIR
-
 MODULES = \
 	aura
 
@@ -14,11 +9,11 @@ MODULES = \
 adapter:
 	mkdir -p build
 	$(MAKE) -C adapter all
-	mv adapter/lights.ko build/lights.ko
+	cp adapter/lights.ko build/lights.ko
 
 $(MODULES): adapter
 	$(MAKE) -C $@ all
-	mv $@/$@.ko build/$@.ko
+	cp $@/$@.ko build/$@.ko
 
 .DEFAULT_GOAL :=
 build: adapter $(MODULES)
@@ -29,7 +24,7 @@ uninstall:
 	done
 	sudo rmmod build/lights.ko || true;
 
-install: uninstall
+install: uninstall build
 	if [[ ! -d build ]]; \
 		then $(MAKE) build; \
 	fi
@@ -37,6 +32,12 @@ install: uninstall
 	for module in $(MODULES); do \
 		sudo insmod build/$$module.ko; \
 	done
+
+# reinstall: uninstall build
+# 	sudo insmod build/lights.ko;
+# 	for module in $(MODULES); do \
+# 		sudo insmod build/$$module.ko; \
+# 	done
 
 clean:
 	$(MAKE) -C adapter clean;

@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "aura.h"
+#include <linux/types.h>
+#include <linux/module.h>
+
+#include <aura/debug.h>
+#include <adapter/lights-interface.h>
+
+#include "aura-module.h"
 
 struct device *aura_dev;
 static struct lights_state global_state;
@@ -16,15 +22,7 @@ MODULE_PARM_DESC(argv_color, "A hexadecimal color code, eg. #00FF00");
 MODULE_PARM_DESC(argv_mode, "The name of a color mode");
 MODULE_PARM_DESC(argv_speed, "The speed of the color cycle, 1-5");
 
-static const struct file_operations aura_fops = {
-    .owner = THIS_MODULE,
-};
-
-static struct miscdevice aura_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "aura",
-    .fops  = &aura_fops,
-};
+extern struct lights_mode aura_available_modes[];
 
 static error_t aura_module_load_defaults (
     void
@@ -63,7 +61,7 @@ static void aura_module_probe_all (
     aura_motherboard_probe(&global_state);
     aura_memory_probe(&global_state);
     aura_gpu_probe(&global_state);
-    aura_header_probe(&global_state);
+    // aura_header_probe(&global_state);
 }
 
 static void aura_module_release_all (
@@ -72,19 +70,13 @@ static void aura_module_release_all (
     aura_motherboard_release();
     aura_memory_release();
     aura_gpu_release();
-    aura_header_release();
+    // aura_header_release();
 }
 
 static int __init aura_module_init (
     void
 ){
     int err;
-
-    err = misc_register(&aura_misc);
-    if (err)
-        return err;
-
-    aura_dev = aura_misc.this_device;
 
     err = aura_module_load_defaults();
     if (err)
@@ -99,7 +91,6 @@ static void __exit aura_module_exit (
     void
 ){
     aura_module_release_all();
-    misc_deregister(&aura_misc);
 }
 
 module_init(aura_module_init);

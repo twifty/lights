@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "aura-smbus.h"
+#include <linux/delay.h>
+#include <linux/i2c.h>
+#include <linux/pci.h>
+
+#include "../debug.h"
 
 /* SB800 constants */
 #define SB800_PIIX4_SMB_IDX     0xcd6
@@ -34,28 +38,33 @@
  * register a pci_driver, because someone else might
  * want to register another driver on the same PCI id.
  */
-static const struct pci_device_id aura_smbus_piix4_tbl[] = {
+static const struct pci_device_id smbus_piix4_tbl[] = {
     { PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_KERNCZ_SMBUS) }, // 0x1022 0x790b
     { 0, },            /* End of list */
 };
-MODULE_DEVICE_TABLE(pci, aura_smbus_piix4_tbl);
+// MODULE_DEVICE_TABLE(pci, smbus_piix4_tbl);
 
-struct aura_smbus_context {
-    struct aura_smbus_adapter   smbus_adapter;
-    uint16_t                    smba;
-    struct i2c_adapter          adapter;
+/**
+ * struct smbus_context - Storage for smbus access
+ *
+ * @smbus_adapter: data expected by the read/write functions
+ * @adapter:       access to the smbus
+ * @smba:          address of the smbus
+ */
+struct smbus_context {
+    struct i2c_adapter      adapter;
+    uint16_t                smba;
 };
+#define ctx_from_adapter(ptr)( \
+    container_of(ptr, struct smbus_context, adapter) \
+)
 
-#define smbus_context(ptr)\
-    container_of(ptr, struct aura_smbus_context, smbus_adapter)
-
-static error_t aura_smbus_piix4_transaction (
-    struct i2c_adapter *adapter
+static int smbus_piix4_transaction (
+    struct i2c_adapter *adapter,
+    uint16_t smba
 ){
-    struct aura_smbus_context *ctx = i2c_get_adapdata(adapter);
-    uint16_t smba = ctx->smba;
     int temp;
-    error_t result = 0;
+    int result = 0;
     int timeout = 0;
 
     /* Make sure the SMBus host is ready to start transmitting */
@@ -113,18 +122,24 @@ static error_t aura_smbus_piix4_transaction (
     return result;
 }
 
-static error_t aura_smbus_piix4_transfer (
-    struct i2c_adapter * adapter,
+static int smbus_piix4_transfer (
+    struct i2c_adapter *adapter,
     uint16_t addr,
     uint16_t flags,
     char read_write,
     uint8_t command,
     int size,
-    union i2c_smbus_data * data
+    union i2c_smbus_data *data
 ){
-    struct aura_smbus_context *ctx = i2c_get_adapdata(adapter);
-    uint16_t smba = ctx->smba;
+    struct smbus_context *context;
+    uint16_t smba;
     int i, len, status;
+
+    if (IS_NULL(adapter))
+        return -ENODEV;
+
+    context = i2c_get_adapdata(adapter);
+    smba = context->smba;
 
     switch (size) {
     case I2C_SMBUS_QUICK:
@@ -174,13 +189,12 @@ static error_t aura_smbus_piix4_transfer (
 
     outb_p((size & 0x1C) + (ENABLE_INT9 & 1), SMBHSTCNT);
 
-    status = aura_smbus_piix4_transaction(adapter);
+    status = smbus_piix4_transaction(adapter, smba);
     if (status)
         return status;
 
     if ((read_write == I2C_SMBUS_WRITE) || (size == PIIX4_QUICK))
         return 0;
-
 
     switch (size) {
     case PIIX4_BYTE:
@@ -203,7 +217,7 @@ static error_t aura_smbus_piix4_transfer (
     return 0;
 }
 
-static uint32_t aura_smbus_piix4_func (
+static uint32_t smbus_piix4_func (
     struct i2c_adapter *adapter
 ){
     return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
@@ -211,15 +225,15 @@ static uint32_t aura_smbus_piix4_func (
         I2C_FUNC_SMBUS_BLOCK_DATA;
 }
 
-static const struct i2c_algorithm aura_smbus_piix4_algorithm = {
-    .smbus_xfer    = aura_smbus_piix4_transfer,
-    .functionality = aura_smbus_piix4_func,
+static const struct i2c_algorithm smbus_piix4_algorithm = {
+    .smbus_xfer    = smbus_piix4_transfer,
+    .functionality = smbus_piix4_func,
 };
 
-static struct aura_smbus_context *aura_smbus_piix4_context_create (
+static struct smbus_context *smbus_piix4_context_create (
     struct pci_dev *pci_dev
 ){
-    struct aura_smbus_context *ctx;
+    struct smbus_context *context;
     uint16_t smba;
     uint8_t  smba_en_lo, smba_en_hi, smb_en, smb_en_status;
 
@@ -232,7 +246,7 @@ static struct aura_smbus_context *aura_smbus_piix4_context_create (
         smb_en = 0x28;
 
     if (!request_muxed_region(SB800_PIIX4_SMB_IDX, 2, MUXED_NAME)) {
-        AURA_ERR("SMB base address index region 0x%x already in use.", SB800_PIIX4_SMB_IDX);
+        LIGHTS_ERR("SMB base address index region 0x%x already in use.", SB800_PIIX4_SMB_IDX);
         return ERR_PTR(-EBUSY);
     }
 
@@ -252,45 +266,55 @@ static struct aura_smbus_context *aura_smbus_piix4_context_create (
     }
 
     if (!smb_en_status) {
-        AURA_ERR("SMBus Host Controller not enabled!");
+        LIGHTS_ERR("SMBus Host Controller not enabled!");
         return ERR_PTR(-ENODEV);
     }
 
     if (acpi_check_region(smba, SMBIOSIZE, "piix4_smbus"))
         return ERR_PTR(-ENODEV);
 
-    AURA_INFO("Auxiliary SMBus Host Controller at 0x%x", smba);
-
-    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx)
+    context = kzalloc(sizeof(*context), GFP_KERNEL);
+    if (!context)
         return ERR_PTR(-ENOMEM);
 
-    ctx->smba = smba;
+    context->smba = smba;
 
-    return ctx;
+    return context;
 }
 
 
-static void aura_smbus_piix4_adapter_destroy (
-    struct aura_smbus_adapter *smbus_adapter
-){
-    struct aura_smbus_context *context = smbus_context(smbus_adapter);
+#ifndef EXPORT_SYMBOL_NS_GPL
+#define EXPORT_SYMBOL_NS_GPL(_sym, _ns) EXPORT_SYMBOL_GPL(_sym)
+#endif
 
+void piix4_adapter_destroy (
+    struct i2c_adapter *adap
+){
+    struct smbus_context *context = ctx_from_adapter(adap);
+
+    if (IS_NULL(adap))
+        return;
+
+    LIGHTS_DBG("Releasing I2C adapter '%s'", context->adapter.name);
+
+    i2c_set_adapdata(&context->adapter, NULL);
     i2c_del_adapter(&context->adapter);
+
     kfree(context);
 }
+EXPORT_SYMBOL_NS_GPL(piix4_adapter_destroy, LIGHTS);
 
-struct aura_smbus_adapter *aura_smbus_piix4_adapter_create (
+struct i2c_adapter *piix4_adapter_create (
     void
 ){
-    struct aura_smbus_context *context;
+    struct smbus_context *context;
     struct pci_dev *pci_dev = NULL;
     bool found = false;
-    error_t err;
+    int err;
 
     /* Match the PCI device */
     for_each_pci_dev(pci_dev) {
-        if (pci_match_id(aura_smbus_piix4_tbl, pci_dev) != NULL) {
+        if (pci_match_id(smbus_piix4_tbl, pci_dev) != NULL) {
             found = true;
             break;
         }
@@ -299,13 +323,13 @@ struct aura_smbus_adapter *aura_smbus_piix4_adapter_create (
     if (!found)
         return ERR_PTR(-ENODEV);
 
-    context = aura_smbus_piix4_context_create(pci_dev);
+    context = smbus_piix4_context_create(pci_dev);
     if (IS_ERR(context))
         return ERR_CAST(context);
 
     context->adapter.owner = THIS_MODULE;
     context->adapter.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
-    context->adapter.algo  = &aura_smbus_piix4_algorithm;
+    context->adapter.algo  = &smbus_piix4_algorithm;
     context->adapter.dev.parent = &pci_dev->dev;
 
     snprintf(context->adapter.name, sizeof(context->adapter.name),
@@ -319,8 +343,8 @@ struct aura_smbus_adapter *aura_smbus_piix4_adapter_create (
         return ERR_PTR(err);
     }
 
-    context->smbus_adapter.adapter = &context->adapter;
-    context->smbus_adapter.destroy = aura_smbus_piix4_adapter_destroy;
+    LIGHTS_INFO("Created I2C adapter '%s'", context->adapter.name);
 
-    return &context->smbus_adapter;
+    return &context->adapter;
 }
+EXPORT_SYMBOL_NS_GPL(piix4_adapter_create, LIGHTS);

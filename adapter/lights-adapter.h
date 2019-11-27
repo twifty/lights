@@ -1,332 +1,273 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_LIGHTS_H
-#define _UAPI_LIGHTS_H
+#ifndef _UAPI_DRIVER_SMBUS_ADAPTER_H
+#define _UAPI_DRIVER_SMBUS_ADAPTER_H
 
-#include <linux/types.h>
-#include <linux/fs.h>
+#include <linux/module.h>
+#include <linux/i2c.h>
 
-typedef s32 error_t;
+#include <include/quirks.h>
+#include <include/types.h>
 
-#define LIGHTS_MAX_FILENAME_LENGTH  64
-#define LIGHTS_MAX_MODENAME_LENGTH  32
+struct lights_adapter_msg;
 
-#define LIGHTS_IO_MODE  "mode"
-#define LIGHTS_IO_COLOR "color"
-#define LIGHTS_IO_SPEED "speed"
-#define LIGHTS_IO_LEDS  "leds"
+typedef void (*lights_adapter_done_t) (struct lights_adapter_msg const * const result, void *data, error_t error);
 
-/*
-    These ids represent common modes supported by a majority
-    of devices. A third party may extend upon these by using
-    the hi byte. Modes are considered equal if the low byte
-    id is equal (disregards string) OR hi byte id is equal
-    AND string name is equal (case sensitive).
- */
-enum lights_mode_id {
-    LIGHTS_MODE_ENDOFARRAY   = 0x0000, /* The last item of an array should be a zeroed object*/
-    LIGHTS_MODE_OFF          = 0x0001,
-    LIGHTS_MODE_STATIC       = 0x0002,
-    LIGHTS_MODE_BREATHING    = 0x0003,
-    LIGHTS_MODE_FLASHING     = 0x0004,
-    LIGHTS_MODE_CYCLE        = 0x0005,
-    LIGHTS_MODE_RAINBOW      = 0x0006,
+/* Used to sanity check while loops */
+#define LIGHTS_ADAPTER_MAX_MSGS 32
+
+enum lights_adapter_flags {
+    LIGHTS_CLIENT_PEC           = I2C_CLIENT_PEC,           /* Use Packet Error Checking */
+    LIGHTS_CLIENT_TEN           = I2C_CLIENT_TEN,           /* we have a ten bit chip address */
+    LIGHTS_CLIENT_SLAVE         = I2C_CLIENT_SLAVE,	        /* we are the slave */
+    LIGHTS_CLIENT_HOST_NOTIFY   = I2C_CLIENT_HOST_NOTIFY,   /* We want to use I2C host notify */
+    LIGHTS_CLIENT_WAKE          = I2C_CLIENT_WAKE,	        /* for board_info; true iff can wake */
+    LIGHTS_CLIENT_SCCB          = I2C_CLIENT_SCCB,          /* Use Omnivision SCCB protocol */
 };
 
-#define LIGHTS_MODE_LABEL_OFF       "off"
-#define LIGHTS_MODE_LABEL_STATIC    "static"
-#define LIGHTS_MODE_LABEL_BREATHING "breathing"
-#define LIGHTS_MODE_LABEL_FLASHING  "flashing"
-#define LIGHTS_MODE_LABEL_CYCLE     "cycle"
-#define LIGHTS_MODE_LABEL_RAINBOW   "rainbow"
-
-#define LIGHTS_MODE(_name)\
-    { .id = LIGHTS_MODE_ ## _name, .name = LIGHTS_MODE_LABEL_ ## _name }
-
-#define LIGHTS_CUSTOM_MODE(_id, _name)\
-    { .id = ((_id & 0xff) << 8), .name = _name }
-
-#define LIGHTS_MODE_LAST_ENTRY()\
-    { .id = LIGHTS_MODE_ENDOFARRAY }
-
-#define lights_is_custom_mode(mode)\
-    ((mode)->id & 0xff00)
-
-#define lights_custom_mode_id(mode)\
-    (((mode)->id & 0xff00) >> 8)
-
-#define lights_mode_id(mode)\
-    ((mode)->id & 0xff)
-
-#define lights_for_each_mode(p, a)                      \
-    for (p = a;                                         \
-         p->id != LIGHTS_MODE_ENDOFARRAY && p->name;    \
-         p++)
-
-/**
- * struct lights_color - Storage for 3 color values
- *
- * @r: The red value
- * @g: The green value
- * @b: The blue value
- */
-struct lights_color {
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
+enum lights_adapter_msg_type {
+    MSG_QUICK       = I2C_SMBUS_QUICK,      /* 0 */
+    MSG_BYTE        = I2C_SMBUS_BYTE,       /* 1 */
+    MSG_BYTE_DATA   = I2C_SMBUS_BYTE_DATA,  /* 2 */
+    MSG_WORD_DATA   = I2C_SMBUS_WORD_DATA,  /* 3 */
+    MSG_BLOCK_DATA  = I2C_SMBUS_BLOCK_DATA, /* 5 */
 };
 
-#define lights_color_equal(p1, p2)\
-    ((p1)->r == (p2)->r && (p1)->g == (p2)->g && (p1)->b == (p2)->b)
-
-/**
- * struct lights_mode
- *
- * @id:   The numeric value of the mode.
- * @name: max LIGHTS_MAX_MODENAME_LENGTH, snake_case name of the mode.
- *
- * Global values (defined within this module) use the lo byte.
- * All third party extensions must use the hi byte.
- */
-struct lights_mode {
-    uint16_t    id;
-    const char  *name;
-};
-
-#define lights_mode_equal(p1, p2)\
-    ((p1)->id == (p2)->id)
-
-struct lights_buffer {
-    ssize_t         length;
-    uint8_t         *data;
-    loff_t          offset;
+enum lights_adapter_protocol {
+    LIGHTS_PROTOCOL_SMBUS = 1,
+    LIGHTS_PROTOCOL_I2C   = 2,
+    LIGHTS_PROTOCOL_USB   = 3,
 };
 
 /**
- * struct lights_state
+ * struct lights_adapter - Storage for hardware access
  *
- * @color: The global color value.
- * @mode:  The global mode value.
- * @speed: The global speed value. This value ranges from 1 to 5 each
- *         representing how a second is to be divided.
+ * @proto:        One of the LIGHTS_PROTOCOL_ constants
+ * @i2c_client:   I2C access data
+ * @smbus_client: SMBUS access data
+ * @adapter:      Async access data
+ *
+ * An instance of this may be created on the stack and used with
+ * calls to @lights_adapter_xfer. However, @lights_adapter_xfer_asyns
+ * calls will fail if the object has not been initialized with
+ * @lights_adapter_register.
  */
-struct lights_state {
-    struct lights_color     color;
-    struct lights_mode      mode;
-    uint8_t                 speed;
+struct lights_adapter_client {
+    enum lights_adapter_protocol proto;
+    union {
+        struct i2c_client i2c_client;
+        struct i2c_client smbus_client;
+    };
+    struct lights_adapter_context *adapter;
 };
-
-enum lights_io_type {
-    LIGHTS_TYPE_CUSTOM, /* Used for third party defined read/write */
-    LIGHTS_TYPE_MODE,
-    LIGHTS_TYPE_COLOR,
-    LIGHTS_TYPE_SPEED,
-    LIGHTS_TYPE_LEDS, /* A raw array of RGB color codes */
-};
+#define LIGHTS_I2C_CLIENT(_adapter, _addr, _flags) \
+(struct lights_adapter_client){ \
+    .proto = LIGHTS_PROTOCOL_I2C, \
+    .i2c_client = { \
+        .adapter = (_adapter), \
+        .addr = (_addr), \
+        .flags = (_flags) \
+    } \
+}
+#define LIGHTS_I2C_CLIENT_UPDATE(_client, _addr) ( \
+    (_client)->i2c_client.addr = (_addr) \
+)
+#define LIGHTS_SMBUS_CLIENT(_adapter, _addr, _flags) \
+(struct lights_adapter_client){ \
+     .proto = LIGHTS_PROTOCOL_SMBUS, \
+     .smbus_client = { \
+         .adapter = (_adapter), \
+         .addr = (_addr), \
+         .flags = (_flags) \
+     } \
+ }
+#define LIGHTS_SMBUS_CLIENT_UPDATE(_client, _addr) ( \
+    (_client)->smbus_client.addr = (_addr) \
+)
 
 /**
- * struct lights_io - Used during read/write callbacks.
- * @type:       Indicates which of the data members is in use.
- * @data.color: A color value being read from or written to the file.
- * @data.mode:  A mode value being read from or written to the file.
- * @data.speed: A speed value being read from or written to the file.
- * @data.raw:   The raw data, in kernel space.
+ * lights_adapter_xfer() - Synchronous reads/writes
  *
- * NOTE - LIGHTS_TYPE_LEDS uses the raw buffer. The size of the buffer
- * is dependant on the led_count member of lights_dev
+ * @client:    Hardware parameters
+ * @msgs:      One or more messages to send
+ * @msg_count: Number of messages to send
+ *
+ * @return: Zero or a negative error code
+ *
+ * There is no need to call @lights_adapter_register before using
+ * this function.
  */
-struct lights_io {
-    enum lights_io_type         type;
+error_t lights_adapter_xfer (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msgs,
+    size_t msg_count
+);
+
+/**
+ * lights_adapter_xfer_async() - Asynchronous reads/writes
+ *
+ * @client:    Hardware parameters
+ * @msgs:      One or more messages to send
+ * @msg_count: Number of messages to send
+ * @cb_data:   Second parameter of @callback
+ * @callback:  Completion function
+ *
+ * @return: Zero or a negative error code
+ *
+ * The async messages are queued until any running synchronous code
+ * completes. Those blocking calls are then paused. Order of completion
+ * for both async and sync is defined by whichever thread is given
+ * the mutex lock.
+ */
+error_t lights_adapter_xfer_async (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msgs,
+    size_t msg_count,
+    void *cb_data,
+    lights_adapter_done_t callback
+);
+
+/**
+ * lights_adapter_unregister() - Releases an async adapter
+ *
+ * @client: The client which holds the adapter
+ *
+ * See @lights_context_adapter_create for more info
+ */
+void lights_adapter_unregister (
+    struct lights_adapter_client *client
+);
+
+/**
+ * lights_context_adapter_create - Associates an I2C/SMBUS adapter
+ *
+ * @i2c_adapter: The adapter being wrapped
+ * @max_async:   A maximum number of pending jobs
+ *
+ * @return: Zero or a negative error number
+ *
+ * This function MUST be called for any @lights_adapter_xfer_async
+ * calls to succeed. It will create a reference counted adapter tied
+ * to the underlying i2c/smbus/usb adapter. The reference to the adapter
+ * is then stored in the given client.
+ *
+ * This was done so that clients can be created on the stack and hardware
+ * probed without the need to allocate memory. One a bus has been validated
+ * to contain the relevent device, the caller may then setup full async
+ * access to the device.
+ *
+ * The actual async allocations are done on the first call to
+ * @lights_adapter_xfer_async.
+ *
+ * Each call to @lights_adapter_register must be paired with a call to
+ * @lights_adapter_unregister.
+ */
+error_t lights_adapter_register (
+    struct lights_adapter_client *client,
+    size_t max_async
+);
+
+/**
+ * struct adapter_msg - I2c/SMBUS message data
+ *
+ * @read:    Truthy read/write
+ * @command: Required for SMBUS transactions
+ * @type:    One of the I2C_SMBUS_ constants
+ * @length:  Only required for I2C_SMBUS_BLOCK_DATA
+ * @swapped: Only for I2C_SMBUS_WORD_DATA
+ * @data:    The value being sent between caller and hardware
+ * @next:    The next message value
+ */
+struct lights_adapter_msg {
+    u8      read;
+    u8      command;
+    u8      type;
+    u8      length;
+    u8      swapped;
 
     union {
-        struct lights_color     color;
-        struct lights_mode      mode;
-        uint8_t                 speed;
-        struct lights_buffer    raw;
-    } data;
+        u8  byte;
+        u16 word;
+        u8  block[I2C_SMBUS_BLOCK_MAX];
+    }       data;
+
+    struct lights_adapter_msg *next;
 };
 
 /**
- * struct lights_io_attribute - Specifies how a file is to be created.
+ * adapter_seek_msg - Access linked list as an array
  *
- * @owner:        The owning module (THIS_MODULE).
- * @attr:         Specifies the name and mode of a file.
- * @type:         Specifies how data written/read is translated.
- * @private_data: A user defined pointer to data associated with the file.
- * @read:         Called to populate the io object.
- * @write:        Called with populated io.
+ * @head:  First linked list item
+ * @index: Message offset from the head
  *
- * The @private_data member is passed to the callbacks. This allows
- * for extensions to associate arbitrary data with each file.
+ * @return: The message or NULL if index doesn't exist
  */
-struct lights_io_attribute {
-    struct module           *owner;
-    struct attribute        attr;
-    enum lights_io_type     type;
-    void                    *private_data;
+static inline struct lights_adapter_msg const *adapter_seek_msg (
+    struct lights_adapter_msg const *head,
+    size_t index
+){
+    if (!head)
+        return NULL;
 
-    error_t (*read)(void *data, struct lights_io *io);
-    error_t (*write)(void *data, const struct lights_io *io);
-};
+    while (head && index > 0) {
+        index--;
+        head = head->next;
+    }
 
-#define LIGHTS_ATTR(_name, _mode, _type, _data, _read, _write)      \
-(struct lights_io_attribute) {                                         \
-    .owner = THIS_MODULE,                                           \
-    .attr = {.name = _name,                                         \
-             .mode = VERIFY_OCTAL_PERMISSIONS(_mode) },             \
-    .type          = _type,                                         \
-    .private_data  = _data,                                         \
-    .read          = _read,                                         \
-    .write         = _write,                                        \
+    return head;
 }
 
-/**
- * Helper macros for creating lights_io_attribute instances.
- */
-#define LIGHTS_ATTR_RO(_name, _type, _data, _read) \
-    LIGHTS_ATTR(_name, 0444, _type, _data, _read, NULL)
+#define ADAPTER_READ_MSG(_reg, _type, _swapped) \
+(struct lights_adapter_msg){ \
+    .read = true, \
+    .type = (_type), \
+    .command = (_reg), \
+    .swapped = (_swapped) \
+}
 
-#define LIGHTS_ATTR_WO(_name, _type, _data, _write) \
-    LIGHTS_ATTR(_name, 0200, _type, _data, NULL, _write)
+#define ADAPTER_WRITE_MSG(_reg, _type, _data, _swapped) \
+(struct lights_adapter_msg){ \
+    .type = (_type), \
+    .command = (_reg), \
+    .data = _data, \
+    .swapped = (_swapped) \
+}
 
-#define LIGHTS_ATTR_RW(_name, _type, _data, _read, _write) \
-    LIGHTS_ATTR(_name, 0644, _type, _data, _read, _write)
+#define ADAPTER_READ_BYTE() \
+    ADAPTER_READ_MSG(0, I2C_SMBUS_BYTE, false)
 
-#define LIGHTS_CUSTOM_ATTR(_name, _data, _read, _write) \
-    LIGHTS_ATTR_RW(_name, LIGHTS_TYPE_CUSTOM, _data, _read, _write)
+#define ADAPTER_READ_BYTE_DATA(_reg) \
+    ADAPTER_READ_MSG((_reg), I2C_SMBUS_BYTE_DATA, false)
 
-#define LIGHTS_MODE_ATTR(_data, _read, _write) \
-    LIGHTS_ATTR_RW(LIGHTS_IO_MODE, LIGHTS_TYPE_MODE, _data, _read, _write)
+#define ADAPTER_READ_WORD_DATA(_reg) \
+    ADAPTER_READ_MSG((_reg), I2C_SMBUS_WORD_DATA, false)
 
-#define LIGHTS_COLOR_ATTR(_data, _read, _write) \
-    LIGHTS_ATTR_RW(LIGHTS_IO_COLOR, LIGHTS_TYPE_COLOR, _data, _read, _write)
+#define ADAPTER_READ_WORD_DATA_SWAPPED(_reg) \
+    ADAPTER_READ_MSG((_reg), I2C_SMBUS_WORD_DATA, true)
 
-#define LIGHTS_SPEED_ATTR(_data, _read, _write) \
-    LIGHTS_ATTR_RW(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _read, _write)
+#define ADAPTER_READ_BLOCK_DATA(_reg) \
+    ADAPTER_READ_MSG((_reg), I2C_SMBUS_BLOCK_DATA, false)
 
-#define LIGHTS_LEDS_ATTR(_data, _write) \
-    LIGHTS_ATTR_WO(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _write)
+#define ADAPTER_WRITE_BYTE(_val) \
+    ADAPTER_WRITE_MSG(0, I2C_SMBUS_BYTE, {.byte = (u8)(_val)}, false)
 
-/**
- * struct lights_dev - Describes the device files to be created.
- *
- * @name:         max LIGHTS_MAX_FILENAME_LENGTH, of directory name within
- *                the /dev/lights/ directory.
- * @led_count:    The number of leds supported by the device.
- * @caps:         A list of modes supported by the device.
- * @attrs:        A null terminated array of io attributes.
- * @update_color: A hook into the writing of /dev/lights/all/color
- * @update_mode:  A hook into the writing of /dev/lights/all/mode
- * @update_speed: A hook into the writing of /dev/lights/all/speed
- *
- * The modes listed here are available to userland in the 'caps' file. This
- * file is created for each device when modes are given. Each mode is also
- * added to a global list, available at /dev/lights/all/caps. The modes listed
- * in this file are those which are defined by THIS module AND which are common
- * to each extension.
- */
-struct lights_dev {
-    const char                          *name;
-    uint16_t                            led_count;
-    const struct lights_mode            *caps;
-    const struct lights_io_attribute    **attrs;
+#define ADAPTER_WRITE_BYTE_DATA(_reg, _val) \
+    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_BYTE_DATA, {.byte = (u8)(_val)}, false)
 
-    error_t (*update_color)(const struct lights_state *);
-    error_t (*update_mode)(const struct lights_state *);
-    error_t (*update_speed)(const struct lights_state *);
-};
+#define ADAPTER_WRITE_WORD_DATA(_reg, _val) \
+    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_WORD_DATA, {.word = (u16)(_val)}, false)
 
-/**
- * lights_device_register() - Registers a new lights device
- *
- * @dev:    A decriptor of the device and its files
- * @Return: A negative error number on failure
- *
- * When a device with the same exists, a value of EEXISTS is returned.
- * The best practice for naming, is to append a hyphen and digit to the
- * names of devices for which multiple instances may exist ("dimm-0").
- */
-error_t lights_device_register (
-    struct lights_dev * dev
-);
+#define ADAPTER_WRITE_WORD_DATA_SWAPPED(_reg, _val) \
+    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_WORD_DATA, {.word = (u16)(_val)}, true)
 
-/**
- * lights_device_unregister() - Removes a device
- *
- * @dev: A device previously registered with lights_device_register()
- */
-void lights_device_unregister (
-    struct lights_dev * dev
-);
+/* NOTE: The caller is required to populate the data */
+#define ADAPTER_WRITE_BLOCK_DATA(_reg, _len) \
+(struct lights_adapter_msg){ \
+    .type = I2C_SMBUS_BLOCK_DATA, \
+    .command = (_reg), \
+    .length = (_len), \
+}
+#define adapter_assign_block_data(_msg, _data, _len)( \
+    memcpy((_msg)->data.block, (_data), (_len) > I2C_SMBUS_BLOCK_MAX ? I2C_SMBUS_BLOCK_MAX : (_len)) \
+)
 
-/**
- * lights_create_file() - Adds a file to the devices directory
- * @dev:  A previously registered device
- * @attr: A description of the file to create
- *
- * @Return: A negative error number on failure
- *
- * The given attribute may exist on the stack. Internally it is copied
- * so the user need not keep a reference to it.
- */
-error_t lights_create_file (
-    struct lights_dev *dev,
-    struct lights_io_attribute *attr
-);
-
-/**
- * lights_read_color() - Helper for reading color value strings.
- *
- * @buffer: A kernel/user buffer containing the string.
- * @len:    The length of the buffer.
- * @color:  A color object to populate.
- *
- * @Return: The number of characters read or a negative error number.
- */
-ssize_t lights_read_color (
-    const char *buffer,
-    size_t len,
-    struct lights_color *color
-);
-
-/**
- * lights_read_mode() - Helper for reading mode value strings.
- *
- * @buffer:   A kernel/user buffer containing the string.
- * @len:      The length of the buffer.
- * @haystack: A list of valid modes to match against.
- * @mode:     A mode object to populate.
- *
- * @Return: The number of characters read or a negative error number.
- */
-ssize_t lights_read_mode (
-    const char *buffer,
-    size_t len,
-    const struct lights_mode *haystack,
-    struct lights_mode *mode
-);
-
-/**
- * lights_read_speed() - Helper for reading speed value strings.
- *
- * @buffer: A kernel/user buffer containing the string.
- * @len:    The length of the buffer.
- * @speed:  A value to populate with the speed
- *
- * @Return: The number of characters read or a negative error number.
- */
-ssize_t lights_read_speed (
-    const char *buffer,
-    size_t len,
-    uint8_t *speed
-);
-
-/**
- * lights_get_params() - Retrieves the current global state
- *
- * @state: An object to populate with the state.
- */
-void lights_get_state (
-    struct lights_state *state
-);
-
-#endif /* _UAPI_LIGHTS_H */
+#endif

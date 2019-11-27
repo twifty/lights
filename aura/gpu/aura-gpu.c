@@ -1,19 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "../aura.h"
+#include <linux/i2c.h>
+#include <adapter/lights-interface.h>
+#include <adapter/lights-adapter.h>
+
+#include <aura/debug.h>
 #include "asic/asic-types.h"
 #include "aura-gpu-i2c.h"
 
 #define MAX_SUPPORTED_GPUS 2
 
-/*
-    AMD devices require an i2c adapter to be created,
-    NVIDIA devices already have the adapter loaded.
+static LIST_HEAD(aura_gpu_adapter_list);
+static LIST_HEAD(aura_gpu_ctrl_list);
+
+typedef void (*i2c_destroy_t)(struct i2c_adapter*);
+
+/**
+ * struct aura_smbus_adapter - Storage for i2c/async
+ *
+ * @siblings:       Next and Prev pointers
+ * @i2c_adapter:    Physical access point to the hardware
+ * @lights_adapter: Async access point to the hardware
+ * @i2c_destroy:    Destructor for @i2c_adapter
+ *
+ * The @i2c_destroy method is only valid if an adapter was created
+ * by this module.
  */
-static const struct pci_device_id pciidlist[] = {
-    {0x1002, 0x67df, 0x1043, 0x0517, 0, 0, CHIP_POLARIS10},     // RX580 (Strix)
-    {0x1002, 0x687F, 0x1043, 0x0555, 0, 0, CHIP_VEGA10},        // Vega 56 (Strix)
-    // {0x1002, 0x731f, 0x1043, 0x04e2, 0, 0, CHIP_NAVI10},     // RX5700XT (Strix)
-    {0, 0, 0},
+struct aura_gpu_adapter {
+    struct list_head        siblings;
+    struct i2c_adapter      *i2c_adapter;
+    i2c_destroy_t           i2c_destroy;
 };
 
 /* TODO - test both 100hz and 20hz i2c speed */
@@ -70,8 +85,6 @@ enum aura_gpu_mode {
     /*
         There is no off mode, all colors are set to 0. The LightingService
         stores the previous values in its xml file.
-
-        TODO - How does the card react between power cycles?
      */
     AURA_MODE_OFF           = 0x00,
     AURA_MODE_STATIC        = 0x01,
@@ -87,15 +100,13 @@ enum aura_gpu_mode {
 
     AURA_MODE_LAST          = AURA_MODE_CYCLE,
 
-    /*
-        TODO - This requires testing.
-
-        The LightingService uses STATIC mode.
-
-        If the colors are changed but not applied, are they retained across
-        a power cycle?
-     */
     AURA_INDEX_DIRECT       = 0x05,
+    /*
+        This is not an actual mode. The chip imitiates direct
+        mode by using STATIC mode not applying (setting 0x01
+        to 0x0E). However, the color of the previous mode is
+        lost until a full power cycle (reboot doesn't work).
+     */
     AURA_MODE_DIRECT        = 0xFF,
 };
 
@@ -122,6 +133,14 @@ struct zone_reg {
     uint8_t apply;
 };
 
+/**
+ * struct zone_context - State of the zone
+ *
+ * @gpu_ctrl: Owning controller
+ * @mode:     Current mode
+ * @color:    Current color
+ * @reg:      Register offsets for colors and mode
+ */
 struct zone_context {
     struct aura_gpu_controller  *gpu_ctrl;
     struct lights_mode          mode;
@@ -129,28 +148,51 @@ struct zone_context {
     const struct zone_reg       reg;
 };
 
-static LIST_HEAD(aura_gpu_ctrl_list);
+/**
+ * struct aura_gpu_controller - Single GPU storage
+ *
+ * @siblings:      Next and prev pointers
+ * @lights_client: Async hardware access
+ * @lock:          Read/Write lock of this object
+ * @id:            The numeric of the GPU (As seen in /dev/lights/gpu-ID)
+ * @zone_count:    Number of lighting zones (Currently only one)
+ * @zone_contexts: Array of zone data
+ * @lights:        Userland access
+ * @lights_name:   Name as seen in /dev/lights/
+ */
 struct aura_gpu_controller {
-    struct list_head            siblings;
-    struct i2c_adapter          *adapter;
-    uint8_t                     address;        /* The 7bit chipset address */
-    struct aura_i2c_service     *i2c_service;
-    struct mutex                i2c_lock;
-    uint8_t                     id;
+    struct list_head                siblings;
+    struct lights_adapter_client    lights_client;
+
+    struct mutex                    lock;
+    uint8_t                         id;
 
     /* Allow multiple zones for future */
-    uint8_t                     zone_count;
-    struct zone_context         *zone_contexts;
-    // struct aura_fops            *aura_fops;
-    struct lights_dev           lights;
-    char                        lights_name[6];
+    uint8_t                         zone_count;
+    struct zone_context             *zone_contexts;
+    struct lights_dev               lights;
+    char                            lights_name[6];
 };
 
+/**
+ * struct callback_data - Used to iterate pci devices
+ *
+ * @count: Number of found GPUs
+ * @error: Any error that occured while creating controller
+ */
 struct callback_data {
     uint8_t count;
+    error_t error;
 };
 
-
+/**
+ * lights_mode_to_aura_gpu_mode() - Mode convertion
+ *
+ * @mode:     Globally recognizable mode
+ * @gpu_mode: GPU recognizable mode
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t lights_mode_to_aura_gpu_mode (
     const struct lights_mode *mode,
     enum aura_gpu_mode *gpu_mode
@@ -184,6 +226,13 @@ static error_t lights_mode_to_aura_gpu_mode (
     return -ENODATA;
 }
 
+/**
+ * aura_gpu_mode_to_lights_mode() - Mode convertion
+ *
+ * @gpu_mode: GPU recognizable mode
+ *
+ * @return: NULL or a globally recognizable mode
+ */
 static const struct lights_mode *aura_gpu_mode_to_lights_mode (
     enum aura_gpu_mode gpu_mode
 ){
@@ -196,58 +245,72 @@ static const struct lights_mode *aura_gpu_mode_to_lights_mode (
     return NULL;
 }
 
+/**
+ * aura_gpu_i2c_read_byte() - Reads a single byte from the hardware
+ *
+ * @client: Adapter and address of device
+ * @reg:    Offset to read from
+ * @value:  Buffer to read into
+ *
+ * @return: Zero or a negative error code
+ *
+ * This function is blocking.
+ */
 static error_t aura_gpu_i2c_read_byte (
-    struct i2c_adapter *adapter,
-    uint8_t addr,
-    uint8_t offset,
-    uint8_t *value
+    struct lights_adapter_client * client,
+    uint8_t reg,
+    uint8_t * value
 ){
-    int ret;
-    struct i2c_msg msgs[] = {{
-        .addr = addr,
-        .len = 1,
-        .buf = &offset
-    },{
-        .addr = addr,
-        .flags = I2C_M_RD,
-        .len = 1,
-        .buf = value
-    }};
+    error_t err;
+    struct lights_adapter_msg msgs[] = {
+        ADAPTER_READ_BYTE_DATA(reg)
+    };
 
-    ret = i2c_transfer(adapter, msgs, 2);
-    if (ret == 2)
-        return 0;
+    err = lights_adapter_xfer(client, msgs, ARRAY_SIZE(msgs));
+    if (!err)
+        *value = msgs[0].data.byte;
 
-    return ret;
+    return err;
 }
 
+/**
+ * aura_gpu_i2c_write_byte() - Writes a single byte to the hardware
+ *
+ * @client: Adapter and address of device
+ * @reg:    Offset to read from
+ * @value:  Buffer to read from
+ *
+ * @return: Zero or a negative error code
+ *
+ * This function is blocking.
+ */
+__used
 static error_t aura_gpu_i2c_write_byte (
-    struct i2c_adapter *adapter,
-    uint8_t addr,
-    uint8_t offset,
+    struct lights_adapter_client *client,
+    uint8_t reg,
     uint8_t value
 ){
-    int ret;
-    struct i2c_msg msgs[] = {{
-        .addr = addr,
-        .len = 1,
-        .buf = &offset
-    },{
-        .addr = addr,
-        .len = 1,
-        .buf = &value
-    }};
+    error_t err;
+    struct lights_adapter_msg msgs[] = {
+        ADAPTER_WRITE_BYTE_DATA(reg, value)
+    };
 
-    ret = i2c_transfer(adapter, msgs, 2);
-    if (ret == 2)
-        return 0;
+    err = lights_adapter_xfer(client, msgs, ARRAY_SIZE(msgs));
 
-    return ret;
+    return err;
 }
 
+/**
+ * aura_gpu_discover() - Checks if the adapter has an AURA capable chip
+ *
+ * @i2c_adapter: Hardware device
+ * @client:      Buffer to write address of chip
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_discover (
-    struct i2c_adapter *adapter,
-    uint8_t *addr
+    struct i2c_adapter * i2c_adapter,
+    struct lights_adapter_client * client
 ){
     uint8_t offset[2] = { AURA_GPU_CHIPSET_MAGIC_HI, AURA_GPU_CHIPSET_MAGIC_LO };
     uint8_t value[2] = {0};
@@ -255,18 +318,22 @@ static error_t aura_gpu_discover (
     int i, j;
 
     for (j = 0; j < ARRAY_SIZE(chipset_addresses); j++) {
-        *addr = chipset_addresses[j];
+        *client = LIGHTS_I2C_CLIENT(i2c_adapter, chipset_addresses[j], 0);
 
         for (i = 0; i < 2; i++) {
-            err = aura_gpu_i2c_read_byte(adapter, *addr, offset[i], &value[i]);
+            err = aura_gpu_i2c_read_byte(client, offset[i], &value[i]);
             if (err) {
-                AURA_DBG("Failed to read offset 0x%02x on address 0x%02x: %d", offset[i], *addr, err);
+                // AURA_DBG("Failed to read offset 0x%02x on address 0x%02x: %d", offset[i], *addr, err);
                 break;
             }
         }
 
         if (!err && ((value[0] << 8) | value[1]) == AURA_GPU_CHIPSET_MAGIC_VALUE) {
-            AURA_DBG("Discovered aura chip at address %x on %s", *addr, adapter->name);
+            AURA_DBG(
+                "Discovered aura chip at address %x on %s",
+                chipset_addresses[j],
+                i2c_adapter->name
+            );
             return 0;
         }
     }
@@ -274,36 +341,44 @@ static error_t aura_gpu_discover (
     return -ENODEV;
 }
 
+/**
+ * aura_gpu_fetch_zone() - Populates the colors and mode of the zone
+ *
+ * @zone: Zone to populate
+ *
+ * @return: Zero or a negative error number
+ *
+ * This function is blocking.
+ */
 static error_t aura_gpu_fetch_zone (
-    struct zone_context *zone
+    struct zone_context * zone
 ){
     enum aura_gpu_mode gpu_mode;
-    const struct lights_mode *mode;
+    const struct lights_mode * mode;
     struct lights_color color;
-    struct i2c_adapter *adapter = zone->gpu_ctrl->adapter;
-    uint8_t address = zone->gpu_ctrl->address;
+    struct lights_adapter_client * client = &zone->gpu_ctrl->lights_client;
     uint8_t mode_raw;
     error_t err;
 
-    mutex_lock(&zone->gpu_ctrl->i2c_lock);
+    mutex_lock(&zone->gpu_ctrl->lock);
 
-    err = aura_gpu_i2c_read_byte(adapter, address, zone->reg.red, &color.r);
+    err = aura_gpu_i2c_read_byte(client, zone->reg.red, &color.r);
     if (err)
         goto error;
 
-    err = aura_gpu_i2c_read_byte(adapter, address, zone->reg.green, &color.g);
+    err = aura_gpu_i2c_read_byte(client, zone->reg.green, &color.g);
     if (err)
         goto error;
 
-    err = aura_gpu_i2c_read_byte(adapter, address, zone->reg.blue, &color.b);
+    err = aura_gpu_i2c_read_byte(client, zone->reg.blue, &color.b);
     if (err)
         goto error;
 
-    err = aura_gpu_i2c_read_byte(adapter, address, zone->reg.mode, &mode_raw);
+    err = aura_gpu_i2c_read_byte(client, zone->reg.mode, &mode_raw);
     if (err)
         goto error;
 
-    /* Detmine the mode base on the values */
+    /* Determine the mode based on the values */
     if (mode_raw >= AURA_MODE_BREATHING && mode_raw <= AURA_MODE_LAST){
         gpu_mode = mode_raw;
     } else if (mode_raw <= AURA_MODE_STATIC) {
@@ -324,91 +399,210 @@ static error_t aura_gpu_fetch_zone (
         goto error;
     }
 
-    memcpy((void*)&zone->mode, &mode, sizeof(mode));
+    memcpy((void*)&zone->mode, mode, sizeof(*mode));
     memcpy((void*)&zone->color, &color, sizeof(color));
 
+    AURA_DBG(
+        "GPU Color: 0x%06x, Mode: %s",
+        ((zone->color.r << 16) | zone->color.g << 8) | zone->color.b,
+        zone->mode.name
+    );
+
 error:
-    mutex_unlock(&zone->gpu_ctrl->i2c_lock);
+    mutex_unlock(&zone->gpu_ctrl->lock);
 
     return err;
 }
 
+/**
+ * aura_gpu_set_color_callback() - Callback handler
+ *
+ * @result: Sent messages
+ * @_data:  Zone which was updated
+ * @error:  Any error while writing
+ *
+ * The hardware was updated before this call, here we sync the local object.
+ */
+static void aura_gpu_set_color_callback (
+    struct lights_adapter_msg const * const result,
+    void *_data,
+    error_t error
+){
+    struct zone_context *zone = _data;
+    struct lights_adapter_msg const * color_msg;
+    uint8_t color_byte[3];
+    int i;
 
+    if (IS_NULL(result, _data))
+        return;
+
+    if (error) {
+        AURA_DBG("Failed to set color %d", error);
+        return;
+    }
+
+    color_msg = result;
+    for (i = 0; i < 3; i++) {
+        if (!color_msg) {
+            AURA_DBG("Next message not found");
+            return;
+        }
+        if (color_msg->type != MSG_BYTE_DATA) {
+            AURA_ERR("Message has an invalid type '%d'", color_msg->type);
+            return;
+        }
+        color_byte[i] = color_msg->data.byte;
+        color_msg = color_msg->next;
+    }
+
+    mutex_lock(&zone->gpu_ctrl->lock);
+
+    zone->color.r = color_byte[0];
+    zone->color.g = color_byte[1];
+    zone->color.b = color_byte[2];
+
+    mutex_unlock(&zone->gpu_ctrl->lock);
+}
+
+/**
+ * aura_gpu_apply_zone_color() - Begins the async writer
+ *
+ * @zone:  The zone to update
+ * @color: The new color to apply
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_apply_zone_color (
     struct zone_context *zone,
     const struct lights_color *color
 ){
-    struct i2c_adapter *adapter = zone->gpu_ctrl->adapter;
-    uint8_t address = zone->gpu_ctrl->address;
-    error_t err;
+    uint8_t msg_count = 3;
+    struct lights_adapter_msg msgs[] = {
+        /* The controller is fussy about block read/writes */
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.red,   color->r),
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.green, color->g),
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.blue,  color->b),
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01)
+    };
 
-    mutex_lock(&zone->gpu_ctrl->i2c_lock);
+    if (lights_custom_mode_id(&zone->mode) != AURA_MODE_DIRECT)
+        msg_count = 4;
 
-    err = aura_gpu_i2c_write_byte(adapter, address, zone->reg.red, color->r);
-    if (err)
-        goto error;
-
-    err = aura_gpu_i2c_write_byte(adapter, address, zone->reg.green, color->g);
-    if (err)
-        goto error;
-
-    err = aura_gpu_i2c_write_byte(adapter,
-        address,
-        zone->reg.blue,color->b
+    return lights_adapter_xfer_async(
+        &zone->gpu_ctrl->lights_client,
+        msgs,
+        msg_count,
+        zone,
+        aura_gpu_set_color_callback
     );
-    if (err)
-        goto error;
-
-    if (!err && lights_custom_mode_id(&zone->mode) == AURA_MODE_DIRECT) {
-        err = aura_gpu_i2c_write_byte(adapter, address, zone->reg.apply, 0x01);
-    }
-
-    memcpy((void*)&zone->color, color, sizeof(*color));
-
-error:
-    mutex_unlock(&zone->gpu_ctrl->i2c_lock);
-
-    return err;
 }
 
+/**
+ * aura_gpu_set_mode_callback() - Callback handler
+ *
+ * @result: Sent messages
+ * @_data:  Zone which was updated
+ * @error:  Any error while writing
+ *
+ * The hardware was updated before this call, here we sync the local object.
+ */
+static void aura_gpu_set_mode_callback (
+    struct lights_adapter_msg const * const result,
+    void *_data,
+    error_t error
+){
+    struct zone_context *zone = _data;
+    const struct lights_mode *mode;
+
+    if (IS_NULL(result, _data))
+        return;
+
+    if (error) {
+        AURA_DBG("Failed to set mode %d", error);
+        return;
+    }
+
+    if (result->type != MSG_BYTE_DATA) {
+        AURA_ERR("Message has an invalid type '%d'", result->type);
+        return;
+    }
+
+    /* If the APPLY was not set, the mode is really DIRECT */
+    if (result->data.byte == AURA_MODE_STATIC && result->next == NULL)
+        mode = aura_gpu_mode_to_lights_mode(AURA_MODE_DIRECT);
+    else
+        mode = aura_gpu_mode_to_lights_mode(result->data.byte);
+
+    if (!mode) {
+        AURA_DBG("Not a valid aura mode 0x%02x", result->data.byte);
+        return;
+    }
+
+    mutex_lock(&zone->gpu_ctrl->lock);
+
+    memcpy((void*)&zone->mode, mode, sizeof(*mode));
+
+    mutex_unlock(&zone->gpu_ctrl->lock);
+}
+
+/**
+ * aura_gpu_apply_zone_mode() - Begins the async writer
+ *
+ * @zone: The zone to update
+ * @mode: The new mode to apply
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_apply_zone_mode (
     struct zone_context *zone,
     const struct lights_mode *mode
 ){
-    struct i2c_adapter *adapter = zone->gpu_ctrl->adapter;
-    uint8_t address = zone->gpu_ctrl->address;
+    uint8_t msg_count = 1;
     enum aura_gpu_mode gpu_mode;
+    struct lights_adapter_msg msgs[] = {
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.mode,  0),
+        ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01)
+    };
     error_t err;
-
-    mutex_lock(&zone->gpu_ctrl->i2c_lock);
 
     err = lights_mode_to_aura_gpu_mode(mode, &gpu_mode);
     if (err)
-        goto error;
+        return err;
 
-    err = aura_gpu_i2c_write_byte(adapter, address, zone->reg.mode, gpu_mode);
-    if (err)
-        goto error;
+    /* DIRECT mode requires special handling */
+    if (gpu_mode == AURA_MODE_DIRECT)
+        gpu_mode = AURA_MODE_STATIC;
+    else
+        msg_count = 2;
 
-    if (!err && lights_custom_mode_id(&zone->mode) == AURA_MODE_DIRECT) {
-        err = aura_gpu_i2c_write_byte(adapter, address, zone->reg.apply, 0x01);
-    }
+    msgs[0].data.byte = gpu_mode;
 
-    memcpy((void*)&zone->mode, mode, sizeof(*mode));
-
-error:
-    mutex_unlock(&zone->gpu_ctrl->i2c_lock);
-
-    return err;
+    return lights_adapter_xfer_async(
+        &zone->gpu_ctrl->lights_client,
+        msgs,
+        msg_count,
+        zone,
+        aura_gpu_set_mode_callback
+    );
 }
 
+/**
+ * aura_gpu_get_mode() - Reads a zones mode
+ *
+ * @data: The zone to read
+ * @io:   Buffer to write into
+ *
+ * @return: Zero or a negative error number
+ *
+ * The returned mode is from the local cache not the harsware.
+ */
 static error_t aura_gpu_get_mode (
     void *data,
     struct lights_io *io
 ){
     struct zone_context *zone = data;
 
-    if (WARN_ON(NULL == zone || NULL == io))
+    if (IS_NULL(zone, io))
         return -EINVAL;
 
     io->data.mode = zone->mode;
@@ -416,6 +610,16 @@ static error_t aura_gpu_get_mode (
     return 0;
 }
 
+/**
+ * aura_gpu_set_mode() - Writes a zones mode
+ *
+ * @data: The zone to read
+ * @io:   Buffer containing new mode
+ *
+ * @return: Zero or a negative error number
+ *
+ * The actual writing is done asynchronously.
+ */
 static error_t aura_gpu_set_mode (
     void *data,
     const struct lights_io *io
@@ -428,6 +632,13 @@ static error_t aura_gpu_set_mode (
     return aura_gpu_apply_zone_mode(zone, &io->data.mode);
 }
 
+/**
+ * aura_gpu_update_mode() - Writes a new mode
+ *
+ * @state: Buffer containing the new mode
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_update_mode (
     const struct lights_state *state
 ){
@@ -443,6 +654,14 @@ static error_t aura_gpu_update_mode (
     return err;
 }
 
+/**
+ * aura_gpu_get_color() - Reads a zones color
+ *
+ * @data: The zone to read
+ * @io:   The buffer to write into
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_get_color (
     void *data,
     struct lights_io *io
@@ -457,6 +676,14 @@ static error_t aura_gpu_get_color (
     return 0;
 }
 
+/**
+ * aura_gpu_set_color() - Writes a zones color
+ *
+ * @data: The zone to write
+ * @io:   The buffer containing the new color
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_set_color (
     void *data,
     const struct lights_io *io
@@ -469,6 +696,13 @@ static error_t aura_gpu_set_color (
     return aura_gpu_apply_zone_color(zone, &io->data.color);
 }
 
+/**
+ * aura_gpu_update_color() - Writes a zones color
+ *
+ * @state: Buffer containing the new color
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_update_color (
     const struct lights_state *state
 ){
@@ -484,7 +718,13 @@ static error_t aura_gpu_update_color (
     return err;
 }
 
-
+/**
+ * aura_gpu_create_fs() - Creates Userland access to the GPU
+ *
+ * @gpu_ctrl: Controller to make public
+ *
+ * @return: Zero or a negative error number
+ */
 static error_t aura_gpu_create_fs (
     struct aura_gpu_controller *gpu_ctrl
 ){
@@ -536,6 +776,11 @@ error_release:
     return err;
 }
 
+/**
+ * aura_gpu_count()
+ *
+ * @return: Number of controllers
+ */
 static uint8_t aura_gpu_count (
     void
 ){
@@ -548,26 +793,38 @@ static uint8_t aura_gpu_count (
     return count;
 }
 
-static struct aura_gpu_controller *aura_gpu_device_create (
-    struct i2c_adapter *adapter
+/**
+ * aura_gpu_controller_create() - Creates a controller for the adapter
+ *
+ * @i2c_adapter: The adapter to search
+ *
+ * @return: NULL, a controller or a negative error number
+ */
+static struct aura_gpu_controller *aura_gpu_controller_create (
+    struct i2c_adapter *i2c_adapter
 ){
     struct aura_gpu_controller *gpu_ctrl;
     struct zone_context *zone_ctx;
+    struct lights_adapter_client client;
     uint8_t zone_count = 1;
-    uint8_t addr;
     error_t err;
 
     /* Check for the presence of the chip and check its id */
-    err = aura_gpu_discover(adapter, &addr);
+    err = aura_gpu_discover(i2c_adapter, &client);
     if (err)
-        return ERR_PTR(err);
+        return err == -ENODEV ? NULL : ERR_PTR(err);
 
     gpu_ctrl = kzalloc(sizeof(*gpu_ctrl), GFP_KERNEL);
     if (!gpu_ctrl)
         return ERR_PTR(-ENOMEM);
 
-    gpu_ctrl->address = addr;
-    gpu_ctrl->adapter = adapter;
+    gpu_ctrl->lights_client = client;
+
+    err = lights_adapter_register(&gpu_ctrl->lights_client, 32);
+    if (err) {
+        AURA_DBG("Failed to register lights_adapter: %s", ERR_NAME(err));
+        goto error_free_ctrl;
+    }
 
     zone_ctx = kzalloc(sizeof(*zone_ctx) * zone_count, GFP_KERNEL);
     if (!zone_ctx) {
@@ -609,96 +866,209 @@ error_free_ctrl:
     return ERR_PTR(err);
 }
 
-static error_t aura_gpu_probe_device (
-    struct device *dev,
-    void *data
-){
-    struct callback_data *cb_data;
-    struct i2c_adapter *adapter = to_i2c_adapter(dev);
-    struct aura_gpu_controller *found;
-
-    cb_data = (struct callback_data*)data;
-    if (dev->type != &i2c_adapter_type || cb_data->count >= MAX_SUPPORTED_GPUS)
-        return cb_data->count;
-
-    found = aura_gpu_device_create(adapter);
-    if (!IS_ERR(found))
-        cb_data->count++;
-
-    return cb_data->count;
-}
-
-error_t aura_gpu_probe (
-    const struct lights_state *state
-){
-    struct pci_dev *pci_dev;
-    const struct pci_device_id *match;
-    struct aura_i2c_service *i2c_service;
-    struct aura_gpu_controller *gpu_ctrl;
-    struct callback_data data = {0};
-
-    i2c_for_each_dev(&data, aura_gpu_probe_device);
-
-    /* Handle the case of mixed GPU types */
-    pci_dev = NULL;
-    while (data.count < MAX_SUPPORTED_GPUS) {
-        while (NULL != (pci_dev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pci_dev))) {
-            match = pci_match_id(pciidlist, pci_dev);
-            if (match) {
-                AURA_DBG("Creating adapter for GPU %x:%x", pci_dev->subsystem_vendor, pci_dev->subsystem_device);
-
-                i2c_service = aura_gpu_i2c_create(pci_dev, match->driver_data);
-                if (IS_ERR(i2c_service))
-                    continue;
-
-                gpu_ctrl = aura_gpu_device_create(i2c_service->adapter);
-                if (IS_ERR(gpu_ctrl)) {
-                    aura_gpu_i2c_destroy(i2c_service);
-                    i2c_service = NULL;
-                    continue;
-                }
-
-                gpu_ctrl->i2c_service = i2c_service;
-                data.count++;
-
-                break;
-            }
-        }
-        if (NULL == pci_dev)
-            break;
-    }
-
-    aura_gpu_update_mode(state);
-    aura_gpu_update_color(state);
-
-    return data.count;
-}
-
-static void aura_gpu_dev_release (
+/**
+ * aura_gpu_controller_destroy() - Releases all memory for a controller
+ *
+ * @gpu_ctrl: The controller to delete
+ */
+static void aura_gpu_controller_destroy (
     struct aura_gpu_controller *gpu_ctrl
 ){
-    if (gpu_ctrl->i2c_service) {
-        aura_gpu_i2c_destroy(gpu_ctrl->i2c_service);
-    }
+    list_del(&gpu_ctrl->siblings);
 
     if (gpu_ctrl->zone_contexts) {
         kfree(gpu_ctrl->zone_contexts);
     }
 
+    lights_adapter_unregister(&gpu_ctrl->lights_client);
     lights_device_unregister(&gpu_ctrl->lights);
 
     kfree(gpu_ctrl);
 }
 
+
+/**
+ * aura_gpu_adapter_create() - Registers async access to the i2c device
+ *
+ * @i2c_adapter: Raw access point
+ * @i2c_destroy: Optional destructor for the @i2c_adapter
+ *
+ * @return: The async interface or a negative error code
+ */
+static struct aura_gpu_adapter *aura_gpu_adapter_create (
+    struct i2c_adapter *i2c_adapter,
+    i2c_destroy_t i2c_destroy
+){
+    struct aura_gpu_adapter *gpu_adapter;
+
+    if (IS_NULL(i2c_adapter, i2c_destroy))
+        return ERR_PTR(-EINVAL);
+
+    gpu_adapter = kzalloc(sizeof(*gpu_adapter), GFP_KERNEL);
+    if (!gpu_adapter)
+        return ERR_PTR(-ENOMEM);
+
+    gpu_adapter->i2c_adapter = i2c_adapter;
+    gpu_adapter->i2c_destroy = i2c_destroy;
+
+    list_add_tail(&gpu_adapter->siblings, &aura_gpu_adapter_list);
+
+    return gpu_adapter;
+}
+
+/**
+ * aura_gpu_adapter_destroy() - Releases a previously bound adapter
+ *
+ * @gpu_adapter: The adapter to delete
+ */
+static void aura_gpu_adapter_destroy (
+    struct aura_gpu_adapter *gpu_adapter
+){
+    if (IS_NULL(gpu_adapter))
+        return;
+
+    list_del(&gpu_adapter->siblings);
+
+    gpu_adapter->i2c_destroy(gpu_adapter->i2c_adapter);
+
+    kfree(gpu_adapter);
+}
+
+/**
+ * aura_gpu_probe_device() - Callback for @i2c_for_each_dev
+ *
+ * @dev:  PCI device to search
+ * @data: Count and errors
+ *
+ * @return: Zero or a negative error number
+ */
+static error_t aura_gpu_probe_device (
+    struct device *dev,
+    void *data
+){
+    struct callback_data *cb_data = data;
+    struct i2c_adapter *adapter = to_i2c_adapter(dev);
+    // struct aura_gpu_adapter *gpu_adapter;
+    struct aura_gpu_controller *gpu_controller;
+    error_t err;
+
+    if (dev->type != &i2c_adapter_type || cb_data->count >= MAX_SUPPORTED_GPUS)
+        return cb_data->count;
+
+    // gpu_adapter = aura_gpu_adapter_create(adapter, NULL);
+    // if (IS_ERR(gpu_adapter)) {
+    //     err = CLEAR_ERR(gpu_adapter);
+    //     goto error;
+    // }
+
+    gpu_controller = aura_gpu_controller_create(adapter);
+    if (IS_ERR(gpu_controller)) {
+        err = CLEAR_ERR(gpu_controller);
+        goto error;
+    }
+
+    if (!gpu_controller) {
+        err = 0;
+        goto error;
+    }
+
+    AURA_DBG("Found %d controllers", cb_data->count);
+    cb_data->count++;
+
+    return cb_data->count;
+
+error:
+    // if (gpu_adapter)
+    //     aura_gpu_adapter_destroy(gpu_adapter);
+
+    cb_data->error = err;
+
+    return err;
+}
+
+/**
+ * aura_gpu_release() - Exit
+ */
 void aura_gpu_release (
     void
 ){
-    struct aura_gpu_controller *gpu_ctrl, *safe;
+    struct aura_gpu_controller *gpu_ctrl, *safe_ctrl;
+    struct aura_gpu_adapter *gpu_adapter, *safe_adapter;
 
-    if (!list_empty(&aura_gpu_ctrl_list)) {
-        list_for_each_entry_safe(gpu_ctrl, safe, &aura_gpu_ctrl_list, siblings) {
-            list_del(&gpu_ctrl->siblings);
-            aura_gpu_dev_release(gpu_ctrl);
+    list_for_each_entry_safe(gpu_ctrl, safe_ctrl, &aura_gpu_ctrl_list, siblings) {
+        aura_gpu_controller_destroy(gpu_ctrl);
+    }
+
+    list_for_each_entry_safe(gpu_adapter, safe_adapter, &aura_gpu_adapter_list, siblings) {
+        aura_gpu_adapter_destroy(gpu_adapter);
+    }
+}
+
+/**
+ * aura_gpu_probe() - Entry point
+ *
+ * @state: Initial state to apply to and found devices
+ *
+ * @return: Zero or a negative error number
+ */
+error_t aura_gpu_probe (
+    const struct lights_state *state
+){
+    struct callback_data data = {0};
+    struct i2c_adapter *adapters[MAX_SUPPORTED_GPUS];
+    struct aura_gpu_adapter *gpu_adapter = NULL;
+    struct aura_gpu_controller *gpu_controller;
+    error_t err;
+    int adapter_count = 0;
+    int i = 0;
+
+    i2c_for_each_dev(&data, aura_gpu_probe_device);
+    if (data.error) {
+        err = data.error;
+        AURA_DBG("aura_gpu_probe_device() Failed with error %d", err);
+        goto error;
+    }
+
+    if (data.count < MAX_SUPPORTED_GPUS) {
+        AURA_DBG("Trying built-in drivers");
+
+        adapter_count = gpu_adapters_create(adapters, ARRAY_SIZE(adapters));
+        if (adapter_count < 0) {
+            err = adapter_count;
+            goto error;
+        }
+
+        for (i = 0; i < adapter_count; i++) {
+            gpu_controller = aura_gpu_controller_create(adapters[i]);
+            if (IS_ERR_OR_NULL(gpu_controller)) {
+                gpu_adapter_destroy(adapters[i]);
+                adapters[i] = NULL;
+
+                if (gpu_controller) {
+                    err = CLEAR_ERR(gpu_controller);
+                    goto error;
+                }
+            } else {
+                gpu_adapter = aura_gpu_adapter_create(adapters[i], gpu_adapter_destroy);
+                if (IS_ERR(gpu_adapter)) {
+                    err = CLEAR_ERR(gpu_adapter);
+                    goto error;
+                } else {
+                    adapters[i] = NULL;
+                }
+            }
         }
     }
+
+    return data.count;
+
+error:
+    for (i = 0; i < adapter_count; i++) {
+        if (adapters[i])
+            gpu_adapter_destroy(adapters[i]);
+    }
+
+    aura_gpu_release();
+
+    return err;
 }

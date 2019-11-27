@@ -9,6 +9,10 @@
  */
 
 #include <linux/usb.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+
+#include <aura/debug.h>
 #include "usb-transfer.h"
 #include "usb-driver.h"
 

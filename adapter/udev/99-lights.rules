@@ -1,1 +1,1 @@
-KERNEL=="lights/*", GROUP="lights"
+SUBSYSTEM=="lights", GROUP="lights"

@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "aura-smbus.h"
+#include <linux/delay.h>
+#include <linux/i2c.h>
+#include <linux/pci.h>
+
+#include <include/types.h>
+#include <adapter/debug.h>
 
 #define MUX_NAME "i2c-nct6775"
 
 /* Nuvoton SMBus address offsets */
-#define SMBHSTDAT               (0x0 + smba)
-#define SMBBLKSZ                (0x1 + smba)
-#define SMBHSTCMD               (0x2 + smba)
-#define SMBHSTIDX               (0x3 + smba)
-#define SMBHSTCTL               (0x4 + smba)
-#define SMBHSTADD               (0x5 + smba)
-#define SMBHSTERR               (0x9 + smba)
-#define SMBHSTSTS               (0xE + smba)
+#define SMBHSTDAT   (0x0 + smba)
+#define SMBBLKSZ    (0x1 + smba)
+#define SMBHSTCMD   (0x2 + smba)
+#define SMBHSTIDX   (0x3 + smba)
+#define SMBHSTCTL   (0x4 + smba)
+#define SMBHSTADD   (0x5 + smba)
+#define SMBHSTERR   (0x9 + smba)
+#define SMBHSTSTS   (0xE + smba)
 
 /* request_region size */
 #define SMBIOSIZE               0xE
@@ -54,14 +59,14 @@ const struct chip_id {
     { "NCT6798", 0xd428 }
 };
 
-struct aura_smbus_context {
-    struct aura_smbus_adapter   smbus_adapter;
+struct nuvoton_context {
     uint16_t                    smba;
     struct i2c_adapter          adapter;
 };
 
-#define smbus_context(ptr)\
-    container_of(ptr, struct aura_smbus_context, smbus_adapter)
+#define context_from_adapter(ptr)( \
+    container_of(ptr, struct nuvoton_context, adapter) \
+)
 
 static void fill_output_buffer (
     uint16_t smba,
@@ -87,7 +92,7 @@ static void fill_output_buffer (
     } while (len);
 }
 
-static error_t aura_smbus_nuvoton_transfer (
+static error_t nuvoton_transfer (
     struct i2c_adapter * adapter,
     uint16_t addr,
     uint16_t flags,
@@ -96,7 +101,7 @@ static error_t aura_smbus_nuvoton_transfer (
     int size,
     union i2c_smbus_data * data
 ){
-    struct aura_smbus_context *ctx = i2c_get_adapdata(adapter);
+    struct nuvoton_context *ctx = i2c_get_adapdata(adapter);
     uint16_t smba = ctx->smba;
 
     /* Reset the bus */
@@ -171,7 +176,7 @@ static error_t aura_smbus_nuvoton_transfer (
     return 0;
 }
 
-static uint32_t aura_smbus_nuvoton_func (
+static uint32_t nuvoton_func (
     struct i2c_adapter *adapter
 ){
     return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
@@ -179,12 +184,12 @@ static uint32_t aura_smbus_nuvoton_func (
         I2C_FUNC_SMBUS_BLOCK_DATA;
 }
 
-static const struct i2c_algorithm aura_smbus_nuvoton_algorithm = {
-    .smbus_xfer     = aura_smbus_nuvoton_transfer,
-    .functionality  = aura_smbus_nuvoton_func,
+static const struct i2c_algorithm nuvoton_algorithm = {
+    .smbus_xfer     = nuvoton_transfer,
+    .functionality  = nuvoton_func,
 };
 
-static error_t aura_smbus_nuvoton_read_smba (
+static error_t nuvoton_read_smba (
     uint16_t *smba
 ){
     const struct chip_id *chip;
@@ -231,7 +236,7 @@ static error_t aura_smbus_nuvoton_read_smba (
             value &= 0xfff8;
 
             if (value) {
-                // AURA_DBG("Detected a Nuvoton %s SMBus at 0x%04x", chip->name, value);
+                // LIGHTS_DBG("Detected a Nuvoton %s SMBus at 0x%04x", chip->name, value);
                 *smba = value;
             } else {
                 chip = NULL;
@@ -253,22 +258,22 @@ static error_t aura_smbus_nuvoton_read_smba (
     return -ENODEV;
 }
 
-static struct aura_smbus_context *aura_smbus_nuvoton_context_create (
+static struct nuvoton_context *nuvoton_context_create (
     void
 ){
-    struct aura_smbus_context *ctx;
+    struct nuvoton_context *ctx;
     uint16_t smba;
     error_t err;
 
     /* Determine the address of the SMBus areas */
-    err = aura_smbus_nuvoton_read_smba(&smba);
+    err = nuvoton_read_smba(&smba);
     if (err)
         return ERR_PTR(err);
 
     if (acpi_check_region(smba, SMBIOSIZE, "nuvoton_smbus"))
         return ERR_PTR(-ENODEV);
 
-    AURA_INFO("Nuvoton SMBus Host Controller at 0x%x", smba);
+    LIGHTS_INFO("Nuvoton SMBus Host Controller at 0x%x", smba);
 
     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
@@ -279,28 +284,37 @@ static struct aura_smbus_context *aura_smbus_nuvoton_context_create (
     return ctx;
 }
 
-static void aura_smbus_nuvoton_adapter_destroy (
-    struct aura_smbus_adapter *smbus_adapter
+#ifndef EXPORT_SYMBOL_NS_GPL
+#define EXPORT_SYMBOL_NS_GPL(_sym, _ns) EXPORT_SYMBOL_GPL(_sym)
+#endif
+
+void nuvoton_adapter_destroy (
+    struct i2c_adapter *adapter
 ){
-    struct aura_smbus_context *context = smbus_context(smbus_adapter);
+    struct nuvoton_context *context = context_from_adapter(adapter);
+
+    if (IS_NULL(adapter))
+        return;
 
     i2c_del_adapter(&context->adapter);
     kfree(context);
 }
+EXPORT_SYMBOL_NS_GPL(nuvoton_adapter_destroy, LIGHTS);
 
-struct aura_smbus_adapter *aura_smbus_nuvoton_adapter_create (
+
+struct i2c_adapter *nuvoton_adapter_create (
     void
 ){
-    struct aura_smbus_context *context;
+    struct nuvoton_context *context;
     error_t err;
 
-    context = aura_smbus_nuvoton_context_create();
+    context = nuvoton_context_create();
     if (IS_ERR(context))
         return ERR_CAST(context);
 
     context->adapter.owner = THIS_MODULE;
     context->adapter.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
-    context->adapter.algo  = &aura_smbus_nuvoton_algorithm;
+    context->adapter.algo  = &nuvoton_algorithm;
     // context->adapter.dev.parent = &pci_dev->dev;
 
     snprintf(context->adapter.name, sizeof(context->adapter.name),
@@ -314,8 +328,6 @@ struct aura_smbus_adapter *aura_smbus_nuvoton_adapter_create (
         return ERR_PTR(err);
     }
 
-    context->smbus_adapter.adapter = &context->adapter;
-    context->smbus_adapter.destroy = aura_smbus_nuvoton_adapter_destroy;
-
-    return &context->smbus_adapter;
+    return &context->adapter;
 }
+EXPORT_SYMBOL_NS_GPL(nuvoton_adapter_create, LIGHTS);

@@ -10,7 +10,8 @@
 * Authors:
 * Owen Parry <twifty@zoho.com>
 */
-#include "../aura.h"
+#include <include/types.h>
+
 #include "usb-transfer.h"
 
 struct usb_controller {

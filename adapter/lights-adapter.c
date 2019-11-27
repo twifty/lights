@@ -1,1462 +1,672 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <linux/kernel.h>
-#include <linux/version.h>
-#include <linux/fs.h>
-#include <linux/device.h>
-#include <linux/cdev.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/list.h>
-#include <linux/uaccess.h>
 #include "lights-adapter.h"
+#include "lib/reserve.h"
+#include "lib/async.h"
 
-#define LIGHTS_ERR(_fmt, ...)\
-    pr_err("lights: " _fmt "\n", ##__VA_ARGS__)
-#define LIGHTS_WARN(_fmt, ...)\
-    pr_warn("lights: " _fmt "\n", ##__VA_ARGS__)
-#define LIGHTS_DBG(_fmt, ...)\
-    pr_debug("lights: " _fmt "\n", ##__VA_ARGS__)
-#define LIGHTS_INFO(_fmt, ...)\
-    pr_info("lights: " _fmt "\n", ##__VA_ARGS__)
+/* Forward declare for the vtable */
+static error_t lights_adapter_smbus_read (
+    const struct lights_adapter_client * client,
+    struct lights_adapter_msg * msg
+);
+static error_t lights_adapter_smbus_write (
+    const struct lights_adapter_client * client,
+    const struct lights_adapter_msg * msg
+);
 
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(5,1,18))
-static inline void list_swap(struct list_head *entry1, struct list_head *entry2)
-{
-    struct list_head *pos = entry2->prev;
+struct lights_adapter_vtable {
+    enum lights_adapter_protocol proto;
+    error_t (*read)(const struct lights_adapter_client *, struct lights_adapter_msg *);
+    error_t (*write)(const struct lights_adapter_client *, const struct lights_adapter_msg *);
+} lights_adapter_vtables[] = {{
+    .proto = LIGHTS_PROTOCOL_SMBUS,
+    .read  = lights_adapter_smbus_read,
+    .write = lights_adapter_smbus_write,
+},{
+    .proto = LIGHTS_PROTOCOL_I2C,
+    .read  = lights_adapter_smbus_read,
+    .write = lights_adapter_smbus_write,
+}};
 
-    list_del(entry2);
-    list_replace(entry1, entry2);
-    if (pos == entry1)
-        pos = entry2;
-    list_add(entry1, pos);
-}
-#endif
-
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(5,0,0))
-#define is_user_memory(_ptr, _size) access_ok(VERIFY_READ, _ptr, _size)
-#else
-#define is_user_memory access_ok
-#endif
-
-#ifndef EXPORT_SYMBOL_NS_GPL
-#define EXPORT_SYMBOL_NS_GPL(sym, ns) EXPORT_SYMBOL_GPL(sym)
-#endif
-
-#define LIGHTS_FIRST_MINOR          0
-#define LIGHTS_MAX_MINORS           512
-#define LIGHTS_MAX_DEVICES          64
-
-/*
- * Assigned numbers, used for dynamic minors
- */
-static DECLARE_BITMAP(lights_minors, LIGHTS_MAX_MINORS);
-static LIST_HEAD(lights_interface_list);
-static DEFINE_MUTEX(lights_interface_lock);
-static LIST_HEAD(lights_caps_list);
-
-static struct lights_mode lights_available_modes[] = {
-    { LIGHTS_MODE_OFF,       LIGHTS_MODE_LABEL_OFF,      },
-    { LIGHTS_MODE_STATIC,    LIGHTS_MODE_LABEL_STATIC,   },
-    { LIGHTS_MODE_BREATHING, LIGHTS_MODE_LABEL_BREATHING },
-    { LIGHTS_MODE_FLASHING,  LIGHTS_MODE_LABEL_FLASHING  },
-    { LIGHTS_MODE_CYCLE,     LIGHTS_MODE_LABEL_CYCLE     },
-    { LIGHTS_MODE_RAINBOW,   LIGHTS_MODE_LABEL_RAINBOW   },
-    { LIGHTS_MODE_ENDOFARRAY }
-};
-
-struct lights_caps {
-    struct list_head    siblings;
-    struct lights_mode  mode;
-    uint32_t            ref_count;
-};
-
-/*
-    A container for each character device
- */
-struct lights_file {
-    int                                 minor;     /* A LIGHT_CLASS minor number */
-    struct cdev                         cdev;      /* The files character device */
-    struct device                       *dev;      /* The files driver device */
-    struct list_head                    siblings;  /* Pointers to prev and next light_dev_file */
-    const struct lights_io_attribute    attr;      /* Pointer to the attributes it was created with */
-    struct lights_interface             *intf;     /* The owning interface */
-    struct file_operations              fops;      /* The cdev fops */
-};
-#define attr_to_file(ptr) \
-    container_of(ptr, struct lights_file, attr)
-
-/*
-    Each interface represents a directory within the root class directory. Each
-    directory may contain user defined character devices for accessing individual
-    light settings.
- */
-struct lights_interface {
-    char                    name[LIGHTS_MAX_FILENAME_LENGTH]; /* The dir name of the light device */
-    spinlock_t              file_lock;                        /* Lock for the file_list */
-    struct list_head        file_list;                        /* A linked list of lights_file */
-    struct list_head        siblings;                         /* Pointers to prev and next lights_interface */
-    struct lights_dev       *ldev;                            /* The users object */
-    struct device           kdev;
-};
-#define dev_to_interface(dev) \
-    container_of(dev, struct lights_interface, kdev)
-
-static int lights_major;
-static struct class *lights_class;
-static struct lights_state lights_global_state;
-static DEFINE_SPINLOCK(lights_state_lock);
-
-static char *default_color = "#FF0000";
-static char *default_mode  = "static";
-static char *default_speed = "2";
-
-
-static error_t lights_add_caps (
-    const struct lights_mode *mode
+static inline const struct lights_adapter_vtable *lights_adapter_vtable_get (
+    enum lights_adapter_protocol proto
 ){
-    struct lights_caps *caps;
-    struct lights_caps *insert;
-    int equality;
-
-    if (WARN_ON(NULL == mode || NULL == mode->name)) {
-        LIGHTS_DBG("NULL ptr detected");
-        return -EINVAL;
+    switch (proto) {
+        case LIGHTS_PROTOCOL_SMBUS:
+            return &lights_adapter_vtables[0];
+        case LIGHTS_PROTOCOL_I2C:
+            return &lights_adapter_vtables[1];
+        case LIGHTS_PROTOCOL_USB:
+            break;
     }
 
-    if (lights_is_custom_mode(mode))
-        return 0;
+    LIGHTS_ERR("Not a valid adapter protocol: 0x%x", proto);
 
-    insert = NULL;
-    if (!list_empty(&lights_caps_list)) {
-        list_for_each_entry(caps, &lights_caps_list, siblings) {
-            equality = strcmp(caps->mode.name, mode->name);
-
-            if (caps->mode.id == mode->id) {
-                if (equality == 0) {
-                    caps->ref_count++;
-                    return 0;
-                } else {
-                    LIGHTS_ERR(
-                        "mode %d:%s conflicts with known mode %d:%s",
-                        mode->id, mode->name,
-                        caps->mode.id, caps->mode.name
-                    );
-                    return -EINVAL;
-                }
-            }
-
-            if (!insert && equality > 0)
-                insert = caps;
-        }
-    }
-
-    caps = kzalloc(sizeof(*caps), GFP_KERNEL);
-    if (!caps)
-        return -ENOMEM;
-
-    caps->mode = *mode;
-    caps->ref_count = 1;
-
-    if (insert)
-        list_add_tail(&caps->siblings, &insert->siblings);
-    else
-        list_add_tail(&caps->siblings, &lights_caps_list);
-
-    return 0;
+    return ERR_PTR(-EINVAL);
 }
 
-static void lights_del_caps (
-    const struct lights_mode *mode
+/**
+ * struct lights_adapter_context - I2C wrapper
+ *
+ * @adapter:     vtable container (TODO: remove)
+ * @lock:        Context lock
+ * @mempool:     Pool of @lights_context_job
+ * @async_queue: Single thread to execute async jobs
+ * @i2c_adapter: The adapter being wrapped
+ */
+struct lights_adapter_context {
+    const struct lights_adapter_vtable  *vtable;
+    struct list_head                    siblings;
+    struct kref                         refs;
+    struct mutex                        lock;
+    reserve_t                           reserve;
+    async_queue_t                       async_queue;
+    size_t                              max_async;
+    const char                          *name;
+
+    atomic_t                            allocated_jobs;
+
+    union {
+        struct i2c_adapter              *i2c_adapter;
+    };
+};
+#define adapter_from_ref(ptr)( \
+    container_of(ptr, struct lights_adapter_context, refs) \
+)
+
+static LIST_HEAD(lights_adapter_list);
+static DEFINE_SPINLOCK(lights_adapter_lock);
+
+/**
+ * lights_adapter_find() - Searches for a context for a client
+ *
+ * @client: Client whose context to find
+ *
+ * @return: NULL or a reference counted context
+ *
+ * While a client may not have an associated context, there may
+ * have been one created for the underlying device.
+ */
+static struct lights_adapter_context *lights_adapter_find (
+    const struct lights_adapter_client *client
 ){
-    struct lights_caps *caps, *safe;
+    struct lights_adapter_context *context;
 
-    if (WARN_ON(NULL == mode)) {
-        LIGHTS_DBG("NULL ptr detected");
-        return;
-    }
-
-    list_for_each_entry_safe(caps, safe, &lights_caps_list, siblings) {
-        if (caps->mode.id == mode->id) {
-            caps->ref_count--;
-            if (0 == caps->ref_count) {
-                list_del(&caps->siblings);
-                kfree(caps);
-                return;
-            }
-        }
-    }
-}
-
-static const struct lights_mode *lights_find_caps (
-    const char *name
-){
-    struct lights_caps *caps;
-
-    if (WARN_ON(NULL == name)) {
-        LIGHTS_DBG("NULL ptr detected");
+    if (IS_NULL(client, lights_adapter_vtable_get(client->proto)))
         return ERR_PTR(-EINVAL);
+
+    if (client->adapter) {
+        kref_get(&client->adapter->refs);
+        return client->adapter;
     }
 
-    list_for_each_entry(caps, &lights_caps_list, siblings) {
-        if (0 == strncmp(caps->mode.name, name, strlen(caps->mode.name))) {
-            return &caps->mode;
-        }
-    }
-
-    return ERR_PTR(-ENOENT);
-}
-
-static ssize_t lights_dump_caps (
-    char *buffer
-){
-    struct list_head *interface;
-    struct lights_caps *caps;
-    size_t mode_len;
-    ssize_t written = 0;
-    uint32_t ref_count = 0;
-
-    list_for_each(interface, &lights_interface_list)
-        ref_count++;
-
-    /* The first interface is for 'all' */
-    ref_count--;
-    if (ref_count == 0)
-        return 0;
-
-    list_for_each_entry(caps, &lights_caps_list, siblings) {
-        if (caps->ref_count != ref_count)
-            continue;
-
-        mode_len = strlen(caps->mode.name);
-
-        if (written + mode_len + 1 > PAGE_SIZE) {
-            written = -ENOMEM;
-            break;
-        }
-
-        memcpy(buffer, caps->mode.name, mode_len);
-        buffer[mode_len] = '\n';
-
-        mode_len++;
-        buffer += mode_len;
-        written += mode_len;
-    }
-
-    return written;
-}
-
-static ssize_t lights_dump_modes (
-    const struct lights_mode *modes,
-    char *buffer
-){
-    const struct lights_mode *iter = modes;
-    size_t mode_len;
-    ssize_t written = 0;
-
-    while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
-        if (!iter->name || 0 == iter->name[0])
-            return -EIO;
-
-        mode_len = strlen(iter->name);
-
-        if (written + mode_len + 1 > PAGE_SIZE) {
-            written = -ENOMEM;
-            break;
-        }
-
-        memcpy(buffer, iter->name, mode_len);
-        buffer[mode_len] = '\n';
-
-        mode_len++;
-        buffer += mode_len;
-        written += mode_len;
-
-        iter++;
-    }
-
-    return written;
-}
-
-static error_t lights_append_caps (
-    const struct lights_mode *modes
-){
-    const struct lights_mode *iter = modes;
-    error_t err;
-
-    if (WARN_ON(NULL == modes))
-        return -EINVAL;
-
-    while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
-        err = lights_add_caps(iter);
-        if (err) {
-            const struct lights_mode *rem = modes;
-            while (rem != iter) {
-                lights_del_caps(rem);
-                rem++;
+    list_for_each_entry(context, &lights_adapter_list, siblings) {
+        if (context->vtable->proto == client->proto) {
+            switch (client->proto) {
+                case LIGHTS_PROTOCOL_SMBUS:
+                    if (context->i2c_adapter == client->smbus_client.adapter) {
+                        kref_get(&context->refs);
+                        return context;
+                    }
+                    break;
+                case LIGHTS_PROTOCOL_I2C:
+                    if (context->i2c_adapter == client->i2c_client.adapter) {
+                        kref_get(&context->refs);
+                        return context;
+                    }
+                    break;
+                case LIGHTS_PROTOCOL_USB:
+                    break;
             }
-            return err;
-        }
-        iter++;
-    }
-
-    return 0;
-}
-
-static void lights_remove_caps (
-    const struct lights_mode *modes
-){
-    while (modes->id != LIGHTS_MODE_ENDOFARRAY) {
-        lights_del_caps(modes);
-        modes++;
-    }
-}
-
-
-ssize_t lights_read_color (
-    const char *buffer,
-    size_t len,
-    struct lights_color *color
-){
-    char kern_buf[9];
-    const char *p;
-    size_t count;
-    uint8_t n;
-    u32 value;
-    error_t i;
-
-    count = len < 8 ? len : 8;
-    if (is_user_memory(buffer, count)) {
-        copy_from_user(kern_buf, buffer, count);
-        buffer = kern_buf;
-    }
-
-    // If the string beings with '#' or '0x' expect 6 hex values
-    p = buffer;
-    value = 0;
-
-    if (count >= 7) {
-        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
-            p += 2;
-        else if (p[0] == '#')
-            p += 1;
-
-        if (p != buffer) {
-            for (i = 20; i >= 0 && *p && p - buffer < count; i -= 4) {
-                if (*p >= '0' && *p <= '9')
-                    n = *p - '0';
-                else if (*p >= 'a' && *p <= 'f')
-                    n = (*p - 'a') + 10;
-                else if (*p >= 'A' && *p <= 'F')
-                    n = (*p - 'A') + 10;
-                else
-                    return -EINVAL;
-
-                value |= n << i;
-                p++;
-            }
-
-            color->r = (value >> 16) & 0xFF;
-            color->g = (value >> 8) & 0xFF;
-            color->b = value & 0xFF;
-
-            return p - buffer;
         }
     }
 
-    return -EINVAL;
-}
-EXPORT_SYMBOL_NS_GPL(lights_read_color, LIGHTS);
-
-ssize_t lights_read_mode (
-    const char *buffer,
-    size_t len,
-    const struct lights_mode *haystack,
-    struct lights_mode *mode
-){
-    const struct lights_mode *p;
-    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH];
-    size_t count;
-
-    count = len < LIGHTS_MAX_MODENAME_LENGTH ? len : LIGHTS_MAX_MODENAME_LENGTH;
-    if (is_user_memory(buffer, count)) {
-        copy_from_user(kern_buf, buffer, count);
-        buffer = kern_buf;
-    }
-
-    for (p = haystack; p->id != LIGHTS_MODE_ENDOFARRAY && p->name; p++) {
-        if (strcmp(buffer, p->name) == 0) {
-            *mode = *p;
-            return 0;
-        }
-    }
-
-    return -EINVAL;
-}
-EXPORT_SYMBOL_NS_GPL(lights_read_mode, LIGHTS);
-
-ssize_t lights_read_speed (
-    const char *buffer,
-    size_t len,
-    uint8_t *speed
-){
-    char tmp;
-
-    if (len < 1)
-        return -EINVAL;
-
-    if (is_user_memory(buffer, 1)) {
-        if (get_user(tmp, buffer))
-            return -EFAULT;
-    } else {
-        tmp = buffer[0];
-    }
-
-    if (tmp < '1' || tmp > '5')
-        return -EINVAL;
-
-    *speed = tmp - '0';
-
-    return 1;
-}
-EXPORT_SYMBOL_NS_GPL(lights_read_speed, LIGHTS);
-
-void lights_get_state (
-    struct lights_state *state
-){
-    *state = lights_global_state;
-}
-EXPORT_SYMBOL_NS_GPL(lights_get_state, LIGHTS);
-
-
-static error_t update_dev_mode (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_mode) ? dev->update_mode(params) : 0;
+    return NULL;
 }
 
-static error_t update_dev_color (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_color) ? dev->update_color(params) : 0;
-}
-
-static error_t update_dev_speed (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_speed) ? dev->update_speed(params) : 0;
-}
-
-static error_t for_each_device_call (
-    error_t (*callback)(struct lights_dev *, const struct lights_state *)
-){
-    struct lights_interface *interface;
-    error_t err = 0;
-
-    mutex_lock(&lights_interface_lock);
-
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        err = callback(interface->ldev, &lights_global_state);
-        if (err)
-            break;
-    }
-
-    mutex_unlock(&lights_interface_lock);
-
-    return err;
-}
-
-static error_t color_read (
-    void *data,
-    struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    io->data.color = lights_global_state.color;
-    spin_unlock(&lights_state_lock);
-
-    return 0;
-}
-
-static error_t color_write (
-    void *data,
-    const struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    lights_global_state.color = io->data.color;
-    spin_unlock(&lights_state_lock);
-
-    // Loop through and update connected devices
-    return for_each_device_call(update_dev_color);
-}
-
-static error_t mode_read (
-    void *data,
-    struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    io->data.mode = lights_global_state.mode;
-    spin_unlock(&lights_state_lock);
-
-    return 0;
-}
-
-static error_t mode_write (
-    void *data,
-    const struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    lights_global_state.mode = io->data.mode;
-    spin_unlock(&lights_state_lock);
-
-    return for_each_device_call(update_dev_mode);
-}
-
-static error_t speed_read (
-    void *data,
-    struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    io->data.speed = lights_global_state.speed;
-    spin_unlock(&lights_state_lock);
-
-    return 0;
-}
-
-static error_t speed_write (
-    void *data,
-    const struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    lights_global_state.speed = io->data.speed;
-    spin_unlock(&lights_state_lock);
-
-    return for_each_device_call(update_dev_speed);
-}
-
-static ssize_t caps_show (
-    struct device *dev,
-    struct device_attribute *attr,
-    char *buf
-){
-    struct lights_interface *intf = dev_to_interface(dev);
-    ssize_t written = 0;
-
-    if (0 == strcmp(intf->name, "all")) {
-        written = lights_dump_caps(buf);
-    } else if (intf->ldev->caps) {
-        written = lights_dump_modes(intf->ldev->caps, buf);
-    }
-
-    return written;
-}
-DEVICE_ATTR_RO(caps);
-
-static ssize_t led_count_show (
-    struct device *dev,
-    struct device_attribute *attr,
-    char *buf
-){
-    struct lights_interface *intf = dev_to_interface(dev);
-
-    if (intf->ldev)
-        return sprintf(buf, "%d", intf->ldev->led_count);
-
-    /* The 'all' interface has no associated dev, so 0 leds */
-    return 0;
-}
-DEVICE_ATTR_RO(led_count);
-
-static struct attribute *lights_class_attrs[] = {
-	&dev_attr_caps.attr,
-    &dev_attr_led_count.attr,
-	NULL,
+/**
+ * struct lights_adapter_job - Storage for queued job data
+ *
+ * @async:      Required by async
+ * @msg:        Linked list of messaged
+ * @client:     Adapter and address
+ * @completion: Callers completion handler
+ * @priv_data:  Callers suplemental completion data
+ *
+ * The objects are memory pool managed. A linked list of messages
+ * consists of one fully initialized job head, followed by zero
+ * or more partially initialized job.
+ */
+struct lights_adapter_job {
+    struct async_job                async;
+    struct lights_adapter_msg       msg;
+    struct lights_adapter_client    client;
+    lights_adapter_done_t           completion;
+    void                            *priv_data;
 };
+#define job_from_async(ptr)( \
+    container_of(ptr, struct lights_adapter_job, async) \
+)
+#define job_from_msg(ptr)( \
+    container_of(ptr, struct lights_adapter_job, msg) \
+)
 
-static const struct attribute_group lights_class_group = {
-	.attrs = lights_class_attrs,
-};
-
-static const struct attribute_group *lights_class_groups[] = {
-	&lights_class_group,
-	NULL,
-};
-
-
-static const struct lights_io_attribute *find_attribute_for_file (
-    struct file *filp
+/**
+ * reserve_alloc_job() - Fetches a job from the memory pool
+ *
+ * @context: Created when calling @lights_adapter_register
+ *
+ * @return: An empty job (don't assume the memory is zeroed)
+ */
+static inline struct lights_adapter_job *reserve_alloc_job (
+    struct lights_adapter_context * context
 ){
-    struct lights_interface *interface;
-    struct lights_file *file_iter;
-    const struct lights_io_attribute *attr;
-    struct cdev *cdev;
+    struct lights_adapter_job *job = reserve_alloc(context->reserve);
 
-    cdev = filp->f_inode->i_cdev;
-
-    mutex_lock(&lights_interface_lock);
-
-    attr = NULL;
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        if (!list_empty(&interface->file_list)) {
-            list_for_each_entry(file_iter, &interface->file_list, siblings) {
-                if (cdev == &file_iter->cdev) {
-                    attr = &file_iter->attr;
-                    goto found;
-                }
-            }
-        }
+    if (!IS_ERR_OR_NULL(job)) {
+        memset(job, 0, sizeof(*job));
+        atomic_inc(&context->allocated_jobs);
     }
 
-found:
-    mutex_unlock(&lights_interface_lock);
-
-    return attr;
+    return job;
 }
 
-static ssize_t lights_color_read (
-    struct file *filp,
-    char __user *buf,
-    size_t len,
-    loff_t *off
+/**
+ * reserve_free_job() - Returns a job to the memory pool
+ *
+ * @context: Created when calling @lights_adapter_register
+ * @job:     Previously created with @reserve_alloc_job
+ */
+static inline void reserve_free_job (
+    struct lights_adapter_context * context,
+    struct lights_adapter_job const * job
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_COLOR
-    };
-    struct lights_color *c = &io.data.color;
-    char color_buf[9];
-    ssize_t err;
+    if (IS_NULL(context, job))
+        return;
 
-    if (*off >= 9)
-        return 0;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
-    if (err)
-        return err;
-
-    snprintf(color_buf, 9, "#%02X%02X%02X\n", c->r, c->g, c->b);
-    err = copy_to_user(buf, color_buf, 9);
-    if (err)
-        return -EFAULT;
-
-    return *off = 9;
+    atomic_dec(&context->allocated_jobs);
+    reserve_free(context->reserve, job);
 }
 
-static ssize_t lights_color_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
+/**
+ * lights_adapter_destroy() - Destructor
+ *
+ * @ref: Reference counter
+ */
+static void lights_adapter_destroy (
+    struct kref *ref
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_COLOR
-    };
-    ssize_t count, err;
+    struct lights_adapter_context *context = adapter_from_ref(ref);
+    int alloc;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
+    spin_lock(&lights_adapter_lock);
+    list_del(&context->siblings);
+    spin_unlock(&lights_adapter_lock);
 
-    count = lights_read_color(buf, len, &io.data.color);
-    if (count < 0)
-        return count;
+    LIGHTS_DBG("Releasing adapter '%s'", context->i2c_adapter->name);
 
-    err = attr->write(attr->private_data, &io);
-    if (err)
-        return err;
+    if (context->async_queue)
+        async_queue_destroy(context->async_queue);
 
-    return len;
-}
-
-static ssize_t lights_mode_read (
-    struct file *filp,
-    char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_MODE
-    };
-    struct lights_mode *mode = &io.data.mode;
-    char mode_buf[LIGHTS_MAX_MODENAME_LENGTH];
-    ssize_t count, err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
-    if (err)
-        return err;
-
-    count = strlen(mode->name) + 2;
-    if (*off >= count)
-        return 0;
-
-    snprintf(mode_buf, count, "%s\n", mode->name);
-    err = copy_to_user(buf, mode_buf, len < count ? len : count);
-    if (err)
-        return -EFAULT;
-
-    return *off = count;
-}
-
-static ssize_t lights_mode_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    struct lights_interface *intf;
-    const struct lights_io_attribute *attr;
-    const struct lights_mode *mode;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_MODE
-    };
-    // struct lights_mode mode;
-    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH + 1];
-    char *name;
-    size_t count, err;
-
-    if (!len)
-        return -EINVAL;
-
-    // count = len < LIGHTS_MAX_MODENAME_LENGTH ? len : LIGHTS_MAX_MODENAME_LENGTH;
-    count = min_t(size_t, len, LIGHTS_MAX_MODENAME_LENGTH);
-    copy_from_user(kern_buf, buf, count);
-    kern_buf[count] = 0;
-    name = strim(kern_buf);
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    /* mode should exist within the interfaces caps */
-    intf = attr_to_file(attr)->intf;
-
-    if (0 == strcmp("all", intf->name)) {
-        mode = lights_find_caps(name);
-        if (IS_ERR(mode))
-            return PTR_ERR(mode);
-    } else {
-        mode = intf->ldev->caps;
-        if (mode) {
-            LIGHTS_DBG("Searching '%s' for mode '%s'", intf->name, name);
-            while (mode->id != LIGHTS_MODE_ENDOFARRAY) {
-                if (0 == strcmp(mode->name, name))
-                    goto found;
-                mode++;
-            }
-            mode = NULL;
-        }
+    alloc = atomic_read(&context->allocated_jobs);
+    if (alloc > 0) {
+        LIGHTS_ERR("Reserve contains %d unallocated jobs", alloc);
     }
 
-found:
-    if (!mode)
-        return -EINVAL;
+    if (context->reserve)
+        reserve_put(context->reserve);
 
-    io.data.mode = *mode;
-    err = attr->write(attr->private_data, &io);
-    if (err)
-        return err;
-
-    return len;
+    kfree(context);
 }
 
-static ssize_t lights_speed_read (
-    struct file *filp,
-    char __user *buf,
-    size_t len,
-    loff_t *off
+/**
+ * lights_adapter_smbus_read() - Processes a single read
+ *
+ * @client: Provided by the adapter caller
+ * @msg:    Provided by the adapter caller
+ *
+ * @return: Zero or negative error number
+ *
+ * Read values are stored in the given @msg.
+ */
+static error_t lights_adapter_smbus_read (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msg
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_SPEED
-    };
-    char speed_buf[3];
-    ssize_t err;
+    s32 result = -EIO;
 
-    if (*off >= 2)
-        return 0;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
-    if (err)
-        return err;
-
-    speed_buf[0] = io.data.speed + '0';
-    speed_buf[1] = '\n';
-    speed_buf[2] = 0;
-
-    err = copy_to_user(buf, speed_buf, len < 3 ? len : 3);
-    if (err)
-        return -EFAULT;
-
-    return *off = 2;
-}
-
-static ssize_t lights_speed_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_SPEED
-    };
-    ssize_t err;
-
-    err = lights_read_speed(buf, len, &io.data.speed);
-    if (err)
-        return err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    err = attr->write(attr->private_data, &io);
-    if (err)
-        return err;
-
-    return len;
-}
-
-static ssize_t lights_raw_read (
-    struct file *filp,
-    char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_CUSTOM
-    };
-    struct lights_buffer *buffer = &io.data.raw;
-    ssize_t err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    buffer->offset = *off;
-    buffer->length = len;
-    buffer->data = kmalloc(len, GFP_KERNEL);
-    if (!buffer->data)
-        return -ENOMEM;
-
-    // TODO - Keep reading from callback until length is 0 or > len
-    err = attr->read(attr->private_data, &io);
-    if (!err) {
-        copy_to_user(buf, buffer->data, buffer->length);
-        *off = buffer->offset;
-    }
-
-    kfree(buffer->data);
-
-    return err ? err : buffer->length;
-}
-
-static ssize_t lights_raw_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_CUSTOM
-    };
-    struct lights_buffer *buffer = &io.data.raw;
-    ssize_t err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    buffer->offset = *off;
-    buffer->length = len;
-    buffer->data = kmalloc(len, GFP_KERNEL);
-    if (!buffer->data)
-        return -ENOMEM;
-
-    err = copy_from_user(buffer->data, buf, len);
-    if (err) {
-        err = -EIO;
-        goto error_free;
-    }
-
-    err = attr->write(attr->private_data, &io);
-
-error_free:
-    kfree(buffer->data);
-
-    return err ? err : buffer->length;
-}
-
-static ssize_t lights_leds_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    struct lights_interface *intf;
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_LEDS
-    };
-    struct lights_buffer *buffer = &io.data.raw;
-    uint16_t led_count;
-    ssize_t err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    intf = attr_to_file(attr)->intf;
-    led_count = intf->ldev->led_count;
-
-    /* The buffer must account for every led */
-    if (!led_count || led_count * 3 != len)
-        return -EINVAL;
-
-    buffer->offset = *off;
-    buffer->length = len;
-    buffer->data = kmalloc(len, GFP_KERNEL);
-    if (!buffer->data)
-        return -ENOMEM;
-
-    err = copy_from_user(buffer->data, buf, len);
-    if (err) {
-        err = -EIO;
-        goto error_free;
-    }
-
-    err = attr->write(attr->private_data, &io);
-
-error_free:
-    kfree(buffer->data);
-
-    return err ? err : buffer->length;
-}
-
-
-static void lights_device_release (
-    struct device *dev
-){
-    /* Nothing to do here */
-}
-
-static error_t file_operations_create (
-    struct lights_file *file,
-    const struct lights_io_attribute *attr
-){
-    memset(&file->fops, 0, sizeof(file->fops));
-
-    /*
-        The fops structure contains local red/write methods. Each of these
-        methods will retrieve the lights_file, associated with the cdev,
-        which in turn contains the user read/write functions and any
-        private data associated with it.
-     */
-    switch (attr->type) {
-        case LIGHTS_TYPE_MODE:
-            file->fops.read = lights_mode_read;
-            if (attr->write)
-                file->fops.write = lights_mode_write;
+    switch (msg->type) {
+        case I2C_SMBUS_BYTE:
+            result = i2c_smbus_read_byte(&client->i2c_client);
+            msg->data.byte = (u8)result;
+            msg->length = 1;
             break;
-        case LIGHTS_TYPE_COLOR:
-            file->fops.read = lights_color_read;
-            if (attr->write)
-                file->fops.write = lights_color_write;
+        case I2C_SMBUS_BYTE_DATA:
+            result = i2c_smbus_read_byte_data(&client->i2c_client, msg->command);
+            msg->data.byte = (u8)result;
+            msg->length = 1;
             break;
-        case LIGHTS_TYPE_SPEED:
-            file->fops.read = lights_speed_read;
-            if (attr->write)
-                file->fops.write = lights_speed_write;
+        case I2C_SMBUS_WORD_DATA:
+            if (msg->swapped)
+                result = i2c_smbus_read_word_swapped(&client->i2c_client, msg->command);
+            else
+                result = i2c_smbus_read_word_data(&client->i2c_client, msg->command);
+            msg->data.word = (u16)result;
+            msg->length = 2;
             break;
-        case LIGHTS_TYPE_CUSTOM:
-            file->fops.read = lights_raw_read;
-            if (attr->write)
-                file->fops.write = lights_raw_write;
-            break;
-        case LIGHTS_TYPE_LEDS:
-            if (!attr->write || attr->read) {
-                LIGHTS_ERR("LIGHTS_TYPE_LEDS is write only");
-                return -EINVAL;
-            }
-            file->fops.write = lights_leds_write;
+        case I2C_SMBUS_BLOCK_DATA:
+            result = i2c_smbus_read_block_data(&client->i2c_client, msg->command, msg->data.block);
+            msg->length = (u8)result;
             break;
         default:
             return -EINVAL;
     }
 
-    file->fops.owner = attr->owner;
-    memcpy((void*)&file->attr, attr, sizeof(file->attr));
-
-    return 0;
-}
-
-static struct lights_file *lights_file_create (
-    struct lights_interface *intf,
-    const struct lights_io_attribute *attr
-){
-    int minor;
-    dev_t ver;
-    struct lights_file *file;
-    error_t err;
-
-    if (!attr || !intf || !attr->attr.name || attr->attr.name[0] == 0) {
-        LIGHTS_ERR("create_lights_file() called with NULL ptr!");
-        return ERR_PTR(-EINVAL);
-    }
-
-    minor = find_first_zero_bit(lights_minors, LIGHTS_MAX_MINORS);
-    if (minor >= LIGHTS_MAX_MINORS)
-        return ERR_PTR(-EBUSY);
-
-    file = kzalloc(sizeof(*file), GFP_KERNEL);
-    if (!file)
-        return ERR_PTR(-ENOMEM);
-
-    err = file_operations_create(file, attr);
-    if (err)
-        goto error_free_file;
-
-    file->intf = intf;
-    file->minor = minor;
-    ver = MKDEV(lights_major, file->minor);
-
-    /* Create a character device with a unique major:minor */
-    cdev_init(&file->cdev, &file->fops);
-    file->cdev.owner = attr->owner;
-    err = cdev_add(&file->cdev, ver, 1);
-    if (err)
-        goto error_free_file;
-
-    /*
-     * Create a device with the same major:minor,
-     * the cdev is automatically associated with it.
-     *
-     * The name configured here will be converted to the correct
-     * path within lights_devnode().
-     */
-    file->dev = device_create(
-        lights_class,
-        &intf->kdev,
-        ver,
-        NULL,
-        "%s:%s", intf->name, attr->attr.name
-    );
-
-    if (IS_ERR(file->dev)) {
-        err = PTR_ERR(file->dev);
-        goto error_free_cdev;
-    }
-
-    set_bit(minor, lights_minors);
-
-    LIGHTS_DBG("created device '/dev/lights/%s/%s'", intf->name, attr->attr.name);
-
-    return file;
-
-error_free_cdev:
-    cdev_del(&file->cdev);
-error_free_file:
-    kfree(file);
-
-    return ERR_PTR(err);
-}
-
-static void lights_file_release (
-    struct lights_file *file
-){
-    if (!file) {
-        LIGHTS_ERR("release_lights_file() called with NULL ptr!");
-        return;
-    }
-
-    device_destroy(lights_class, MKDEV(lights_major, file->minor));
-    cdev_del(&file->cdev);
-
-    if (file->minor < LIGHTS_MAX_MINORS && file->minor >= 0)
-        clear_bit(file->minor, lights_minors);
-
-    LIGHTS_DBG("removed file '/dev/lights/%s/%s'", file->intf->name, file->attr.attr.name);
-    kfree(file);
-}
-
-static struct lights_interface *lights_interface_find (
-    struct lights_dev *dev
-){
-    struct lights_interface *interface;
-
-    if (!dev) {
-        LIGHTS_ERR("find_lights_interface() called with NULL ptr!");
-        return NULL;
-    }
-
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        if (interface->ldev == dev)
-            goto found;
-    }
-
-    interface = NULL;
-
-found:
-    return interface;
-}
-
-static struct lights_interface *lights_interface_create (
-    const char *name
-){
-    struct lights_interface *intf;
-
-    if (!name || strlen(name) == 0) {
-        LIGHTS_ERR("create_lights_interface() called with null or empty string");
-        return ERR_PTR(-EINVAL);
-    }
-
-    list_for_each_entry(intf, &lights_interface_list, siblings) {
-        if (strcmp(name, intf->name) == 0)
-            goto found;
-    }
-
-    intf = NULL;
-
-found:
-    if (intf) {
-        LIGHTS_ERR("create_lights_interface() interface already exists");
-        return ERR_PTR(-EEXIST);
-    }
-
-    intf = kzalloc(sizeof(*intf), GFP_KERNEL);
-    if (!intf) {
-        return ERR_PTR(-ENOMEM);
-    }
-
-    spin_lock_init(&intf->file_lock);
-    INIT_LIST_HEAD(&intf->file_list);
-    strncpy(intf->name, name, LIGHTS_MAX_FILENAME_LENGTH);
-
-    dev_set_name(&intf->kdev, intf->name);
-    intf->kdev.class = lights_class;
-    intf->kdev.release = lights_device_release;
-    intf->kdev.groups = lights_class_groups;
-
-    device_register(&intf->kdev);
-
-    LIGHTS_DBG("created interface '%s'", intf->name);
-
-    return intf;
-}
-
-static void lights_interface_release (
-    struct lights_interface *intf
-){
-    struct lights_file *file, *file_dafe;
-
-    if (!intf) {
-        LIGHTS_ERR("release_lights_interface() called with NULL ptr!");
-        return;
-    }
-
-    if (!list_empty(&intf->file_list)) {
-        list_for_each_entry_safe(file, file_dafe, &intf->file_list, siblings) {
-            list_del(&file->siblings);
-            lights_file_release(file);
-        }
-    }
-
-    if (intf->ldev->caps)
-        lights_remove_caps(intf->ldev->caps);
-
-    device_unregister(&intf->kdev);
-    // device_destroy(lights_class, MKDEV(lights_major, intf->minor));
-    // put_minor(intf->minor);
-
-    LIGHTS_DBG("removed interface '%s'", intf->name);
-
-    kfree(intf);
-}
-
-int lights_device_register (
-    struct lights_dev *lights
-){
-    struct lights_file *file;
-    struct lights_interface *intf;
-    const struct lights_io_attribute **attr;
-    int err = 0;
-
-    if (!lights) {
-        LIGHTS_ERR("lights_device_register() called with NULL ptr!");
-        return -EINVAL;
-    }
-
-    intf = lights_interface_create(lights->name);
-    if (IS_ERR(intf)) {
-        LIGHTS_ERR("create_lights_interface() returned %ld!", PTR_ERR(intf));
-        return PTR_ERR(intf);
-    }
-
-    intf->ldev = lights;
-
-    if (lights->caps) {
-        err = lights_append_caps(lights->caps);
-        if (err)
-            goto error_free_intf;
-    }
-
-    if (lights->attrs) {
-        for (attr = lights->attrs; *attr; attr++) {
-            file = lights_file_create(intf, *attr);
-
-            if (IS_ERR(file)) {
-                LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
-                err = PTR_ERR(file);
-                goto error_free_files;
-            }
-
-            list_add_tail(&file->siblings, &intf->file_list);
-        }
-    }
-
-    mutex_lock(&lights_interface_lock);
-    list_add_tail(&intf->siblings, &lights_interface_list);
-    mutex_unlock(&lights_interface_lock);
-
-    return 0;
-
-error_free_files:
-    list_for_each_entry(file, &intf->file_list, siblings) {
-        lights_file_release(file);
-    }
-error_free_intf:
-    kfree(intf);
-
-    return err;
-}
-EXPORT_SYMBOL_NS_GPL(lights_device_register, LIGHTS);
-
-void lights_device_unregister (
-    struct lights_dev *lights
-){
-    struct lights_interface *intf;
-
-    if (!lights) {
-        LIGHTS_ERR("lights_device_unregister() called with NULL ptr!");
-        return;
-    }
-
-    intf = lights_interface_find(lights);
-    if (!intf) {
-        LIGHTS_ERR("lights_device_unregister() failed to find interface for '%s'!", lights->name);
-        return;
-    }
-
-    mutex_lock(&lights_interface_lock);
-    list_del(&intf->siblings);
-    mutex_unlock(&lights_interface_lock);
-
-    lights_interface_release(intf);
-}
-EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
-
-error_t lights_create_file (
-    struct lights_dev *dev,
-    struct lights_io_attribute *attr
-){
-    struct lights_interface *intf;
-    struct lights_file *file;
-
-    if (WARN_ON(NULL == dev || NULL == attr))
-        return -EINVAL;
-
-    intf = lights_interface_find(dev);
-    if (!intf) {
-        LIGHTS_ERR("lights device not found (was it registered?)");
-        return -ENODEV;
-    }
-
-    file = lights_file_create(intf, attr);
-    if (IS_ERR(file)) {
-        LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
-        return PTR_ERR(file);
-    }
-
-    list_add_tail(&file->siblings, &intf->file_list);
-
-    return 0;
-}
-EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
-
-
-static struct lights_dev lights_global_dev = {
-    .name = "all",
-    // .attr_count = 3,
-    // .attributes = lights_global_attributes
-};
-
-static error_t init_default_attributes (
-    void
-){
-    error_t err;
-
-    err = lights_device_register(&lights_global_dev);
-    if (err)
-        return err;
-
-    err = lights_create_file(&lights_global_dev, &LIGHTS_COLOR_ATTR(
-        NULL,
-        color_read,
-        color_write
-    ));
-    if (err)
-        return err;
-
-    err = lights_create_file(&lights_global_dev, &LIGHTS_MODE_ATTR(
-        NULL,
-        mode_read,
-        mode_write
-    ));
-    if (err)
-        return err;
-
-    err = lights_create_file(&lights_global_dev, &LIGHTS_SPEED_ATTR(
-        NULL,
-        speed_read,
-        speed_write
-    ));
-    if (err)
-        return err;
-
-    return err;
-}
-
-static void lights_destroy (
-    void
-){
-    struct lights_interface *intf;
-    struct lights_interface *intf_safe;
-    dev_t dev_id = MKDEV(lights_major, 0);
-
-    lights_device_unregister(&lights_global_dev);
-
-    if (!list_empty(&lights_interface_list)) {
-        LIGHTS_WARN("Not all interfaces have been unregistered.");
-        mutex_lock(&lights_interface_lock);
-
-        list_for_each_entry_safe(intf, intf_safe, &lights_interface_list, siblings) {
-            list_del(&intf->siblings);
-            lights_interface_release(intf);
-        }
-
-        mutex_unlock(&lights_interface_lock);
-    }
-
-    // lights_unregister_all_devices();
-    unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
-    class_destroy(lights_class);
-}
-
-static void __exit lights_exit (void)
-{
-    lights_destroy();
-
-    LIGHTS_INFO("exiting");
+    return result < 0 ? result : 0;
 }
 
 /**
- * lights_devnode() - Creates a hierarchy within the /dev directory
- * @dev:  The device in question
- * @mode: The acces flags
+ * lights_adapter_smbus_write() - Processes a single write
  *
- * @Return: The path name
+ * @client: Provided by the adapter caller
+ * @msg:    Provided by the adapter caller
+ *
+ * @return: Zero or negative error number
  */
-static char *lights_devnode (
-    struct device *dev,
-    umode_t *mode
+static error_t lights_adapter_smbus_write (
+    const struct lights_adapter_client * client,
+    const struct lights_adapter_msg * msg
 ){
-    size_t len, i;
-    const char *name;
-    char *buf;
+    int result = -EIO;
 
-    name = dev_name(dev);
-    len = strlen(name) + 9;
-    buf = kmalloc(len, GFP_KERNEL);
+    switch (msg->type) {
+        case I2C_SMBUS_BYTE:
+            result = i2c_smbus_write_byte(&client->i2c_client, msg->data.byte);
+            break;
+        case I2C_SMBUS_BYTE_DATA:
+            result = i2c_smbus_write_byte_data(&client->i2c_client, msg->command, msg->data.byte);
+            break;
+        case I2C_SMBUS_WORD_DATA:
+            if (msg->swapped)
+                result = i2c_smbus_write_word_swapped(&client->i2c_client, msg->command, msg->data.word);
+            else
+                result = i2c_smbus_write_word_data(&client->i2c_client, msg->command, msg->data.word);
+            break;
+        case I2C_SMBUS_BLOCK_DATA:
+            result = i2c_smbus_write_block_data(&client->i2c_client, msg->command, msg->length, msg->data.block);
+            break;
+        default:
+            return -EINVAL;
+    }
 
-    if (buf) {
-        snprintf(buf, len, "lights/%s", name);
-        for (i = 8; i < len; i++) {
-            if (buf[i] == ':')
-                buf[i] = '/';
+    return result < 0 ? result : 0;
+}
+
+/**
+ * lights_adapter_job_free() - returns the job to the memory pool
+ *
+ * @job: A linked list of jobs (linked through @job->msg.next)
+ *
+ * NOTE: Only the head of the list is fully initialized, all
+ * siblings only contain a msg.
+ */
+static int lights_adapter_job_free (
+    const struct lights_adapter_job * job
+){
+    struct lights_adapter_context * context;
+    struct lights_adapter_job const * next;
+    int sanity = LIGHTS_ADAPTER_MAX_MSGS;
+    int count = 0;
+
+    if (IS_NULL(job))
+        return 0;
+
+    context = job->client.adapter;
+    if (IS_NULL(context))
+        return 0;
+
+    do {
+        next = job->msg.next ? job_from_msg(job->msg.next) : NULL;
+        count++;
+
+        reserve_free_job(context, job);
+        job = next;
+    } while (job && --sanity);
+
+    if (!sanity)
+        LIGHTS_ERR("Message count exceeded LIGHTS_ADAPTER_MAX_MSGS");
+
+    return count;
+}
+
+/**
+ * lights_adapter_job_execute() - Processes a list of queued messages
+ *
+ * @async_job: The head of the linked list
+ */
+static void lights_adapter_job_execute (
+    struct async_job *async_job,
+    enum async_queue_state state
+){
+    struct lights_adapter_job * const job = job_from_async(async_job);
+    struct lights_adapter_context * context;
+    struct lights_adapter_msg * msg;
+    int sanity = LIGHTS_ADAPTER_MAX_MSGS;
+    int count = 0;
+    error_t err = 0;
+
+    if (IS_NULL(async_job))
+        return;
+
+    context = job->client.adapter;
+    msg = &job->msg;
+
+    if (!context) {
+        LIGHTS_ERR("Job submitted without a context");
+        return;
+    }
+
+    if (state == ASYNC_STATE_RUNNING) {
+        mutex_lock(&context->lock);
+
+        /* Process each message in the job */
+        while (msg && --sanity) {
+            if (msg->read)
+                err = context->vtable->read(&job->client, msg);
+            else
+                err = context->vtable->write(&job->client, msg);
+
+            if (err)
+                break;
+
+            msg = msg->next;
+            count++;
+        }
+
+        mutex_unlock(&context->lock);
+
+        if (!sanity)
+            LIGHTS_ERR("Message count exceeded LIGHTS_ADAPTER_MAX_MSGS");
+
+        /* Notify caller, pass the erroring message, or first */
+        job->completion(err ? msg : &job->msg, job->priv_data, err);
+    } else {
+        job->completion(&job->msg, job->priv_data, -ECANCELED);
+    }
+
+    if (count != lights_adapter_job_free(job))
+        LIGHTS_ERR("Disparity between job count and jobs freed");
+}
+
+/**
+ * lights_adapter_job_create() - Creates a linked list of messages
+ *
+ * @context: Created when calling @lights_adapter_register
+ * @count:   Number of @msg objects
+ * @msg:     Array of messages
+ *
+ * @return: The head of the linked list.
+ *
+ * Each message is copied into the list.
+ */
+static struct lights_adapter_job *lights_adapter_job_create (
+    struct lights_adapter_context * const context,
+    size_t count,
+    struct lights_adapter_msg * const msg
+){
+    struct lights_adapter_job *head, *prev, *job;
+    int i;
+
+    head = prev = NULL;
+    for (i = 0; i < count; i++) {
+        job = reserve_alloc_job(context);
+        if (IS_ERR(job)) {
+
+        }
+
+        memcpy(&job->msg, &msg[i], sizeof(*msg));
+        job->msg.next = NULL;
+
+        if (!head) {
+            head = prev = job;
+        } else {
+            prev->msg.next = &job->msg;
+            prev = job;
         }
     }
 
-    return buf;
+    INIT_ASYNC_JOB(&head->async, lights_adapter_job_execute);
+
+    return head;
 }
 
-static int __init lights_init (void)
-{
-    int err;
-    dev_t dev_id;
+/**
+ * lights_adapter_init() - Creates the pool and queue for the adapter
+ *
+ * @context: Adapter on which to begin async transactions
+ *
+ * @return: Zero or a negative error number
+ */
+static error_t lights_adapter_init (
+    struct lights_adapter_context *context
+){
+    error_t err = 0;
 
-    err = lights_read_mode(default_mode, strlen(default_mode), lights_available_modes, &lights_global_state.mode);
-    if (err < 0)
-        return err;
+    if (context->async_queue && context->reserve)
+        return 0;
 
-    err = lights_read_color(default_color, strlen(default_color), &lights_global_state.color);
-    if (err < 0)
-        return err;
+    mutex_lock(&context->lock);
 
-    err = lights_read_speed(default_speed, strlen(default_speed), &lights_global_state.speed);
-    if (err < 0)
-        return err;
-
-    err = alloc_chrdev_region(&dev_id, LIGHTS_FIRST_MINOR, LIGHTS_MAX_DEVICES, "lights");
-    if (err < 0) {
-        LIGHTS_WARN("can't get major number");
-        return err;
+    if (!context->async_queue) {
+        context->async_queue = async_queue_create(context->name, context->max_async);
+        if (IS_ERR(context->async_queue)) {
+            err = CLEAR_ERR(context->async_queue);
+            goto error;
+        }
     }
 
-    lights_major = MAJOR(dev_id);
-    lights_class = class_create(THIS_MODULE, "lights");
-
-    if (IS_ERR(lights_class)) {
-        err = PTR_ERR(lights_class);
-        unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
-        LIGHTS_WARN("failed to create lights_class");
-        return err;
+    if (!context->reserve) {
+        context->reserve = reserve_get(lights_adapter_job, context->max_async, SLAB_POISON, GFP_KERNEL);
+        if (IS_ERR(context->reserve)) {
+            err = CLEAR_ERR(context->reserve);
+            goto error;
+        }
     }
 
-    lights_class->devnode = lights_devnode;
-
-    err = init_default_attributes();
-    if (err)
-        lights_destroy();
+error:
+    mutex_unlock(&context->lock);
 
     return err;
 }
 
-module_param(default_color, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_mode,  charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_speed, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_init(lights_init);
-module_exit(lights_exit);
 
-MODULE_PARM_DESC(default_color, "A hexadecimal color code, eg. #00FF00");
-MODULE_PARM_DESC(default_mode, "The name of a color mode");
-MODULE_PARM_DESC(default_speed, "The speed of the color cycle, 1-5");
-MODULE_AUTHOR("Owen Parry <waldermort@gmail.com>");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RGB Lighting Class Interface");
+/**
+ * lights_adapter_xfer() - Synchronous reads/writes
+ *
+ * @client:    Hardware parameters
+ * @msgs:      One or more messages to send
+ * @msg_count: Number of messages to send
+ *
+ * @return: Zero or a negative error code
+ */
+error_t lights_adapter_xfer (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msgs,
+    size_t count
+){
+    struct lights_adapter_context * context;
+    const struct lights_adapter_vtable * vtable;
+    error_t err = 0;
+    int i;
+
+    if (IS_NULL(client, msgs) || IS_TRUE(0 == count) || IS_TRUE(count > LIGHTS_ADAPTER_MAX_MSGS))
+        return -EINVAL;
+
+    vtable = lights_adapter_vtable_get(client->proto);
+    if (IS_ERR(vtable))
+        return CLEAR_ERR(vtable);
+
+    context = lights_adapter_find(client);
+    if (IS_ERR(context))
+        return CLEAR_ERR(context);
+
+    if (context) {
+        if (context->async_queue)
+            async_queue_pause(context->async_queue);
+        mutex_lock(&context->lock);
+    }
+
+    for (i = 0; i < count && !err; i++) {
+        if (msgs[i].read)
+            err = vtable->read(client, &msgs[i]);
+        else
+            err = vtable->write(client, &msgs[i]);
+    }
+
+    if (context) {
+        mutex_unlock(&context->lock);
+        if (context->async_queue)
+            async_queue_resume(context->async_queue);
+
+        kref_put(&context->refs, lights_adapter_destroy);
+    }
+
+    return err;
+}
+EXPORT_SYMBOL_NS_GPL(lights_adapter_xfer, LIGHTS);
+
+/**
+ * lights_adapter_xfer_async() - Asynchronous reads/writes
+ *
+ * @client:    Hardware parameters
+ * @msgs:      One or more messages to send
+ * @msg_count: Number of messages to send
+ * @cb_data:   Second parameter of @callback
+ * @callback:  Completion function
+ *
+ * @return: Zero or a negative error code
+ */
+error_t lights_adapter_xfer_async (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msgs,
+    size_t count,
+    void *cb_data,
+    lights_adapter_done_t callback
+){
+    struct lights_adapter_context * context;
+    struct lights_adapter_job *job;
+    error_t err = 0;
+
+    if (IS_NULL(client, client->adapter, msgs) || IS_TRUE(0 == count) || IS_TRUE(count > LIGHTS_ADAPTER_MAX_MSGS))
+        return -EINVAL;
+
+    context = client->adapter;
+
+    err = lights_adapter_init(context);
+    if (err) {
+        LIGHTS_ERR("Failed to initialize adapter async: %d", err);
+        kref_put(&context->refs, lights_adapter_destroy);
+        return err;
+    }
+
+    /* Create a linked list of jobs, one for each message */
+    job = lights_adapter_job_create(context, count, msgs);
+    job->client     = *client;
+    job->completion = callback;
+    job->priv_data  = cb_data;
+
+    err = async_queue_add(context->async_queue, &job->async);
+    if (err) {
+        LIGHTS_ERR("Failed to add async job: %d", err);
+        lights_adapter_job_free(job);
+    }
+
+    return err;
+}
+EXPORT_SYMBOL_NS_GPL(lights_adapter_xfer_async, LIGHTS);
+
+/**
+ * lights_adapter_unregister() - Releases an async adapter
+ *
+ * @client: The client which holds the adapter
+ *
+ * See @lights_context_adapter_create for more info
+ */
+void lights_adapter_unregister (
+    struct lights_adapter_client *client
+){
+    if (!(client && client->adapter))
+        return;
+
+    kref_put(&client->adapter->refs, lights_adapter_destroy);
+
+    client->adapter = NULL;
+}
+EXPORT_SYMBOL_NS_GPL(lights_adapter_unregister, LIGHTS);
+
+/**
+ * lights_adapter_register - Associates an I2C/SMBUS adapter
+ *
+ * @client:    The client and adapter being wrapped
+ * @max_async: A maximum number of pending jobs
+ *
+ * @return: Zero or a negative error number
+ */
+error_t lights_adapter_register (
+    struct lights_adapter_client *client,
+    size_t max_async
+){
+    struct lights_adapter_context *context;
+    const struct lights_adapter_vtable *vtable;
+
+    if (IS_NULL(client))
+        return -EINVAL;
+
+    if (client->adapter) {
+        LIGHTS_ERR("Adapter is already registered.");
+        return -EINVAL;
+    }
+
+    vtable = lights_adapter_vtable_get(client->proto);
+    if (IS_ERR(vtable))
+        return PTR_ERR(vtable);
+
+    context = lights_adapter_find(client);
+    if (IS_ERR(context))
+        return PTR_ERR(context);
+
+    if (!context) {
+        context = kzalloc(sizeof(*context), GFP_KERNEL);
+        if (!context)
+            return -ENOMEM;
+
+        mutex_init(&context->lock);
+        kref_init(&context->refs);
+        atomic_set(&context->allocated_jobs, 0);
+        context->max_async = max_async;
+        context->vtable = vtable;
+
+        switch (client->proto) {
+            case LIGHTS_PROTOCOL_SMBUS:
+                context->i2c_adapter = client->smbus_client.adapter;
+                context->name = context->i2c_adapter->name;
+                LIGHTS_DBG("Created SMBUS adapter '%s'", context->name);
+                break;
+            case LIGHTS_PROTOCOL_I2C:
+                context->i2c_adapter = client->i2c_client.adapter;
+                context->name = context->i2c_adapter->name;
+                LIGHTS_DBG("Created I2C adapter '%s'", context->name);
+                break;
+            case LIGHTS_PROTOCOL_USB:
+                return -EIO;
+        }
+
+        spin_lock(&lights_adapter_lock);
+        list_add_tail(&context->siblings, &lights_adapter_list);
+        spin_unlock(&lights_adapter_lock);
+    }
+
+    client->adapter = context;
+
+    return 0;
+}
+EXPORT_SYMBOL_NS_GPL(lights_adapter_register, LIGHTS);

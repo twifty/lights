@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _UAPI_AURA_GPU_ASIC_TYPES_H
 #define _UAPI_AURA_GPU_ASIC_TYPES_H
+#include <linux/types.h>
 
 enum aura_asic_type {
     CHIP_NVIDIA = 0,
