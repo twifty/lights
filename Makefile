@@ -13,14 +13,14 @@ adapter:
 
 $(MODULES): adapter
 	$(MAKE) -C $@ all
-	cp $@/$@.ko build/$@.ko
+	cp $@/lights-$@.ko build/lights-$@.ko
 
 .DEFAULT_GOAL :=
 build: adapter $(MODULES)
 
 uninstall:
 	for module in $(MODULES); do \
-		sudo rmmod $$module.ko || true; \
+		sudo rmmod lights-$$module.ko || true; \
 	done
 	sudo rmmod build/lights.ko || true;
 
@@ -30,7 +30,7 @@ install: uninstall build
 	fi
 	sudo insmod build/lights.ko;
 	for module in $(MODULES); do \
-		sudo insmod build/$$module.ko; \
+		sudo insmod build/lights-$$module.ko; \
 	done
 
 # reinstall: uninstall build

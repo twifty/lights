@@ -2,7 +2,7 @@
 #ifndef _UAPI_AURA_DEBUG_H
 #define _UAPI_AURA_DEBUG_H
 
-#define LIGHTS_MODULE "aura"
+#define LIGHTS_MODULE "lights-aura"
 
 #include "../include/debug.h"
 

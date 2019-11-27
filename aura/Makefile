@@ -1,6 +1,6 @@
 CONFIG_MODULE_SIG=n
 CONFIG_STACK_VALIDATION=n
-MODULE_NAME = aura
+MODULE_NAME = lights-aura
 
 SRCS = \
 	aura-module.c \
