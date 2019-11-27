@@ -2,7 +2,7 @@
 #ifndef _UAPI_ADAPTER_DEBUG_H
 #define _UAPI_ADAPTER_DEBUG_H
 
-#define LIGHTS_MODULE "adapter"
+#define LIGHTS_MODULE "lights-adapter"
 
 #include "../include/debug.h"
 

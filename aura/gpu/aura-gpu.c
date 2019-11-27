@@ -239,7 +239,7 @@ static const struct lights_mode *aura_gpu_mode_to_lights_mode (
     if (gpu_mode == AURA_MODE_DIRECT) {
         return &aura_gpu_modes[AURA_INDEX_DIRECT];
     } else if (gpu_mode >= 0 && gpu_mode <= AURA_MODE_LAST) {
-        return &aura_gpu_modes[AURA_INDEX_DIRECT];
+        return &aura_gpu_modes[gpu_mode];
     }
 
     return NULL;
@@ -382,7 +382,7 @@ static error_t aura_gpu_fetch_zone (
     if (mode_raw >= AURA_MODE_BREATHING && mode_raw <= AURA_MODE_LAST){
         gpu_mode = mode_raw;
     } else if (mode_raw <= AURA_MODE_STATIC) {
-        if (0 == zone->color.r && 0 == zone->color.g && 0 == zone->color.b) {
+        if (0 == color.value) {
             gpu_mode = AURA_MODE_OFF;
         } else {
             gpu_mode = AURA_MODE_STATIC;
@@ -401,12 +401,6 @@ static error_t aura_gpu_fetch_zone (
 
     memcpy((void*)&zone->mode, mode, sizeof(*mode));
     memcpy((void*)&zone->color, &color, sizeof(color));
-
-    AURA_DBG(
-        "GPU Color: 0x%06x, Mode: %s",
-        ((zone->color.r << 16) | zone->color.g << 8) | zone->color.b,
-        zone->mode.name
-    );
 
 error:
     mutex_unlock(&zone->gpu_ctrl->lock);
@@ -485,8 +479,12 @@ static error_t aura_gpu_apply_zone_color (
         ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01)
     };
 
-    if (lights_custom_mode_id(&zone->mode) != AURA_MODE_DIRECT)
+    if (lights_custom_mode_id(&zone->mode) != AURA_MODE_DIRECT) {
+        AURA_DBG("Non-Direct mode detected, applying save");
         msg_count = 4;
+    } else {
+        AURA_DBG("Current mode: %s %x", zone->mode.name, lights_custom_mode_id(&zone->mode));
+    }
 
     return lights_adapter_xfer_async(
         &zone->gpu_ctrl->lights_client,
@@ -855,6 +853,14 @@ static struct aura_gpu_controller *aura_gpu_controller_create (
         goto error_free_zone;
 
     list_add_tail(&gpu_ctrl->siblings, &aura_gpu_ctrl_list);
+
+    AURA_INFO(
+        "Detected AURA capable GPU on '%s' at 0x%02x with Color: 0x%06x, Mode: %s",
+        i2c_adapter->name,
+        gpu_ctrl->lights_client.i2c_client.addr,
+        gpu_ctrl->zone_contexts[0].color.value,
+        gpu_ctrl->zone_contexts[0].mode.name
+    );
 
     return gpu_ctrl;
 
