@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_LIGHTS_H
-#define _UAPI_LIGHTS_H
+#ifndef _UAPI_LIGHTS_ADAPTER_INTERFACE_H
+#define _UAPI_LIGHTS_ADAPTER_INTERFACE_H
 
 #include <linux/types.h>
 #include <linux/sysfs.h>
@@ -215,7 +215,7 @@ struct lights_io_attribute {
     LIGHTS_ATTR(_name, 0444, _type, _data, _read, NULL) \
 )
 
-#define LIGHTS_ATTR_WO(_name, _type, _data, _write) (    \
+#define LIGHTS_ATTR_WO(_name, _type, _data, _write) ( \
     LIGHTS_ATTR(_name, 0200, _type, _data, NULL, _write) \
 )
 
@@ -223,24 +223,24 @@ struct lights_io_attribute {
     LIGHTS_ATTR(_name, 0644, _type, _data, _read, _write)    \
 )
 
-#define LIGHTS_CUSTOM_ATTR(_name, _data, _read, _write) (           \
+#define LIGHTS_CUSTOM_ATTR(_name, _data, _read, _write) ( \
     LIGHTS_ATTR_RW(_name, LIGHTS_TYPE_CUSTOM, _data, _read, _write) \
 )
 
-#define LIGHTS_MODE_ATTR(_data, _read, _write) (                           \
+#define LIGHTS_MODE_ATTR(_data, _read, _write) ( \
     LIGHTS_ATTR_RW(LIGHTS_IO_MODE, LIGHTS_TYPE_MODE, _data, _read, _write) \
 )
 
-#define LIGHTS_COLOR_ATTR(_data, _read, _write) (                            \
+#define LIGHTS_COLOR_ATTR(_data, _read, _write) ( \
     LIGHTS_ATTR_RW(LIGHTS_IO_COLOR, LIGHTS_TYPE_COLOR, _data, _read, _write) \
 )
 
-#define LIGHTS_SPEED_ATTR(_data, _read, _write) (                            \
+#define LIGHTS_SPEED_ATTR(_data, _read, _write) ( \
     LIGHTS_ATTR_RW(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _read, _write) \
 )
 
-#define LIGHTS_LEDS_ATTR(_data, _write) (                             \
-    LIGHTS_ATTR_WO(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _write) \
+#define LIGHTS_LEDS_ATTR(_data, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_LEDS, LIGHTS_TYPE_LEDS, _data, _write) \
 )
 
 /**

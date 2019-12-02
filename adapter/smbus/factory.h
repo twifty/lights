@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_ADAPTER_SMBUS_FACTORY_H
-#define _UAPI_ADAPTER_SMBUS_FACTORY_H
+#ifndef _UAPI_LIGHTS_ADAPTER_SMBUS_FACTORY_H
+#define _UAPI_LIGHTS_ADAPTER_SMBUS_FACTORY_H
 
 #include <linux/i2c.h>
 

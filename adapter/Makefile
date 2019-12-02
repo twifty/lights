@@ -6,6 +6,7 @@ SRCS = \
 	lights-adapter.c \
 	lib/async.c \
 	lib/reserve.c \
+	usb/usb-driver.c \
 	smbus/piix4.c \
 	smbus/nuvoton.c
 

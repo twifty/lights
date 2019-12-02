@@ -258,7 +258,7 @@ static error_t aura_controller_read_block (
 
     msgs = (struct lights_adapter_msg[]){
         ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, reg),
-        ADAPTER_READ_BLOCK_DATA(CMD_READ_BLOCK + size)
+        ADAPTER_READ_BLOCK_DATA(CMD_READ_BLOCK + size, size)
     };
 
     err = lights_adapter_xfer(client, msgs, 2);

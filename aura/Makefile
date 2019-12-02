@@ -13,8 +13,6 @@ SRCS = \
 	gpu/aura-gpu-reg.c \
 	gpu/aura-gpu-i2c.c \
 	gpu/aura-gpu.c \
-	header/usb-transfer.c \
-	header/usb-driver.c \
 	header/aura-header.c
 
 KERNELDIR = /lib/modules/$(shell uname -r)/build

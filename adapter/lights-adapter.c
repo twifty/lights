@@ -3,12 +3,29 @@
 #include "lib/reserve.h"
 #include "lib/async.h"
 
+#define dump_msg(msg, p, len) \
+({                          \
+    print_hex_dump_bytes(   \
+        msg,                \
+        DUMP_PREFIX_NONE,   \
+        p,                  \
+        len );      \
+})
+
 /* Forward declare for the vtable */
 static error_t lights_adapter_smbus_read (
     const struct lights_adapter_client * client,
     struct lights_adapter_msg * msg
 );
 static error_t lights_adapter_smbus_write (
+    const struct lights_adapter_client * client,
+    const struct lights_adapter_msg * msg
+);
+static error_t lights_adapter_usb_read (
+    const struct lights_adapter_client * client,
+    struct lights_adapter_msg * msg
+);
+static error_t lights_adapter_usb_write (
     const struct lights_adapter_client * client,
     const struct lights_adapter_msg * msg
 );
@@ -25,6 +42,10 @@ struct lights_adapter_vtable {
     .proto = LIGHTS_PROTOCOL_I2C,
     .read  = lights_adapter_smbus_read,
     .write = lights_adapter_smbus_write,
+},{
+    .proto = LIGHTS_PROTOCOL_USB,
+    .read  = lights_adapter_usb_read,
+    .write = lights_adapter_usb_write,
 }};
 
 static inline const struct lights_adapter_vtable *lights_adapter_vtable_get (
@@ -36,6 +57,7 @@ static inline const struct lights_adapter_vtable *lights_adapter_vtable_get (
         case LIGHTS_PROTOCOL_I2C:
             return &lights_adapter_vtables[1];
         case LIGHTS_PROTOCOL_USB:
+            return &lights_adapter_vtables[2];
             break;
     }
 
@@ -67,6 +89,7 @@ struct lights_adapter_context {
 
     union {
         struct i2c_adapter              *i2c_adapter;
+        struct usb_controller           *usb_controller;
     };
 };
 #define adapter_from_ref(ptr)( \
@@ -115,6 +138,10 @@ static struct lights_adapter_context *lights_adapter_find (
                     }
                     break;
                 case LIGHTS_PROTOCOL_USB:
+                    if (context->usb_controller == client->usb_client.controller) {
+                        kref_get(&context->refs);
+                        return context;
+                    }
                     break;
             }
         }
@@ -202,7 +229,7 @@ static void lights_adapter_destroy (
     list_del(&context->siblings);
     spin_unlock(&lights_adapter_lock);
 
-    LIGHTS_DBG("Releasing adapter '%s'", context->i2c_adapter->name);
+    LIGHTS_DBG("Releasing adapter '%s'", context->name);
 
     if (context->async_queue)
         async_queue_destroy(context->async_queue);
@@ -232,30 +259,66 @@ static error_t lights_adapter_smbus_read (
     const struct lights_adapter_client *client,
     struct lights_adapter_msg *msg
 ){
+    union i2c_smbus_data data;
+    // int status;
     s32 result = -EIO;
 
     switch (msg->type) {
-        case I2C_SMBUS_BYTE:
-            result = i2c_smbus_read_byte(&client->i2c_client);
+        case MSG_BYTE:
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_BYTE, &data
+            );
+            // result = i2c_smbus_read_byte(&client->i2c_client);
             msg->data.byte = (u8)result;
             msg->length = 1;
             break;
-        case I2C_SMBUS_BYTE_DATA:
-            result = i2c_smbus_read_byte_data(&client->i2c_client, msg->command);
+        case MSG_BYTE_DATA:
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_BYTE_DATA, &data
+            );
+            // result = i2c_smbus_read_byte_data(&client->i2c_client, msg->command);
             msg->data.byte = (u8)result;
             msg->length = 1;
             break;
-        case I2C_SMBUS_WORD_DATA:
+        case MSG_WORD_DATA:
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_WORD_DATA, &data
+            );
             if (msg->swapped)
-                result = i2c_smbus_read_word_swapped(&client->i2c_client, msg->command);
+                // result = i2c_smbus_read_word_swapped(&client->i2c_client, msg->command);
+                msg->data.word = swab16(result);
             else
-                result = i2c_smbus_read_word_data(&client->i2c_client, msg->command);
-            msg->data.word = (u16)result;
+                // result = i2c_smbus_read_word_data(&client->i2c_client, msg->command);
+                msg->data.word = (u16)result;
             msg->length = 2;
             break;
-        case I2C_SMBUS_BLOCK_DATA:
-            result = i2c_smbus_read_block_data(&client->i2c_client, msg->command, msg->data.block);
-            msg->length = (u8)result;
+        case MSG_BLOCK_DATA:
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_BLOCK_DATA, &data
+            );
+        	if (!result) {
+                memcpy(msg->data.block, &data.block[1], data.block[0]);
+                msg->length = data.block[0];
+            }
+            // return data.block[0];
+            // result = i2c_smbus_read_block_data(&client->i2c_client, msg->command, msg->data.block);
+            // msg->length = (u8)result;
             break;
         default:
             return -EINVAL;
@@ -276,29 +339,110 @@ static error_t lights_adapter_smbus_write (
     const struct lights_adapter_client * client,
     const struct lights_adapter_msg * msg
 ){
+    union i2c_smbus_data data;
     int result = -EIO;
 
     switch (msg->type) {
-        case I2C_SMBUS_BYTE:
-            result = i2c_smbus_write_byte(&client->i2c_client, msg->data.byte);
+        case MSG_BYTE:
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_WRITE, msg->data.byte,
+                I2C_SMBUS_BYTE, NULL
+            );
+            // result = i2c_smbus_write_byte(&client->i2c_client, msg->data.byte);
             break;
-        case I2C_SMBUS_BYTE_DATA:
-            result = i2c_smbus_write_byte_data(&client->i2c_client, msg->command, msg->data.byte);
+        case MSG_BYTE_DATA:
+            data.byte = msg->data.byte;
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_WRITE, msg->command,
+                I2C_SMBUS_BYTE_DATA, &data
+            );
+            // result = i2c_smbus_write_byte_data(&client->i2c_client, msg->command, msg->data.byte);
             break;
-        case I2C_SMBUS_WORD_DATA:
+        case MSG_WORD_DATA:
             if (msg->swapped)
-                result = i2c_smbus_write_word_swapped(&client->i2c_client, msg->command, msg->data.word);
+                data.word = swab16(msg->data.word);
+                // result = i2c_smbus_write_word_swapped(&client->i2c_client, msg->command, msg->data.word);
             else
-                result = i2c_smbus_write_word_data(&client->i2c_client, msg->command, msg->data.word);
+                // result = i2c_smbus_write_word_data(&client->i2c_client, msg->command, msg->data.word);
+                data.word = msg->data.word;
+
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_WRITE, msg->command,
+                I2C_SMBUS_WORD_DATA, &data
+            );
             break;
-        case I2C_SMBUS_BLOCK_DATA:
-            result = i2c_smbus_write_block_data(&client->i2c_client, msg->command, msg->length, msg->data.block);
+        case MSG_BLOCK_DATA:
+            if (msg->length > I2C_SMBUS_BLOCK_MAX)
+                return -EINVAL;
+
+            data.block[0] = msg->length;
+            memcpy(&data.block[1], msg->data.block, msg->length);
+
+            result = i2c_smbus_xfer(
+                client->i2c_client.adapter,
+                client->i2c_client.addr,
+                client->i2c_client.flags,
+                I2C_SMBUS_WRITE, msg->command,
+                I2C_SMBUS_BLOCK_DATA, &data
+            );
+            // result = i2c_smbus_write_block_data(&client->i2c_client, msg->command, msg->length, msg->data.block);
             break;
         default:
             return -EINVAL;
     }
 
     return result < 0 ? result : 0;
+}
+
+/**
+ * lights_adapter_usb_read() - Processes a single write
+ *
+ * @client: Provided by the adapter caller
+ * @msg:    Provided by the adapter caller
+ *
+ * @return: Zero or negative error number
+ */
+static error_t lights_adapter_usb_read (
+    const struct lights_adapter_client *client,
+    struct lights_adapter_msg *msg
+){
+    struct usb_packet pkt = {
+        .length = msg->length,
+        .data = msg->data.block
+    };
+
+    // dump_msg("lights_adapter_usb_read(): ", &pkt, sizeof(pkt));
+
+    return usb_read_packet(&client->usb_client, &pkt);
+}
+
+/**
+ * lights_adapter_usb_write() - Processes a single write
+ *
+ * @client: Provided by the adapter caller
+ * @msg:    Provided by the adapter caller
+ *
+ * @return: Zero or negative error number
+ */
+static error_t lights_adapter_usb_write (
+    const struct lights_adapter_client *client,
+    const struct lights_adapter_msg *msg
+){
+    struct usb_packet pkt = {
+        .length = msg->length,
+        .data = (char*)msg->data.block
+    };
+
+    return usb_write_packet(&client->usb_client, &pkt);
 }
 
 /**
@@ -393,7 +537,7 @@ static void lights_adapter_job_execute (
         job->completion(&job->msg, job->priv_data, -ECANCELED);
     }
 
-    if (count != lights_adapter_job_free(job))
+    if (count != lights_adapter_job_free(job) && !err)
         LIGHTS_ERR("Disparity between job count and jobs freed");
 }
 
@@ -594,8 +738,11 @@ EXPORT_SYMBOL_NS_GPL(lights_adapter_xfer_async, LIGHTS);
 void lights_adapter_unregister (
     struct lights_adapter_client *client
 ){
-    if (!(client && client->adapter))
+    if (IS_NULL(client, client->adapter))
         return;
+
+    if (client->proto == LIGHTS_PROTOCOL_USB)
+        usb_controller_unregister(&client->usb_client);
 
     kref_put(&client->adapter->refs, lights_adapter_destroy);
 
@@ -617,6 +764,7 @@ error_t lights_adapter_register (
 ){
     struct lights_adapter_context *context;
     const struct lights_adapter_vtable *vtable;
+    error_t err = 0;
 
     if (IS_NULL(client))
         return -EINVAL;
@@ -657,7 +805,14 @@ error_t lights_adapter_register (
                 LIGHTS_DBG("Created I2C adapter '%s'", context->name);
                 break;
             case LIGHTS_PROTOCOL_USB:
-                return -EIO;
+                err = usb_controller_register(&client->usb_client);
+                if (err)
+                    goto error_free;
+
+                context->name = client->usb_client.name;
+                context->usb_controller = client->usb_client.controller;
+                LIGHTS_DBG("Created USB adapter '%s'", context->name);
+                break;
         }
 
         spin_lock(&lights_adapter_lock);
@@ -667,6 +822,13 @@ error_t lights_adapter_register (
 
     client->adapter = context;
 
-    return 0;
+    return err;
+
+error_free:
+    kfree(context);
+
+    client->adapter = NULL;
+
+    return err;
 }
 EXPORT_SYMBOL_NS_GPL(lights_adapter_register, LIGHTS);
