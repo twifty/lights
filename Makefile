@@ -22,7 +22,7 @@ uninstall:
 	for module in $(MODULES); do \
 		sudo rmmod lights-$$module.ko || true; \
 	done
-	sudo rmmod build/lights.ko || true;
+	sudo rmmod lights.ko || true;
 
 install: uninstall build
 	if [[ ! -d build ]]; \

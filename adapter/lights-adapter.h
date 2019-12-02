@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_DRIVER_SMBUS_ADAPTER_H
-#define _UAPI_DRIVER_SMBUS_ADAPTER_H
+#ifndef _UAPI_LIGHTS_ADAPTER_H
+#define _UAPI_LIGHTS_ADAPTER_H
 
 #include <linux/module.h>
 #include <linux/i2c.h>
 
 #include <include/quirks.h>
 #include <include/types.h>
+#include "usb/usb-driver.h"
 
 struct lights_adapter_msg;
 
@@ -44,6 +45,7 @@ enum lights_adapter_protocol {
  * @proto:        One of the LIGHTS_PROTOCOL_ constants
  * @i2c_client:   I2C access data
  * @smbus_client: SMBUS access data
+ * @usb_client:   USB access data
  * @adapter:      Async access data
  *
  * An instance of this may be created on the stack and used with
@@ -54,8 +56,15 @@ enum lights_adapter_protocol {
 struct lights_adapter_client {
     enum lights_adapter_protocol proto;
     union {
-        struct i2c_client i2c_client;
-        struct i2c_client smbus_client;
+        struct i2c_config {
+            struct i2c_adapter  *adapter;
+            uint16_t            addr;
+            uint16_t            flags;
+        }                       i2c_client,
+                                smbus_client;
+        // struct i2c_client i2c_client;
+        // struct i2c_client smbus_client;
+        struct usb_client usb_client;
     };
     struct lights_adapter_context *adapter;
 };
@@ -73,15 +82,35 @@ struct lights_adapter_client {
 )
 #define LIGHTS_SMBUS_CLIENT(_adapter, _addr, _flags) \
 (struct lights_adapter_client){ \
-     .proto = LIGHTS_PROTOCOL_SMBUS, \
-     .smbus_client = { \
-         .adapter = (_adapter), \
-         .addr = (_addr), \
-         .flags = (_flags) \
-     } \
- }
+    .proto = LIGHTS_PROTOCOL_SMBUS, \
+    .smbus_client = { \
+        .adapter = (_adapter), \
+        .addr = (_addr), \
+        .flags = (_flags) \
+    } \
+}
 #define LIGHTS_SMBUS_CLIENT_UPDATE(_client, _addr) ( \
     (_client)->smbus_client.addr = (_addr) \
+)
+#define LIGHTS_USB_CLIENT_INDEX(_name, _index, _packet_size, _ids) \
+(struct lights_adapter_client){ \
+    .proto = LIGHTS_PROTOCOL_USB, \
+    .usb_client = { \
+        .name = (_name), \
+        .packet_size = (_packet_size), \
+        .ids = (_ids), \
+        .index = (_index) \
+    } \
+}
+#define LIGHTS_USB_CLIENT(_name, _packet_size, _ids) ( \
+    LIGHTS_USB_CLIENT_INDEX(_name, 0, _packet_size, _ids) \
+)
+#define LIGHTS_USB_CLIENT_INIT(_client, _usb) ({ \
+    (_client)->proto = LIGHTS_PROTOCOL_USB; \
+    (_client)->usb_client = *(_usb); \
+})
+#define LIGHTS_USB_CLIENT_UPDATE(_client, _index) ( \
+    (_client)->usb_client.index = (_index) \
 )
 
 /**
@@ -166,6 +195,14 @@ error_t lights_adapter_register (
     size_t max_async
 );
 
+/*
+ * This needs to be large enough to hold the max possible transfer data.
+ * Currently 65 bytes for aura usb headers.
+ *
+ * TODO - Can we make the message size dynamic while also reseving?
+ */
+#define LIGHTS_ADAPTER_BLOCK_MAX 65
+
 /**
  * struct adapter_msg - I2c/SMBUS message data
  *
@@ -187,7 +224,7 @@ struct lights_adapter_msg {
     union {
         u8  byte;
         u16 word;
-        u8  block[I2C_SMBUS_BLOCK_MAX];
+        u8  block[LIGHTS_ADAPTER_BLOCK_MAX];
     }       data;
 
     struct lights_adapter_msg *next;
@@ -233,41 +270,46 @@ static inline struct lights_adapter_msg const *adapter_seek_msg (
 }
 
 #define ADAPTER_READ_BYTE() \
-    ADAPTER_READ_MSG(0, I2C_SMBUS_BYTE, false)
+    ADAPTER_READ_MSG(0, MSG_BYTE, false)
 
 #define ADAPTER_READ_BYTE_DATA(_reg) \
-    ADAPTER_READ_MSG((_reg), I2C_SMBUS_BYTE_DATA, false)
+    ADAPTER_READ_MSG((_reg), MSG_BYTE_DATA, false)
 
 #define ADAPTER_READ_WORD_DATA(_reg) \
-    ADAPTER_READ_MSG((_reg), I2C_SMBUS_WORD_DATA, false)
+    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA, false)
 
 #define ADAPTER_READ_WORD_DATA_SWAPPED(_reg) \
-    ADAPTER_READ_MSG((_reg), I2C_SMBUS_WORD_DATA, true)
-
-#define ADAPTER_READ_BLOCK_DATA(_reg) \
-    ADAPTER_READ_MSG((_reg), I2C_SMBUS_BLOCK_DATA, false)
+    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA, true)
 
 #define ADAPTER_WRITE_BYTE(_val) \
-    ADAPTER_WRITE_MSG(0, I2C_SMBUS_BYTE, {.byte = (u8)(_val)}, false)
+    ADAPTER_WRITE_MSG(0, MSG_BYTE, {.byte = (u8)(_val)}, false)
 
 #define ADAPTER_WRITE_BYTE_DATA(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_BYTE_DATA, {.byte = (u8)(_val)}, false)
+    ADAPTER_WRITE_MSG((_reg), MSG_BYTE_DATA, {.byte = (u8)(_val)}, false)
 
 #define ADAPTER_WRITE_WORD_DATA(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_WORD_DATA, {.word = (u16)(_val)}, false)
+    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA, {.word = (u16)(_val)}, false)
 
 #define ADAPTER_WRITE_WORD_DATA_SWAPPED(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), I2C_SMBUS_WORD_DATA, {.word = (u16)(_val)}, true)
+    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA, {.word = (u16)(_val)}, true)
 
+#define ADAPTER_READ_BLOCK_DATA(_reg, _len) \
+(struct lights_adapter_msg){ \
+    .read = true, \
+    .type = MSG_BLOCK_DATA, \
+    .command = (_reg), \
+    .length = (_len), \
+}
+// ADAPTER_READ_MSG((_reg), MSG_BLOCK_DATA, false)
 /* NOTE: The caller is required to populate the data */
 #define ADAPTER_WRITE_BLOCK_DATA(_reg, _len) \
 (struct lights_adapter_msg){ \
-    .type = I2C_SMBUS_BLOCK_DATA, \
+    .type = MSG_BLOCK_DATA, \
     .command = (_reg), \
     .length = (_len), \
 }
 #define adapter_assign_block_data(_msg, _data, _len)( \
-    memcpy((_msg)->data.block, (_data), (_len) > I2C_SMBUS_BLOCK_MAX ? I2C_SMBUS_BLOCK_MAX : (_len)) \
+    memcpy((_msg)->data.block, (_data), (_len) > LIGHTS_ADAPTER_BLOCK_MAX ? LIGHTS_ADAPTER_BLOCK_MAX : (_len)) \
 )
 
 #endif

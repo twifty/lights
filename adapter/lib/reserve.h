@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_DRIVER_RESERVE_H
-#define _UAPI_DRIVER_RESERVE_H
+#ifndef _UAPI_LIGHTS_ADAPTER_RESERVE_H
+#define _UAPI_LIGHTS_ADAPTER_RESERVE_H
 
 struct reserve_context;
 

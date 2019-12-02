@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _UAPI_DRIVER_ASYNC_H
-#define _UAPI_DRIVER_ASYNC_H
+#ifndef _UAPI_LIGHTS_ADAPTER_ASYNC_H
+#define _UAPI_LIGHTS_ADAPTER_ASYNC_H
 
 #include <linux/sched.h>
 #include <linux/slab.h>

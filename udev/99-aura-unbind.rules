@@ -11,6 +11,6 @@ GOTO="aura_end"
 
 LABEL="aura_unbind"
 RUN+="/bin/sh -c 'echo -n %k >/sys%p/driver/unbind'"
-RUN+="/bin/sh -c 'echo -n %k >/sys/bus/usb/drivers/aura-mb-headers/bind'"
+RUN+="/bin/sh -c 'echo -n %k >/sys/bus/usb/drivers/aura-argb-headers/bind'"
 
 LABEL="aura_end"
