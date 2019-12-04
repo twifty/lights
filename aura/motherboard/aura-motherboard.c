@@ -57,112 +57,99 @@ struct callback_data {
 /**
  * aura_motherboard_color_read() - Reads the color of a single zone
  *
- * @data: A struct aura_zone
- * @io:   Buffer to read into
+ * @data:  A struct aura_zone
+ * @state: Buffer to read into
  *
  * @return: Zero or a negative error code
  */
 static error_t aura_motherboard_color_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
-    if (IS_NULL(data, io) || IS_TRUE(io->type != LIGHTS_TYPE_COLOR))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
         return -EINVAL;
 
-    return aura_controller_get_zone_color(data, &io->data.color);
+    return aura_controller_get_zone_color(data, &state->color);
 }
 
 /**
  * aura_motherboard_color_write() - Writes a single zone color
  *
- * @data: A struct aura_zone
- * @io:   Buffer to read from
+ * @data:  A struct aura_zone
+ * @state: Buffer to read from
  *
  * @return: Zero or a negative error code
  */
 static error_t aura_motherboard_color_write (
     void *data,
-    const struct lights_io *io
-){
-    if (IS_NULL(data, io) || IS_TRUE(io->type != LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_controller_set_zone_color(data, &io->data.color);
-}
-
-/**
- * aura_motherboard_color_update() - Writes a color to all zones
- *
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_color_update (
     const struct lights_state *state
 ){
-    struct aura_motherboard_ctrl *ctrl;
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+        return -EINVAL;
 
-    list_for_each_entry(ctrl, &aura_motherboard_ctrl_list, siblings) {
-        aura_controller_set_color(ctrl->aura_ctrl, &state->color);
-    }
-
-    return 0;
+    return aura_controller_set_zone_color(data, &state->color);
 }
 
 /**
  * aura_motherboard_color_read() - Reads the mode of a single zone
  *
- * @data: A struct aura_zone
- * @io:   Buffer to read into
+ * @data:  A struct aura_zone
+ * @state: Buffer to read into
  *
  * @return: Zero or a negative error code
  */
 static error_t aura_motherboard_mode_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
-    if (IS_NULL(data, io) || IS_TRUE(io->type != LIGHTS_TYPE_MODE))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
         return -EINVAL;
 
-    return aura_controller_get_mode(data, &io->data.mode);
+    return aura_controller_get_mode(data, &state->mode);
 }
 
 /**
  * aura_motherboard_color_write() - Writes a single zone mode
  *
- * @data: A struct aura_zone
- * @io:   Buffer to read from
+ * @data:  A struct aura_zone
+ * @state: Buffer to read from
  *
  * @return: Zero or a negative error code
  */
 static error_t aura_motherboard_mode_write (
     void *data,
-    const struct lights_io *io
-){
-    if (IS_NULL(data, io) || IS_TRUE(io->type != LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_controller_set_mode(data, &io->data.mode);
-}
-
-/**
- * aura_motherboard_color_update() - Writes a mode to all zones
- *
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_mode_update (
     const struct lights_state *state
 ){
-    struct aura_motherboard_ctrl *ctrl;
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
 
-    list_for_each_entry(ctrl, &aura_motherboard_ctrl_list, siblings) {
-        aura_controller_set_mode(ctrl->aura_ctrl, &state->mode);
+    return aura_controller_set_mode(data, &state->mode);
+}
+
+static error_t aura_motherboard_update (
+    void *data,
+    const struct lights_state *state
+){
+    error_t err;
+
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    if (state->type & LIGHTS_TYPE_MODE) {
+        err = aura_controller_set_mode(data, &state->mode);
+        if (err)
+            return err;
+    }
+
+    if (state->type & LIGHTS_TYPE_COLOR) {
+        err = aura_controller_set_color(data, &state->color);
+        if (err)
+            return err;
     }
 
     return 0;
 }
+
 
 /**
  * aura_motherboard_zone_create() - Sets up the Userland files for the zone
@@ -176,7 +163,19 @@ static error_t aura_motherboard_zone_create (
     struct aura_motherboard_ctrl *ctrl,
     uint8_t index
 ){
-    struct aura_zone *aura_zone;
+    struct aura_zone *aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, index);
+    struct lights_io_attribute attrs[] = {
+        LIGHTS_MODE_ATTR(
+            aura_zone,
+            aura_motherboard_mode_read,
+            aura_motherboard_mode_write
+        ),
+        LIGHTS_COLOR_ATTR(
+            aura_zone,
+            aura_motherboard_color_read,
+            aura_motherboard_color_write
+        )
+    };
     struct aura_motherboard_zone *ctrl_zone;
     error_t err;
 
@@ -190,32 +189,16 @@ static error_t aura_motherboard_zone_create (
 
     ctrl_zone->lights.name = aura_zone->name;
     ctrl_zone->lights.caps = aura_controller_get_caps();
-    ctrl_zone->lights.update_color = aura_motherboard_color_update;
-    ctrl_zone->lights.update_mode  = aura_motherboard_mode_update;
 
     err = lights_device_register(&ctrl_zone->lights);
     if (err)
         goto error_free_zone;
 
-    err = lights_create_file(&ctrl_zone->lights, &LIGHTS_ATTR_RW(
-        "mode",
-        LIGHTS_TYPE_MODE,
-        aura_zone,
-        aura_motherboard_mode_read,
-        aura_motherboard_mode_write
-    ));
-    if (err)
+    err = lights_create_files(&ctrl_zone->lights, attrs, ARRAY_SIZE(attrs));
+    if (err) {
+        lights_device_unregister(&ctrl_zone->lights);
         goto error_free_zone;
-
-    err = lights_create_file(&ctrl_zone->lights, &LIGHTS_ATTR_RW(
-        "color",
-        LIGHTS_TYPE_COLOR,
-        aura_zone,
-        aura_motherboard_color_read,
-        aura_motherboard_color_write
-    ));
-    if (err)
-        goto error_free_zone;
+    }
 
     list_add_tail(&ctrl_zone->siblings, &ctrl->zone_list);
 
@@ -511,6 +494,7 @@ error_t aura_motherboard_probe (
 ){
     struct i2c_adapter *i2c_adapter;
     struct aura_smbus_adapter *smbus_adapter;
+    struct aura_motherboard_ctrl *ctrl;
     struct callback_data data = {0};
     int i, found;
     error_t err;
@@ -545,8 +529,8 @@ error_t aura_motherboard_probe (
     if (err) {
         aura_motherboard_release();
     } else {
-        aura_motherboard_mode_update(state);
-        aura_motherboard_color_update(state);
+        list_for_each_entry(ctrl, &aura_motherboard_ctrl_list, siblings)
+            aura_motherboard_update(ctrl, state);
     }
 
     return 0;

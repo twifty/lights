@@ -360,38 +360,6 @@ static const struct lights_mode *chipset_mode_to_lights_mode (
     return NULL;
 }
 
-/**
- * apply_color_to_buffer() - Converts a color object to byte array
- *
- * @buffer: Target buffer
- * @color:  Color to copy
- *
- * The @buffer MUST be at least 3 bytes long
- */
-inline void apply_color_to_buffer (
-    uint8_t buffer[3],
-    const struct lights_color *color
-){
-    buffer[0] = color->r;
-    buffer[1] = color->b;
-    buffer[2] = color->g;
-}
-
-/**
- * read_color_from_buffer() - Converts a byte array to color object
- *
- * @buffer: Buffer to read
- *
- * @return: Color object
- */
-inline void read_color_from_buffer (
-    const uint8_t buffer[3],
-    struct lights_color * color
-){
-    color->r = buffer[0];
-    color->b = buffer[1];
-    color->g = buffer[2];
-}
 
 /**
  * aura_colors_create() - Creates and optionally populates a color cache object
@@ -439,18 +407,8 @@ static struct aura_colors *aura_colors_create (
         }
 
         for (i = 0, j = 0; i < count; i += 3, j++) {
-            read_color_from_buffer(&buffer[i], &colors->zone[j]);
-            // colors->zone[j].r = buffer[i + 0];
-            // colors->zone[j].b = buffer[i + 1];
-            // colors->zone[j].g = buffer[i + 2];
+            lights_color_read(&colors->zone[j], &buffer[i]);
         }
-
-        // err = aura_controller_init_colors(ctx, count, colors);
-        // if (err) {
-        //     AURA_TRACE("%s failed with %d", "aura_controller_init_colors()", err);
-        //     kfree(colors);
-        //     return ERR_PTR(err);
-        // }
     }
 
 error:
@@ -863,7 +821,7 @@ static void aura_controller_set_zone_color_callback (
         goto exit;
     }
 
-    read_color_from_buffer(color_msg->data.block, &color);
+    lights_color_read(&color, color_msg->data.block);
 
     mutex_lock(&data->context->lock);
 
@@ -911,7 +869,7 @@ error_t aura_controller_set_zone_color (
     msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target->reg + (3 * zone_ctx->offset));
     msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, 3);
 
-    apply_color_to_buffer(msgs[1].data.block, color);
+    lights_color_write(color, msgs[1].data.block);
 
     if (!context->is_direct) {
         msgs[2] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_APPLY);
@@ -997,7 +955,6 @@ static void aura_controller_set_color_callback (
 ){
     struct aura_callback_context *data = _data;
     struct lights_adapter_msg const * color_msg;
-    struct lights_color color;
     int i;
 
     if (IS_NULL(result, _data))
@@ -1019,11 +976,11 @@ static void aura_controller_set_color_callback (
         goto exit;
     }
 
-    read_color_from_buffer(color_msg->data.block, &color);
     mutex_lock(&data->context->lock);
 
-    for (i = 0; i <= data->context->zone_count; i++)
-        data->color[i] = color;
+    for (i = 0; i <= data->context->zone_count; i++) {
+        lights_color_read(&data->color[i], &color_msg->data.block[i * 3]);
+    }
 
     mutex_unlock(&data->context->lock);
 
@@ -1032,28 +989,31 @@ exit:
 }
 
 /**
- * aura_controller_set_color() - Applies a color to all zones
+ * aura_controller_set_colors() - Applies a color to all zones
  *
  * @ctrl:  Previously allocated with @aura_controller_create
  * @color: Color to apply
+ * @count: Number of colors
  *
  * @return: Zero or negative error number
+ *
+ * If @count is 1, the same color is applied to all zones, otherwise
+ * @count must be equal to the zone count.
  */
-error_t aura_controller_set_color (
+error_t aura_controller_set_colors (
     struct aura_controller *ctrl,
-    const struct lights_color *color
+    const struct lights_color *colors,
+    uint8_t count
 ){
     struct aura_controller_context *context = context_from_ctrl(ctrl);
     struct aura_colors *target;
     struct aura_callback_context *cb_data;
     struct lights_adapter_msg msgs[4];
-    int i, count;
+    int i;
     error_t err;
 
-    if (IS_NULL(ctrl, color))
+    if (IS_NULL(ctrl, colors) || IS_FALSE(count == 1 || count == context->zone_count))
         return -EINVAL;
-
-    AURA_DBG("setting color: 0x%02x%02x%02x to all %d zones", color->r, color->g, color->b, context->zone_count);
 
     if (context->is_direct)
         target = context->direct_colors;
@@ -1063,8 +1023,12 @@ error_t aura_controller_set_color (
     msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target->reg);
     msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, context->zone_count * 3);
 
-    for (i = 0; i < context->zone_count; i++)
-        apply_color_to_buffer(&msgs[1].data.block[i * 3], color);
+    for (i = 0; i < context->zone_count; i++) {
+        lights_color_write(colors, &msgs[1].data.block[i * 3]);
+
+        if (count > 1)
+            colors++;
+    }
 
     if (!context->is_direct) {
         msgs[2] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_APPLY);

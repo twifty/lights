@@ -126,6 +126,24 @@ error_t aura_controller_get_zone_color (
 );
 
 /**
+ * aura_controller_set_colors() - Applies a color to all zones
+ *
+ * @ctrl:  Previously allocated with @aura_controller_create
+ * @color: Color to apply
+ * @count: Number of colors
+ *
+ * @return: Zero or negative error number
+ *
+ * If @count is 1, the same color is applied to all zones, otherwise
+ * @count must be equal to the zone count.
+ */
+error_t aura_controller_set_colors (
+    struct aura_controller *ctrl,
+    const struct lights_color *colors,
+    uint8_t count
+);
+
+/**
  * aura_controller_set_color() - Applies a color to all zones
  *
  * @ctrl:  Previously allocated with @aura_controller_create
@@ -133,10 +151,12 @@ error_t aura_controller_get_zone_color (
  *
  * @return: Zero or negative error number
  */
-error_t aura_controller_set_color (
+static inline error_t aura_controller_set_color (
     struct aura_controller *ctrl,
     const struct lights_color *color
-);
+){
+    return aura_controller_set_colors(ctrl, color, 1);
+};
 
 /**
  * aura_controller_set_mode() - Applies a mode to all zones

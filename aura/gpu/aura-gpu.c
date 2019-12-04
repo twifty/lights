@@ -587,23 +587,23 @@ static error_t aura_gpu_apply_zone_mode (
 /**
  * aura_gpu_get_mode() - Reads a zones mode
  *
- * @data: The zone to read
- * @io:   Buffer to write into
+ * @data:  The zone to read
+ * @state: Buffer to write into
  *
  * @return: Zero or a negative error number
  *
- * The returned mode is from the local cache not the harsware.
+ * The returned mode is from the local cache not the hardware.
  */
 static error_t aura_gpu_get_mode (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct zone_context *zone = data;
 
-    if (IS_NULL(zone, io))
+    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
         return -EINVAL;
 
-    io->data.mode = zone->mode;
+    state->mode = zone->mode;
 
     return 0;
 }
@@ -611,8 +611,8 @@ static error_t aura_gpu_get_mode (
 /**
  * aura_gpu_set_mode() - Writes a zones mode
  *
- * @data: The zone to read
- * @io:   Buffer containing new mode
+ * @data:  The zone to read
+ * @state: Buffer containing new mode
  *
  * @return: Zero or a negative error number
  *
@@ -620,56 +620,34 @@ static error_t aura_gpu_get_mode (
  */
 static error_t aura_gpu_set_mode (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct zone_context *zone = data;
 
-    if (WARN_ON(NULL == zone || NULL == io || io->type != LIGHTS_TYPE_MODE))
+    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
         return -EINVAL;
 
-    return aura_gpu_apply_zone_mode(zone, &io->data.mode);
-}
-
-/**
- * aura_gpu_update_mode() - Writes a new mode
- *
- * @state: Buffer containing the new mode
- *
- * @return: Zero or a negative error number
- */
-static error_t aura_gpu_update_mode (
-    const struct lights_state *state
-){
-    struct aura_gpu_controller *ctrl;
-    error_t err;
-
-    list_for_each_entry(ctrl, &aura_gpu_ctrl_list, siblings) {
-        err = aura_gpu_apply_zone_mode(&ctrl->zone_contexts[0], &state->mode);
-        if (err)
-            break;
-    }
-
-    return err;
+    return aura_gpu_apply_zone_mode(zone, &state->mode);
 }
 
 /**
  * aura_gpu_get_color() - Reads a zones color
  *
- * @data: The zone to read
- * @io:   The buffer to write into
+ * @data:  The zone to read
+ * @state: The buffer to write into
  *
  * @return: Zero or a negative error number
  */
 static error_t aura_gpu_get_color (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct zone_context *zone = data;
 
-    if (WARN_ON(NULL == zone || NULL == io))
+    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
         return -EINVAL;
 
-    io->data.color = zone->color;
+    state->color = zone->color;
 
     return 0;
 }
@@ -677,43 +655,21 @@ static error_t aura_gpu_get_color (
 /**
  * aura_gpu_set_color() - Writes a zones color
  *
- * @data: The zone to write
- * @io:   The buffer containing the new color
+ * @data:  The zone to write
+ * @state: The buffer containing the new color
  *
  * @return: Zero or a negative error number
  */
 static error_t aura_gpu_set_color (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct zone_context *zone = data;
 
-    if (WARN_ON(NULL == zone || NULL == io || io->type != LIGHTS_TYPE_COLOR))
+    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
         return -EINVAL;
 
-    return aura_gpu_apply_zone_color(zone, &io->data.color);
-}
-
-/**
- * aura_gpu_update_color() - Writes a zones color
- *
- * @state: Buffer containing the new color
- *
- * @return: Zero or a negative error number
- */
-static error_t aura_gpu_update_color (
-    const struct lights_state *state
-){
-    struct aura_gpu_controller *ctrl;
-    error_t err;
-
-    list_for_each_entry(ctrl, &aura_gpu_ctrl_list, siblings) {
-        err = aura_gpu_apply_zone_color(&ctrl->zone_contexts[0], &state->color);
-        if (err)
-            break;
-    }
-
-    return err;
+    return aura_gpu_apply_zone_color(zone, &state->color);
 }
 
 /**
@@ -726,13 +682,23 @@ static error_t aura_gpu_update_color (
 static error_t aura_gpu_create_fs (
     struct aura_gpu_controller *gpu_ctrl
 ){
+    struct lights_io_attribute attrs[] = {
+        LIGHTS_MODE_ATTR(
+            &gpu_ctrl->zone_contexts[0],
+            aura_gpu_get_mode,
+            aura_gpu_set_mode
+        ),
+        LIGHTS_COLOR_ATTR(
+            &gpu_ctrl->zone_contexts[0],
+            aura_gpu_get_color,
+            aura_gpu_set_color
+        )
+    };
     uint8_t id = gpu_ctrl->id;
     error_t err;
 
     gpu_ctrl->lights.name = gpu_ctrl->lights_name;
     gpu_ctrl->lights.caps = aura_gpu_modes;
-    gpu_ctrl->lights.update_mode  = aura_gpu_update_mode;
-    gpu_ctrl->lights.update_color = aura_gpu_update_color;
 
     for (id = gpu_ctrl->id; id < 2; id++) {
         snprintf(gpu_ctrl->lights_name, sizeof(gpu_ctrl->lights_name), "gpu-%d", id);
@@ -746,23 +712,7 @@ static error_t aura_gpu_create_fs (
     }
 
     /* Create the attributes */
-    err = lights_create_file(&gpu_ctrl->lights, &LIGHTS_ATTR_RW(
-        "mode",
-        LIGHTS_TYPE_MODE,
-        &gpu_ctrl->zone_contexts[0],
-        aura_gpu_get_mode,
-        aura_gpu_set_mode
-    ));
-    if (err)
-        goto error_release;
-
-    err = lights_create_file(&gpu_ctrl->lights, &LIGHTS_ATTR_RW(
-        "color",
-        LIGHTS_TYPE_COLOR,
-        &gpu_ctrl->zone_contexts[0],
-        aura_gpu_get_color,
-        aura_gpu_set_color
-    ));
+    err = lights_create_files(&gpu_ctrl->lights, attrs, ARRAY_SIZE(attrs));
     if (err)
         goto error_release;
 

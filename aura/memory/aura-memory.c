@@ -4,7 +4,7 @@
 #include <aura/debug.h>
 #include <aura/controller/aura-controller.h>
 
-enum {
+enum spd_type {
     SPD_TYPE_DDR0 = 0x7,
     SPD_TYPE_DDR2 = 0x8,
     SPD_TYPE_DDR3 = 0xB,
@@ -55,9 +55,9 @@ struct callback_data {
     int count;
 };
 
-static const char *led_names[] = {
-    "led-1", "led-2", "led-3", "led-4", "led-5", "led-6", "led-7", "led-8",
-};
+// static const char *led_names[] = {
+//     "led-1", "led-2", "led-3", "led-4", "led-5", "led-6", "led-7", "led-8",
+// };
 
 static const uint8_t aura_memory_rgb_triplets[] = {
     0x52, 0x47, 0x42,  0x02, 0x01, 0x01,  0x03, 0x01, 0x01,  0x04, 0x01, 0x01,
@@ -130,203 +130,6 @@ static error_t aura_memory_create_aura_address (
     return 0;
 }
 
-
-/**
- * aura_memory_color_read() - Reads the color of a single zone
- *
- * @data: A struct aura_zone
- * @io:   Buffer to read into
- *
- * @return: Error code
- */
-static error_t aura_memory_color_read (
-    void *data,
-    struct lights_io *io
-){
-    if (WARN_ON(NULL == data || NULL == io || io->type != LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_controller_get_zone_color(data, &io->data.color);
-}
-
-/**
- * aura_memory_color_write() - Writes a single zone color
- *
- * @data: A struct aura_zone
- * @io:   Buffer to read from
- *
- * @return: Error code
- */
-static error_t aura_memory_color_write (
-    void *data,
-    const struct lights_io *io
-){
-    if (WARN_ON(NULL == data || NULL == io || io->type != LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_controller_set_zone_color(data, &io->data.color);
-}
-
-/**
- * aura_memory_color_update() - Writes a color to all zones on all DIMMS
- *
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_memory_color_update (
-    const struct lights_state *state
-){
-    struct aura_memory_controller *ctrl;
-    error_t err;
-
-    list_for_each_entry(ctrl, &aura_memory_controller_list, siblings) {
-        err = aura_controller_set_color(ctrl->aura_ctrl, &state->color);
-        if (err) {
-            AURA_DBG("aura_controller_set_color() filed with code %d", err);
-            return err;
-        }
-    }
-
-    return 0;
-}
-
-/**
- * aura_memory_mode_read() - Reads the mode of a single zone
- *
- * @data: A struct aura_zone
- * @io:   Buffer to read into
- *
- * @return: Error code
- */
-static error_t aura_memory_mode_read (
-    void *data,
-    struct lights_io *io
-){
-    if (WARN_ON(NULL == data || NULL == io || io->type != LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_controller_get_mode(data, &io->data.mode);
-}
-
-/**
- * aura_memory_color_write() - Writes a single zone mode
- *
- * @data: A struct aura_zone
- * @io:   Buffer to read from
- *
- * @return: Error code
- */
-static error_t aura_memory_mode_write (
-    void *data,
-    const struct lights_io *io
-){
-    if (WARN_ON(NULL == data || NULL == io || io->type != LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_controller_set_mode(data, &io->data.mode);
-}
-
-/**
- * aura_memory_color_update() - Writes a mode to all zones on all DIMMS
- *
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_memory_mode_update (
-    const struct lights_state *state
-){
-    struct aura_memory_controller *node;
-
-    list_for_each_entry(node, &aura_memory_controller_list, siblings) {
-        aura_controller_set_mode(node->aura_ctrl, &state->mode);
-    }
-
-    return 0;
-}
-
-/**
- * aura_memory_create_zone() - Creates userland access
- *
- * @ctrl: Controller being built
- *
- * @return: Error code
- */
-static error_t aura_memory_create_zone (
-    struct aura_memory_controller *ctrl
-){
-    struct aura_zone *aura_zone;
-    int i;
-    uint8_t id;
-    error_t err;
-
-    ctrl->lights.name = ctrl->name;
-    ctrl->lights.caps = aura_controller_get_caps();
-    ctrl->lights.update_color = aura_memory_color_update;
-    ctrl->lights.update_mode = aura_memory_mode_update;
-
-    snprintf(ctrl->name, sizeof(ctrl->name), "dimm-%d", ctrl->spd.slot);
-    err = lights_device_register(&ctrl->lights);
-    if (err)
-        return err;
-
-    aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, ZONE_ID_ALL);
-    if (IS_ERR(aura_zone)) {
-        AURA_DBG("Failed to get aura zone 'all'");
-        err = PTR_ERR(aura_zone);
-        goto error_unregister;
-    }
-
-    /* Create a color and mode file which adjusts all leds */
-    err = lights_create_file(&ctrl->lights, &LIGHTS_ATTR_RW(
-        "mode",
-        LIGHTS_TYPE_MODE,
-        aura_zone,
-        aura_memory_mode_read,
-        aura_memory_mode_write
-    ));
-    if (err)
-        goto error_unregister;
-
-    err = lights_create_file(&ctrl->lights, &LIGHTS_ATTR_RW(
-        "color",
-        LIGHTS_TYPE_COLOR,
-        aura_zone,
-        aura_memory_color_read,
-        aura_memory_color_write
-    ));
-    if (err)
-        goto error_unregister;
-
-    /* Create a color file for each led */
-    for (i = 2, id = 0; id < ctrl->aura_ctrl->zone_count && id < 8; i++, id++) {
-        aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, id);
-        if (IS_ERR(aura_zone)) {
-            AURA_DBG("Failed to get aura zone %d", id);
-            err = PTR_ERR(aura_zone);
-            goto error_unregister;
-        }
-
-        err = lights_create_file(&ctrl->lights, &LIGHTS_ATTR_RW(
-            led_names[id],
-            LIGHTS_TYPE_COLOR,
-            aura_zone,
-            aura_memory_color_read,
-            aura_memory_color_write
-        ));
-        if (err)
-            goto error_unregister;
-    }
-
-    return 0;
-
-error_unregister:
-    lights_device_unregister(&ctrl->lights);
-
-    return err;
-}
-
 /**
  * smbus_read_byte() - Reads a single byte from the bus
  *
@@ -376,6 +179,180 @@ static error_t smbus_write_byte (
     };
 
     return lights_adapter_xfer(&LIGHTS_I2C_CLIENT(adapter, addr, 0), msgs, ARRAY_SIZE(msgs));
+}
+
+
+/**
+ * aura_memory_color_read() - Reads the color of a single zone
+ *
+ * @data:  A struct aura_zone
+ * @state: Buffer to read into
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_color_read (
+    void *data,
+    struct lights_state *state
+){
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+        return -EINVAL;
+
+    return aura_controller_get_zone_color(data, &state->color);
+}
+
+/**
+ * aura_memory_color_write() - Writes a single zone color
+ *
+ * @data:  A struct aura_zone
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_color_write (
+    void *data,
+    const struct lights_state *state
+){
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+        return -EINVAL;
+
+    return aura_controller_set_zone_color(data, &state->color);
+}
+
+/**
+ * aura_memory_mode_read() - Reads the mode of a single zone
+ *
+ * @data:  A struct aura_zone
+ * @state: Buffer to read into
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_mode_read (
+    void *data,
+    struct lights_state *state
+){
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    return aura_controller_get_mode(data, &state->mode);
+}
+
+/**
+ * aura_memory_color_write() - Writes a single zone mode
+ *
+ * @data:  A struct aura_zone
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_mode_write (
+    void *data,
+    const struct lights_state *state
+){
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    return aura_controller_set_mode(data, &state->mode);
+}
+
+/**
+ * aura_memory_leds_write() - Writes color values to all zones
+ *
+ * @data:  Memory controller
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_leds_write (
+    void *data,
+    const struct lights_state *state
+){
+    struct aura_memory_controller *ctrl = data;
+    struct aura_zone *zone;
+    struct lights_color *color;
+    uint8_t id;
+    error_t err;
+
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_LEDS))
+        return -EINVAL;
+
+    if (state->raw.length != ctrl->aura_ctrl->zone_count)
+        return -EINVAL;
+
+    color = state->raw.data;
+
+    for (id = 0; id < ctrl->aura_ctrl->zone_count && id < 8; id++, color++) {
+        zone = aura_controller_get_zone(ctrl->aura_ctrl, id);
+        if (IS_ERR(zone)) {
+            err = PTR_ERR(zone);
+            AURA_DBG("Failed to get aura zone %d: %s", id, ERR_NAME(err));
+            return err;
+        }
+
+        err = aura_controller_set_zone_color(zone, color);
+        if (err) {
+            AURA_DBG("Failed to apply color to aura zone %d: %s", id, ERR_NAME(err));
+            return err;
+        }
+    }
+
+    return 0;
+}
+
+
+/**
+ * aura_memory_create_zone() - Creates userland access
+ *
+ * @ctrl: Controller being built
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_create_zone (
+    struct aura_memory_controller *ctrl
+){
+    struct aura_zone *aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, ZONE_ID_ALL);
+    struct lights_io_attribute attrs[] = {
+        LIGHTS_MODE_ATTR(
+            aura_zone,
+            aura_memory_mode_read,
+            aura_memory_mode_write
+        ),
+        LIGHTS_COLOR_ATTR(
+            aura_zone,
+            aura_memory_color_read,
+            aura_memory_color_write
+        ),
+        LIGHTS_LEDS_ATTR(
+            ctrl,
+            aura_memory_leds_write
+        )
+    };
+    error_t err;
+
+    if (IS_ERR(aura_zone)) {
+        err = PTR_ERR(aura_zone);
+        AURA_DBG("Failed to get aura zone 'all': %s", ERR_NAME(err));
+        goto error_unregister;
+    }
+
+    snprintf(ctrl->name, sizeof(ctrl->name), "dimm-%d", ctrl->spd.slot);
+    err = lights_device_register(&ctrl->lights);
+    if (err)
+        return err;
+
+    ctrl->lights.led_count = ctrl->aura_ctrl->zone_count;
+    ctrl->lights.name = ctrl->name;
+    ctrl->lights.caps = aura_controller_get_caps();
+
+    err = lights_create_files(&ctrl->lights, attrs, ARRAY_SIZE(attrs));
+    if (err)
+        goto error_unregister;
+
+    return 0;
+
+error_unregister:
+    lights_device_unregister(&ctrl->lights);
+
+    return err;
 }
 
 /**
@@ -649,11 +626,11 @@ error_t aura_memory_probe (
     if (err < 0 || data.count == 0)
         return err;
 
-    err = aura_memory_mode_update(state);
-    if (err)
-        return err;
-
-    err = aura_memory_color_update(state);
+    // err = aura_memory_mode_update(state);
+    // if (err)
+    //     return err;
+    //
+    // err = aura_memory_color_update(state);
 
     return err;
 }

@@ -17,10 +17,41 @@
 #define LIGHTS_MAX_MINORS           512
 #define LIGHTS_MAX_DEVICES          64
 
-static DECLARE_BITMAP(lights_minors, LIGHTS_MAX_MINORS);
-static LIST_HEAD(lights_interface_list);
-static DEFINE_MUTEX(lights_interface_lock);
-static LIST_HEAD(lights_caps_list);
+static struct {
+    struct class        *class;
+    struct lights_state state;
+    struct lights_dev   all;
+
+    struct {
+        struct list_head    list;
+        spinlock_t          lock;
+        size_t              count;
+    }                   interface,
+                        caps;
+    spinlock_t          state_lock;
+    atomic_t            next_id;
+    int                 major;
+    unsigned long       minors[BITS_TO_LONGS(LIGHTS_MAX_MINORS)];
+} lights_global = {
+    .interface = {
+        .list = LIST_HEAD_INIT(lights_global.interface.list),
+        .lock = __SPIN_LOCK_UNLOCKED(lights_global.interface.lock),
+        .count = 0,
+    },
+    .caps = {
+        .list = LIST_HEAD_INIT(lights_global.caps.list),
+        .lock = __SPIN_LOCK_UNLOCKED(lights_global.caps.lock),
+        .count = 0,
+    },
+    .state_lock = __SPIN_LOCK_UNLOCKED(lights_global.state_lock),
+    .next_id = ATOMIC_INIT(0),
+    .all = { .name = "all" },
+};
+
+static char *default_color      = "#FF0000";
+static char *default_mode       = "static";
+static char *default_speed      = "2";
+static char *default_direction  = "0";
 
 static struct lights_mode lights_available_modes[] = {
     { LIGHTS_MODE_OFF,       LIGHTS_MODE_LABEL_OFF,      },
@@ -57,16 +88,17 @@ struct lights_caps {
  * @fops:     File operations of the device
  */
 struct lights_file {
-    int                                 minor;     /* A LIGHT_CLASS minor number */
-    struct cdev                         cdev;      /* The files character device */
-    struct device                       *dev;      /* The files driver device */
-    struct list_head                    siblings;  /* Pointers to prev and next light_dev_file */
-    const struct lights_io_attribute    attr;      /* Pointer to the attributes it was created with */
-    struct lights_interface             *intf;     /* The owning interface */
-    struct file_operations              fops;      /* The cdev fops */
+    int                                 minor;
+    struct cdev                         cdev;
+    struct device                       *dev;
+    struct list_head                    siblings;
+    const struct lights_io_attribute    attr;
+    struct lights_interface             *intf;
+    struct file_operations              fops;
 };
-#define file_from_attr(ptr) \
-    container_of(ptr, struct lights_file, attr)
+#define file_from_attr(ptr) ( \
+    container_of(ptr, struct lights_file, attr) \
+)
 
 /**
  * struct lights_interface - Interface storage
@@ -79,25 +111,31 @@ struct lights_file {
  * @kdev:      Kernel device
  */
 struct lights_interface {
-    char                    name[LIGHTS_MAX_FILENAME_LENGTH];
-    spinlock_t              file_lock;
-    struct list_head        file_list;
     struct list_head        siblings;
     struct lights_dev       *ldev;
     struct device           kdev;
+    struct kref             refs;
+    struct lights_color     *led_buffer;
+    struct list_head        file_list;
+    spinlock_t              file_lock;
+    uint16_t                id;
+    char                    name[LIGHTS_MAX_FILENAME_LENGTH];
 };
 #define interface_from_dev(dev)( \
     container_of(dev, struct lights_interface, kdev) \
 )
 
-static int lights_major;
-static struct class *lights_class;
-static struct lights_state lights_global_state;
-static DEFINE_SPINLOCK(lights_state_lock);
+/*
+ * Forward declaration for reference counters
+ */
+static void lights_interface_destroy (struct lights_interface *intf);
+static void lights_interface_put (
+    struct kref *ref
+){
+    struct lights_interface *intf = container_of(ref, struct lights_interface, refs);
 
-static char *default_color = "#FF0000";
-static char *default_mode  = "static";
-static char *default_speed = "2";
+    lights_interface_destroy(intf);
+}
 
 /**
  * lights_add_caps() - Adds a mode to accumulated list
@@ -112,9 +150,8 @@ static char *default_speed = "2";
 static error_t lights_add_caps (
     const struct lights_mode *mode
 ){
-    struct lights_caps *caps;
-    struct lights_caps *insert;
-    int equality;
+    struct lights_caps *iter, *entry;
+    error_t err = 0;
 
     if (IS_NULL(mode, mode->name))
         return -EINVAL;
@@ -122,41 +159,38 @@ static error_t lights_add_caps (
     if (lights_is_custom_mode(mode))
         return 0;
 
-    insert = NULL;
-    if (!list_empty(&lights_caps_list)) {
-        list_for_each_entry(caps, &lights_caps_list, siblings) {
-            equality = strcmp(caps->mode.name, mode->name);
+    entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return -ENOMEM;
 
-            if (caps->mode.id == mode->id) {
-                if (equality == 0) {
-                    caps->ref_count++;
-                    return 0;
-                } else {
-                    LIGHTS_ERR(
-                        "mode %d:%s conflicts with known mode %d:%s",
-                        mode->id, mode->name,
-                        caps->mode.id, caps->mode.name
-                    );
-                    return -EINVAL;
-                }
+    entry->mode = *mode;
+    entry->ref_count = 2;
+
+    spin_lock(&lights_global.caps.lock);
+
+    list_for_each_entry(iter, &lights_global.caps.list, siblings) {
+        if (iter->mode.id == mode->id) {
+            if (0 == strcmp(iter->mode.name, mode->name)) {
+                iter->ref_count++;
+            } else {
+                LIGHTS_ERR(
+                    "mode %d:%s conflicts with known mode %d:%s",
+                    mode->id, mode->name,
+                    iter->mode.id, iter->mode.name
+                );
+                err = -EINVAL;
             }
 
-            if (!insert && equality > 0)
-                insert = caps;
+            kfree(entry);
+            goto exit;
         }
     }
 
-    caps = kzalloc(sizeof(*caps), GFP_KERNEL);
-    if (!caps)
-        return -ENOMEM;
+    lights_global.caps.count++;
+    list_add_tail(&entry->siblings, &lights_global.caps.list);
 
-    caps->mode = *mode;
-    caps->ref_count = 1;
-
-    if (insert)
-        list_add_tail(&caps->siblings, &insert->siblings);
-    else
-        list_add_tail(&caps->siblings, &lights_caps_list);
+exit:
+    spin_unlock(&lights_global.caps.lock);
 
     return 0;
 }
@@ -173,21 +207,27 @@ static error_t lights_add_caps (
 static void lights_del_caps (
     const struct lights_mode *mode
 ){
-    struct lights_caps *caps, *safe;
+    struct lights_caps *iter, *safe;
 
     if (IS_NULL(mode))
         return;
 
-    list_for_each_entry_safe(caps, safe, &lights_caps_list, siblings) {
-        if (caps->mode.id == mode->id) {
-            caps->ref_count--;
-            if (0 == caps->ref_count) {
-                list_del(&caps->siblings);
-                kfree(caps);
-                return;
+    spin_lock(&lights_global.caps.lock);
+
+    list_for_each_entry_safe(iter, safe, &lights_global.caps.list, siblings) {
+        if (iter->mode.id == mode->id) {
+            iter->ref_count--;
+            if (1 == iter->ref_count) {
+                list_del(&iter->siblings);
+                kfree(iter);
+                lights_global.caps.count--;
+                goto exit;
             }
         }
     }
+
+exit:
+    spin_unlock(&lights_global.caps.lock);
 }
 
 /**
@@ -200,18 +240,81 @@ static void lights_del_caps (
 static const struct lights_mode *lights_find_caps (
     const char *name
 ){
-    struct lights_caps *caps;
+    const struct lights_mode *mode;
+    struct lights_caps *iter;
 
     if (IS_NULL(name))
         return ERR_PTR(-EINVAL);
 
-    list_for_each_entry(caps, &lights_caps_list, siblings) {
-        if (0 == strncmp(caps->mode.name, name, strlen(caps->mode.name))) {
-            return &caps->mode;
+    spin_lock(&lights_global.caps.lock);
+
+    list_for_each_entry(iter, &lights_global.caps.list, siblings) {
+        if (0 == strcmp(iter->mode.name, name)) {
+            mode = &iter->mode;
+            goto exit;
         }
     }
 
-    return ERR_PTR(-ENOENT);
+    mode = ERR_PTR(-ENOENT);
+
+exit:
+    spin_unlock(&lights_global.caps.lock);
+
+    return mode;
+}
+
+/**
+ * lights_find_mode() - Finds a mode from a userland buffer
+ *
+ * @intf: Interface to search within
+ * @mode: Target buffer to write
+ * @buf:  Userland input buffer
+ * @len:  Length of @buf
+ *
+ * @return: Error code
+ */
+static error_t lights_find_mode (
+    struct lights_interface *intf,
+    struct lights_mode *mode,
+    const char __user *buf,
+    size_t len
+){
+    const struct lights_mode *iter;
+    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH + 1];
+    char *name;
+    size_t count;
+
+    if (!len || len > LIGHTS_MAX_MODENAME_LENGTH)
+        return -EINVAL;
+
+    count = min_t(size_t, len, LIGHTS_MAX_MODENAME_LENGTH);
+    copy_from_user(kern_buf, buf, count);
+    kern_buf[count] = 0;
+    name = strim(kern_buf);
+
+    if (0 == strcmp("all", intf->name)) {
+        iter = lights_find_caps(name);
+        if (IS_ERR(iter))
+            return CLEAR_ERR(iter);
+
+        memcpy(mode, iter, sizeof(*mode));
+        return 0;
+    }
+
+    iter = intf->ldev->caps;
+    if (iter) {
+        while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
+            if (0 == strcmp(iter->name, name)) {
+                memcpy(mode, iter, sizeof(*mode));
+                return 0;
+            }
+            iter++;
+        }
+    }
+
+    LIGHTS_DBG("Mode '%s' not found in '%s'", name, intf->name);
+
+    return -ENOENT;
 }
 
 /**
@@ -226,38 +329,33 @@ static const struct lights_mode *lights_find_caps (
 static ssize_t lights_dump_caps (
     char *buffer
 ){
-    struct list_head *interface;
-    struct lights_caps *caps;
+    struct lights_caps *iter;
     size_t mode_len;
     ssize_t written = 0;
-    uint32_t ref_count = 0;
 
-    list_for_each(interface, &lights_interface_list)
-        ref_count++;
+    spin_lock(&lights_global.caps.lock);
 
-    /* The first interface is for 'all' */
-    ref_count--;
-    if (ref_count == 0)
-        return 0;
-
-    list_for_each_entry(caps, &lights_caps_list, siblings) {
-        if (caps->ref_count != ref_count)
+    list_for_each_entry(iter, &lights_global.caps.list, siblings) {
+        if (iter->ref_count != lights_global.interface.count)
             continue;
 
-        mode_len = strlen(caps->mode.name);
+        mode_len = strlen(iter->mode.name);
 
         if (written + mode_len + 1 > PAGE_SIZE) {
             written = -ENOMEM;
-            break;
+            goto exit;
         }
 
-        memcpy(buffer, caps->mode.name, mode_len);
+        memcpy(buffer, iter->mode.name, mode_len);
         buffer[mode_len] = '\n';
 
         mode_len++;
         buffer += mode_len;
         written += mode_len;
     }
+
+exit:
+    spin_unlock(&lights_global.caps.lock);
 
     return written;
 }
@@ -346,6 +444,53 @@ static void lights_remove_caps (
         lights_del_caps(modes);
         modes++;
     }
+}
+
+
+/**
+ * lights_read_hex() - Converts a hex string into a hex value
+ *
+ * @value:  Target buffer
+ * @buffer: Input buffer
+ * @length: Length of @buffer
+ *
+ * @return: Error code
+ */
+static error_t lights_read_hex (
+    uint32_t *value,
+    const char *buffer,
+    size_t length
+){
+    char c;
+    int shift, n, i;
+
+    switch (length) {
+        case 2: shift = 4; break;
+        case 4: shift = 12; break;
+        case 6: shift = 20; break;
+        case 8: shift = 28; break;
+        default:
+            return -EINVAL;
+    }
+
+    *value = 0;
+
+    for (i = 0; i < length; i++, shift -= 4) {
+        c = buffer[i];
+
+        if (c >= '0' && c <= '9')
+            n = c - '0';
+        else if (c >= 'a' && c <= 'f')
+            n = (c - 'a') + 10;
+        else if (c >= 'A' && c <= 'F')
+            n = (c - 'A') + 10;
+        else
+            return -EINVAL;
+
+        *value |= n << shift;
+    }
+
+    return 0;
 }
 
 /**
@@ -475,7 +620,7 @@ ssize_t lights_read_speed (
         tmp = buffer[0];
     }
 
-    if (tmp < '1' || tmp > '5')
+    if (tmp < '0' || tmp > '5')
         return -EINVAL;
 
     *speed = tmp - '0';
@@ -485,6 +630,79 @@ ssize_t lights_read_speed (
 EXPORT_SYMBOL_NS_GPL(lights_read_speed, LIGHTS);
 
 /**
+ * lights_read_direction - Helper for reading direction value strings
+ *
+ * @buffer:    A kernel/user buffer containing the string
+ * @len:       The length of the buffer
+ * @direction: A value to populate with the direction
+ *
+ * @Return: The number of characters read or a negative error number
+ */
+ssize_t lights_read_direction (
+    const char *buffer,
+    size_t len,
+    uint8_t *direction
+){
+    char tmp;
+
+    if (len < 1)
+        return -EINVAL;
+
+    if (is_user_memory(buffer, 1)) {
+        if (get_user(tmp, buffer))
+            return -EFAULT;
+    } else {
+        tmp = buffer[0];
+    }
+
+    if (tmp == '0')
+        *direction = 0;
+    else if (tmp == '1')
+        *direction = 1;
+    else
+        return -EINVAL;
+
+    return 1;
+}
+EXPORT_SYMBOL_NS_GPL(lights_read_direction, LIGHTS);
+
+/**
+ * lights_read_sync - Helper for reading sync value strings
+ *
+ * @buffer: A kernel/user buffer containing the string
+ * @len:    The length of the buffer
+ * @sync:   A value to populate with the speed
+ *
+ * @Return: The number of characters read or a negative error number
+ */
+ssize_t lights_read_sync (
+    const char *buffer,
+    size_t len,
+    uint8_t *sync
+){
+    char kern_buf[4];
+    uint32_t value;
+
+    if (len < 4)
+        return -EINVAL;
+
+    if (is_user_memory(buffer, len)) {
+        copy_from_user(kern_buf, buffer, len);
+        buffer = kern_buf;
+    }
+
+    if (buffer[0] == '0' && (buffer[1] == 'x' || buffer[1] == 'X')) {
+        if (0 == lights_read_hex(&value, &buffer[2], 2)) {
+            *sync = (uint8_t)value;
+            return 4;
+        }
+    }
+
+    return -EINVAL;
+}
+EXPORT_SYMBOL_NS_GPL(lights_read_sync, LIGHTS);
+
+/**
  * lights_get_params - Retrieves the current global state
  *
  * @state: An object to populate with the state
@@ -492,212 +710,206 @@ EXPORT_SYMBOL_NS_GPL(lights_read_speed, LIGHTS);
 void lights_get_state (
     struct lights_state *state
 ){
-    *state = lights_global_state;
+    spin_lock(&lights_global.state_lock);
+
+    memcpy(state, &lights_global.state, sizeof(*state));
+    state->type = LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION;
+
+    spin_unlock(&lights_global.state_lock);
 }
 EXPORT_SYMBOL_NS_GPL(lights_get_state, LIGHTS);
 
-/**
- * update_dev_mode() - Calls update_mode() of given device
- *
- * @dev:    Device to update
- * @params: Buffer containing the new mode
- *
- * @return: Return value from the device
- */
-static error_t update_dev_mode (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_mode) ? dev->update_mode(params) : 0;
-}
 
 /**
- * update_dev_color() - Calls update_color() of given device
+ * find_attribute_for_file() - Finds the user attributes for the given character device
  *
- * @dev:    Device to update
- * @params: Buffer containing the new color
+ * @filp: Character device handle (/dev/lights/___/)
  *
- * @return: Return value from the device
+ * @return: NULL or the file containing the attributes
+ *
+ * NOTE, The reference count is increased on the owning interface. When the
+ * caller is done with the object it MUST decrease the reference counter.
  */
-static error_t update_dev_color (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_color) ? dev->update_color(params) : 0;
-}
-
-/**
- * update_dev_speed() - Calls update_speed() of given device
- *
- * @dev:    Device to update
- * @params: Buffer containing the new speed
- *
- * @return: Return value from the device
- */
-static error_t update_dev_speed (
-    struct lights_dev * dev,
-    const struct lights_state *params
-){
-    return (dev->update_speed) ? dev->update_speed(params) : 0;
-}
-
-/**
- * for_each_device_call() - Calls a function in each device
- *
- * @callback: Device function to call
- *
- * @return: Zero or a negative error code
- */
-static error_t for_each_device_call (
-    error_t (*callback)(struct lights_dev *, const struct lights_state *)
+static struct lights_file *find_attribute_for_file (
+    struct file *filp
 ){
     struct lights_interface *interface;
-    error_t err = 0;
+    struct lights_file *iter;
+    struct cdev *cdev;
 
-    mutex_lock(&lights_interface_lock);
+    cdev = filp->f_inode->i_cdev;
 
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        err = callback(interface->ldev, &lights_global_state);
-        if (err)
-            break;
+    spin_lock(&lights_global.interface.lock);
+
+    list_for_each_entry(interface, &lights_global.interface.list, siblings) {
+        if (!list_empty(&interface->file_list)) {
+            list_for_each_entry(iter, &interface->file_list, siblings) {
+                if (cdev == &iter->cdev) {
+                    kref_get(&iter->intf->refs);
+                    goto found;
+                }
+            }
+        }
     }
 
-    mutex_unlock(&lights_interface_lock);
+    iter = NULL;
 
-    return err;
+found:
+    spin_unlock(&lights_global.interface.lock);
+
+    return iter;
 }
 
 /**
- * color_read() - Reads the global color value
+ * find_attribute_for_type() - Searches for a given attribute type in the interface
  *
- * @data: Ununsed
- * @io:   Buffer to write the value into
+ * @interface: Interface to search
+ * @type:      Type of attribute to find
  *
- * @return: Zero or a negative error code
+ * @return: NULL or the file containing the attributes
  *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
+ * NOTE, The reference count is increased on the owning interface. When the
+ * caller is done with the object it MUST decrease the reference counter.
  */
-static error_t color_read (
-    void *data,
-    struct lights_io *io
+static struct lights_file *find_attribute_for_type (
+    struct lights_interface *intf,
+    enum lights_io_type type
 ){
-    spin_lock(&lights_state_lock);
-    io->data.color = lights_global_state.color;
-    spin_unlock(&lights_state_lock);
+    struct lights_file *iter;
+
+    list_for_each_entry(iter, &intf->file_list, siblings) {
+        if (type == iter->attr.type) {
+            kref_get(&intf->refs);
+            return iter;
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * update_each_interface() - Invokes the write method in all relevant attributes
+ *
+ * @state: Buffer of data to write
+ *
+ * @return: Error code
+ */
+static error_t update_each_interface (
+    const struct lights_state *state
+){
+    const struct lights_file **files;
+    struct lights_interface *intf;
+    size_t count, i;
+    error_t err = 0;
+
+    /*
+     * We cannot hold a spinlock while invoking the read callback or while
+     * allocating memory. Reading the count in an unlocked state is risky
+     * since an interface may be removed right after reading.
+     */
+
+repeat:
+    count = lights_global.interface.count;
+    files = kcalloc(count, sizeof(*files), GFP_KERNEL);
+
+    spin_lock(&lights_global.interface.lock);
+
+    if (count < lights_global.interface.count) {
+        kfree(files);
+        spin_unlock(&lights_global.interface.lock);
+        goto repeat;
+    }
+
+    count = 0;
+    list_for_each_entry(intf, &lights_global.interface.list, siblings) {
+        /* Exclude the "all" interface */
+        if (intf->id == 0)
+            continue;
+
+        files[count] = find_attribute_for_type(intf, state->type);
+        if (files[count])
+            count++;
+    }
+
+    spin_unlock(&lights_global.interface.lock);
+
+    for (i = 0; i < count; i++) {
+        if (files[i]->attr.write) {
+            err = files[i]->attr.write(files[i]->attr.private_data, state);
+
+            if (err) {
+                LIGHTS_ERR(
+                    "Failed to update '%s/%s': %s",
+                    files[i]->intf->name,
+                    files[i]->attr.attr.name,
+                    ERR_NAME(err)
+                );
+            }
+        }
+
+        kref_put(&files[i]->intf->refs, lights_interface_put);
+    }
+
+    kfree(files);
 
     return 0;
 }
 
 /**
- * color_write() - Writes the global color value
+ * io_read() - File output handler
  *
- * @data: Ununsed
- * @io:   Buffer to read the value from
+ * @data:  Unused
+ * @state: Buffer to populate
  *
- * @return: Zero or a negative error code
+ * @return: Zero
  *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
+ * This function is the read handler for all device files
+ * under the "all" interface.
  */
-static error_t color_write (
+static error_t io_read (
     void *data,
-    const struct lights_io *io
+    struct lights_state *state
 ){
-    spin_lock(&lights_state_lock);
-    lights_global_state.color = io->data.color;
-    spin_unlock(&lights_state_lock);
-
-    // Loop through and update connected devices
-    return for_each_device_call(update_dev_color);
-}
-
-/**
- * mode_read() - Reads the global mode value
- *
- * @data: Ununsed
- * @io:   Buffer to write the value into
- *
- * @return: Zero or a negative error code
- *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
- */
-static error_t mode_read (
-    void *data,
-    struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    io->data.mode = lights_global_state.mode;
-    spin_unlock(&lights_state_lock);
+    lights_get_state(state);
 
     return 0;
 }
 
 /**
- * mode_write() - Writes the global mode value
+ * io_write() - File input handler
  *
- * @data: Ununsed
- * @io:   Buffer to read the value from
+ * @data:  Unused
+ * @state: Data written to the file
  *
- * @return: Zero or a negative error code
+ * @return: Error code
  *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
+ * This function is the write handler for all device files
+ * under the "all" interface. When invoked it will call the
+ * write method of all other interfaces for the same data type.
  */
-static error_t mode_write (
+static error_t io_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
-    spin_lock(&lights_state_lock);
-    lights_global_state.mode = io->data.mode;
-    spin_unlock(&lights_state_lock);
+    if (IS_NULL(state))
+        return -EINVAL;
 
-    return for_each_device_call(update_dev_mode);
-}
+    spin_lock(&lights_global.state_lock);
 
-/**
- * speed_read() - Reads the global speed value
- *
- * @data: Ununsed
- * @io:   Buffer to write the value into
- *
- * @return: Zero or a negative error code
- *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
- */
-static error_t speed_read (
-    void *data,
-    struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    io->data.speed = lights_global_state.speed;
-    spin_unlock(&lights_state_lock);
+    if (state->type & LIGHTS_TYPE_MODE)
+        lights_global.state.mode = state->mode;
+    if (state->type & LIGHTS_TYPE_COLOR)
+        lights_global.state.color = state->color;
+    if (state->type & LIGHTS_TYPE_SPEED)
+        lights_global.state.speed = state->speed;
+    if (state->type & LIGHTS_TYPE_DIRECTION)
+        lights_global.state.direction = state->direction;
+    if (state->type & LIGHTS_TYPE_SYNC)
+        lights_global.state.sync = state->sync;
 
-    return 0;
-}
+    spin_unlock(&lights_global.state_lock);
 
-/**
- * speed_write() - Writes the global speed value
- *
- * @data: Ununsed
- * @io:   Buffer to read the value from
- *
- * @return: Zero or a negative error code
- *
- * The global values are configured through module params and writing
- * to one of the devices in /dev/lights/all/
- */
-static error_t speed_write (
-    void *data,
-    const struct lights_io *io
-){
-    spin_lock(&lights_state_lock);
-    lights_global_state.speed = io->data.speed;
-    spin_unlock(&lights_state_lock);
-
-    return for_each_device_call(update_dev_speed);
+    return update_each_interface(state);
 }
 
 /**
@@ -767,44 +979,61 @@ static const struct attribute_group *lights_class_groups[] = {
 };
 
 /**
- * find_attribute_for_file() - Finds the user attributes for the given character device
+ * lights_attribute_read() - Helper method for invoking write
  *
- * @filp: Character device handle (/dev/lights/___/)
+ * @filp:  Handle to the cdev file
+ * @state: Data to write
  *
- * @return: NULL or the files attributes
+ * @return: Error code
  */
-static const struct lights_io_attribute *find_attribute_for_file (
-    struct file *filp
+static error_t lights_attribute_read (
+    struct file *filp,
+    struct lights_state *state
 ){
-    struct lights_interface *interface;
-    struct lights_file *file_iter;
-    const struct lights_io_attribute *attr;
-    struct cdev *cdev;
+    struct lights_file *file;
+    error_t err = -ENODEV;
 
-    cdev = filp->f_inode->i_cdev;
+    file = find_attribute_for_file(filp);
+    if (!file)
+        return -ENODEV;
 
-    mutex_lock(&lights_interface_lock);
+    if (file->attr.read)
+        err = file->attr.read(file->attr.private_data, state);
 
-    attr = NULL;
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        if (!list_empty(&interface->file_list)) {
-            list_for_each_entry(file_iter, &interface->file_list, siblings) {
-                if (cdev == &file_iter->cdev) {
-                    attr = &file_iter->attr;
-                    goto found;
-                }
-            }
-        }
-    }
+    kref_put(&file->intf->refs, lights_interface_put);
 
-found:
-    mutex_unlock(&lights_interface_lock);
-
-    return attr;
+    return err;
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_attribute_write() - Helper method for invoking read
+ *
+ * @filp:  Handle to the cdev file
+ * @state: Buffer to fill
+ *
+ * @return: Error code
+ */
+static error_t lights_attribute_write (
+    struct file *filp,
+    const struct lights_state *state
+){
+    struct lights_file *file;
+    error_t err = -ENODEV;
+
+    file = find_attribute_for_file(filp);
+    if (!file)
+        return -ENODEV;
+
+    if (file->attr.write)
+        err = file->attr.write(file->attr.private_data, state);
+
+    kref_put(&file->intf->refs, lights_interface_put);
+
+    return err;
+}
+
+/**
+ * lights_mode_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Target buffer
@@ -813,105 +1042,20 @@ found:
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_color_read (
+static ssize_t lights_mode_attribute_read (
     struct file *filp,
     char __user *buf,
     size_t len,
     loff_t *off
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_COLOR
-    };
-    struct lights_color *c = &io.data.color;
-    char color_buf[9];
-    ssize_t err;
-
-    if (*off >= 9)
-        return 0;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
-    if (err)
-        return err;
-
-    snprintf(color_buf, 9, "#%02X%02X%02X\n", c->r, c->g, c->b);
-    err = copy_to_user(buf, color_buf, 9);
-    if (err)
-        return -EFAULT;
-
-    return *off = 9;
-}
-
-/**
- * lights_color_read() - File IO handler
- *
- * @filp: Character device handle
- * @buf:  Source buffer
- * @len:  Length of @buf
- * @off:  Offset to begin writing
- *
- * @return: Number of bytes or a negative error code
- */
-static ssize_t lights_color_write (
-    struct file *filp,
-    const char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_COLOR
-    };
-    ssize_t count, err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    count = lights_read_color(buf, len, &io.data.color);
-    if (count < 0)
-        return count;
-
-    err = attr->write(attr->private_data, &io);
-    if (err)
-        return err;
-
-    return len;
-}
-
-/**
- * lights_color_read() - File IO handler
- *
- * @filp: Character device handle
- * @buf:  Target buffer
- * @len:  Length of @buf
- * @off:  Offset to begin reading
- *
- * @return: Number of bytes or a negative error code
- */
-static ssize_t lights_mode_read (
-    struct file *filp,
-    char __user *buf,
-    size_t len,
-    loff_t *off
-){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
+    struct lights_state state = {
         .type = LIGHTS_TYPE_MODE
     };
-    struct lights_mode *mode = &io.data.mode;
+    struct lights_mode *mode = &state.mode;
     char mode_buf[LIGHTS_MAX_MODENAME_LENGTH];
     ssize_t count, err;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
+    err = lights_attribute_read(filp, &state);
     if (err)
         return err;
 
@@ -931,7 +1075,7 @@ static ssize_t lights_mode_read (
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_mode_attribute_write() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Source buffer
@@ -940,68 +1084,39 @@ static ssize_t lights_mode_read (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_mode_write (
+static ssize_t lights_mode_attribute_write (
     struct file *filp,
     const char __user *buf,
     size_t len,
     loff_t *off
 ){
-    struct lights_interface *intf;
-    const struct lights_io_attribute *attr;
-    const struct lights_mode *mode;
-    struct lights_io io = {
+    const struct lights_file *file;
+    struct lights_state state = {
         .type = LIGHTS_TYPE_MODE
     };
-    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH + 1];
-    char *name;
-    size_t count, err;
+    error_t err;
 
-    if (!len)
-        return -EINVAL;
-
-    count = min_t(size_t, len, LIGHTS_MAX_MODENAME_LENGTH);
-    copy_from_user(kern_buf, buf, count);
-    kern_buf[count] = 0;
-    name = strim(kern_buf);
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
+    file = find_attribute_for_file(filp);
+    if (!file)
         return -ENODEV;
 
-    /* mode should exist within the interfaces caps */
-    intf = file_from_attr(attr)->intf;
-
-    if (0 == strcmp("all", intf->name)) {
-        mode = lights_find_caps(name);
-        if (IS_ERR(mode))
-            return PTR_ERR(mode);
-    } else {
-        mode = intf->ldev->caps;
-        if (mode) {
-            while (mode->id != LIGHTS_MODE_ENDOFARRAY) {
-                if (0 == strcmp(mode->name, name))
-                    goto found;
-                mode++;
-            }
-            LIGHTS_DBG("Mode '%s' not found in '%s'", name, intf->name);
-            mode = NULL;
-        }
-    }
-
-found:
-    if (!mode)
-        return -EINVAL;
-
-    io.data.mode = *mode;
-    err = attr->write(attr->private_data, &io);
+    err = lights_find_mode(file->intf, &state.mode, buf, len);
     if (err)
-        return err;
+        goto exit;
 
-    return len;
+    if (file->attr.write)
+        err = file->attr.write(file->attr.private_data, &state);
+    else
+        err = -ENODEV;
+
+exit:
+    kref_put(&file->intf->refs, lights_interface_put);
+
+    return err ? err : len;
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_color_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Target buffer
@@ -1010,14 +1125,83 @@ found:
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_speed_read (
+static ssize_t lights_color_attribute_read (
     struct file *filp,
     char __user *buf,
     size_t len,
     loff_t *off
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_COLOR
+    };
+    struct lights_color *c = &state.color;
+    char color_buf[9];
+    ssize_t err;
+
+    if (*off >= 9)
+        return 0;
+
+    err = lights_attribute_read(filp, &state);
+    if (err)
+        return err;
+
+    snprintf(color_buf, 9, "#%02X%02X%02X\n", c->r, c->g, c->b);
+    err = copy_to_user(buf, color_buf, 9);
+    if (err)
+        return -EFAULT;
+
+    return *off = 9;
+}
+
+/**
+ * lights_color_attribute_write() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Source buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin writing
+ *
+ * @return: Number of bytes or a negative error code
+ */
+static ssize_t lights_color_attribute_write (
+    struct file *filp,
+    const char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_COLOR
+    };
+    ssize_t err;
+
+    err = lights_read_color(buf, len, &state.color);
+    if (err < 0)
+        return err;
+
+    err = lights_attribute_write(filp, &state);
+    if (err)
+        return err;
+
+    return len;
+}
+
+/**
+ * lights_speed_attribute_read() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Target buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin reading
+ *
+ * @return: Number of bytes or a negative error code
+ */
+static ssize_t lights_speed_attribute_read (
+    struct file *filp,
+    char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    struct lights_state state = {
         .type = LIGHTS_TYPE_SPEED
     };
     char speed_buf[3];
@@ -1026,15 +1210,11 @@ static ssize_t lights_speed_read (
     if (*off >= 2)
         return 0;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
-
-    err = attr->read(attr->private_data, &io);
+    err = lights_attribute_read(filp, &state);
     if (err)
         return err;
 
-    speed_buf[0] = io.data.speed + '0';
+    speed_buf[0] = state.speed + '0';
     speed_buf[1] = '\n';
     speed_buf[2] = 0;
 
@@ -1046,7 +1226,7 @@ static ssize_t lights_speed_read (
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_speed_attribute_write() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Source buffer
@@ -1055,27 +1235,22 @@ static ssize_t lights_speed_read (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_speed_write (
+static ssize_t lights_speed_attribute_write (
     struct file *filp,
     const char __user *buf,
     size_t len,
     loff_t *off
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
+    struct lights_state state = {
         .type = LIGHTS_TYPE_SPEED
     };
     ssize_t err;
 
-    err = lights_read_speed(buf, len, &io.data.speed);
-    if (err)
+    err = lights_read_speed(buf, len, &state.speed);
+    if (err < 0)
         return err;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
-
-    err = attr->write(attr->private_data, &io);
+    err = lights_attribute_write(filp, &state);
     if (err)
         return err;
 
@@ -1083,7 +1258,7 @@ static ssize_t lights_speed_write (
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_direction_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Target buffer
@@ -1092,43 +1267,112 @@ static ssize_t lights_speed_write (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_raw_read (
+static ssize_t lights_direction_attribute_read (
     struct file *filp,
     char __user *buf,
     size_t len,
     loff_t *off
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
-        .type = LIGHTS_TYPE_CUSTOM
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_DIRECTION
     };
-    struct lights_buffer *buffer = &io.data.raw;
+    char output[3];
     ssize_t err;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->read)
-        return -ENODEV;
+    if (*off >= 2)
+        return 0;
+
+    err = lights_attribute_read(filp, &state);
+    if (err)
+        return err;
+
+    output[0] = state.direction + '0';
+    output[1] = '\n';
+    output[2] = 0;
+
+    err = copy_to_user(buf, output, len < 3 ? len : 3);
+    if (err)
+        return -EFAULT;
+
+    return *off = 2;
+}
+
+/**
+ * lights_direction_attribute_write() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Source buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin writing
+ *
+ * @return: Number of bytes or a negative error code
+ */
+static ssize_t lights_direction_attribute_write (
+    struct file *filp,
+    const char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_DIRECTION
+    };
+    ssize_t err;
+
+    err = lights_read_direction(buf, len, &state.speed);
+    if (err < 0)
+        return err;
+
+    err = lights_attribute_write(filp, &state);
+    if (err)
+        return err;
+
+    return len;
+}
+
+/**
+ * lights_color_attribute_read() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Target buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin reading
+ *
+ * @return: Number of bytes or a negative error code
+ */
+static ssize_t lights_raw_attribute_read (
+    struct file *filp,
+    char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_CUSTOM
+    };
+    struct lights_buffer *buffer = &state.raw;
+    ssize_t err;
 
     buffer->offset = *off;
     buffer->length = len;
     buffer->data = kmalloc(len, GFP_KERNEL);
     if (!buffer->data)
         return -ENOMEM;
+
+    err = lights_attribute_read(filp, &state);
+    if (err)
+        goto error;
 
     // TODO - Keep reading from callback until length is 0 or > len
-    err = attr->read(attr->private_data, &io);
-    if (!err) {
-        copy_to_user(buf, buffer->data, buffer->length);
-        *off = buffer->offset;
-    }
+    copy_to_user(buf, buffer->data, buffer->length);
+    *off = buffer->offset;
 
+error:
     kfree(buffer->data);
 
     return err ? err : buffer->length;
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_color_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Source buffer
@@ -1137,45 +1381,42 @@ static ssize_t lights_raw_read (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_raw_write (
+static ssize_t lights_raw_attribute_write (
     struct file *filp,
     const char __user *buf,
     size_t len,
     loff_t *off
 ){
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
+    struct lights_state state = {
         .type = LIGHTS_TYPE_CUSTOM
     };
-    struct lights_buffer *buffer = &io.data.raw;
+    struct lights_buffer *buffer = &state.raw;
     ssize_t err;
-
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
-        return -ENODEV;
 
     buffer->offset = *off;
     buffer->length = len;
     buffer->data = kmalloc(len, GFP_KERNEL);
-    if (!buffer->data)
-        return -ENOMEM;
+    if (!buffer->data) {
+        err = -ENOMEM;
+        goto exit;
+    }
 
     err = copy_from_user(buffer->data, buf, len);
     if (err) {
         err = -EIO;
-        goto error_free;
+        goto exit;
     }
 
-    err = attr->write(attr->private_data, &io);
+    err = lights_attribute_write(filp, &state);
 
-error_free:
+exit:
     kfree(buffer->data);
 
     return err ? err : buffer->length;
 }
 
 /**
- * lights_color_read() - File IO handler
+ * lights_color_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Source buffer
@@ -1184,51 +1425,195 @@ error_free:
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_leds_write (
+static ssize_t lights_leds_attribute_write (
     struct file *filp,
     const char __user *buf,
     size_t len,
     loff_t *off
 ){
-    struct lights_interface *intf;
-    const struct lights_io_attribute *attr;
-    struct lights_io io = {
+    const struct lights_file *file;
+    struct lights_state state = {
         .type = LIGHTS_TYPE_LEDS
     };
-    struct lights_buffer *buffer = &io.data.raw;
+    struct lights_buffer *buffer = &state.raw;
+    struct lights_color *color;
+    uint8_t kern_buf[3];
     uint16_t led_count;
     ssize_t err;
+    int i;
 
-    attr = find_attribute_for_file(filp);
-    if (!attr || !attr->write)
+    file = find_attribute_for_file(filp);
+    if (!file)
         return -ENODEV;
 
-    intf = file_from_attr(attr)->intf;
-    led_count = intf->ldev->led_count;
-
-    /* The buffer must account for every led */
-    if (!led_count || led_count * 3 != len)
-        return -EINVAL;
-
-    buffer->offset = *off;
-    buffer->length = len;
-    buffer->data = kmalloc(len, GFP_KERNEL);
-    if (!buffer->data)
-        return -ENOMEM;
-
-    err = copy_from_user(buffer->data, buf, len);
-    if (err) {
-        err = -EIO;
-        goto error_free;
+    if (!file->attr.write) {
+        err = -ENODEV;
+        goto exit;
     }
 
-    err = attr->write(attr->private_data, &io);
+    /* The buffer must account for every led */
+    led_count = file->intf->ldev->led_count;
+    if (!led_count || led_count * 3 != len) {
+        err = -EINVAL;
+        goto exit;
+    }
 
-error_free:
-    kfree(buffer->data);
+    if (!file->intf->led_buffer) {
+        file->intf->led_buffer = kcalloc(led_count, sizeof(struct lights_color), GFP_KERNEL);
+        if (!file->intf->led_buffer) {
+            err = -ENOMEM;
+            goto exit;
+        }
+    }
+
+    buffer->offset = *off;
+    buffer->length = led_count;
+    buffer->data   = file->intf->led_buffer;
+
+    color = file->intf->led_buffer;
+
+    for (i = 0; i < led_count; i++) {
+        err = copy_from_user(kern_buf, buf, 3);
+        if (err) {
+            err = -EIO;
+            goto exit;
+        }
+
+        lights_color_read(color, kern_buf);
+
+        color++;
+        buf += 3;
+    }
+
+    err = file->attr.write(file->attr.private_data, &state);
+
+exit:
+    kref_put(&file->intf->refs, lights_interface_put);
 
     return err ? err : buffer->length;
 }
+
+/**
+ * lights_color_attribute_read() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Source buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin writing
+ *
+ * @return: Number of bytes or a negative error code
+ */
+static ssize_t lights_sync_attribute_write (
+    struct file *filp,
+    const char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    struct lights_state state = {
+        .type = LIGHTS_TYPE_SYNC
+    };
+    ssize_t err;
+
+    err = lights_read_sync(buf, len, &state.sync);
+    if (err < 0)
+        return err;
+
+    err = lights_attribute_write(filp, &state);
+    if (err)
+        return err;
+
+    return len;
+}
+
+/**
+ * lights_update_attribute_write() - File IO handler
+ *
+ * @filp: Character device handle
+ * @buf:  Source buffer
+ * @len:  Length of @buf
+ * @off:  Offset to begin writing
+ *
+ * @return: Number of bytes or a negative error code
+ *
+ * This is a special function which allows another process to
+ * pass in a struct lights_state. This should enable a service
+ * to update multiple properties in a single call.
+ */
+static ssize_t lights_update_attribute_write (
+    struct file *filp,
+    const char __user *buf,
+    size_t len,
+    loff_t *off
+){
+    const struct lights_file *file;
+    enum lights_io_type allowed = (
+        LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION
+    );
+    struct lights_state state;
+    error_t err;
+
+    if (len != sizeof(state)) {
+        LIGHTS_ERR("Unexpected 'update' length: %ld", len);
+        return -EINVAL;
+    }
+
+    if (0 != copy_from_user(&state, buf, len)) {
+        LIGHTS_ERR("Failed to copy user buffer");
+        return -EIO;
+    }
+
+    if ((state.type & ~allowed) != 0) {
+        LIGHTS_ERR("state.type contains unsupported flags");
+        return -EINVAL;
+    }
+
+    /* Trying to sneak in a pointer??? */
+    memset(&state.raw, 0, sizeof(state.raw));
+
+    file = find_attribute_for_file(filp);
+    if (!file)
+        return -ENODEV;
+
+    /* Fix mode name */
+    if (state.type & LIGHTS_TYPE_MODE) {
+        if (!state.mode.name || state.mode.id > LIGHTS_MAX_MODENAME_LENGTH) {
+            LIGHTS_ERR("userland buffer error");
+            err = -EINVAL;
+            goto exit;
+        }
+
+        err = lights_find_mode(file->intf, &state.mode, state.mode.name, state.mode.id);
+        if (err)
+            goto exit;
+    }
+
+    if (state.type & LIGHTS_TYPE_SPEED) {
+        if (state.speed > 5) {
+            LIGHTS_ERR("Invalid speed value: 0x%02x", state.speed);
+            err = -EINVAL;
+            goto exit;
+        }
+    }
+
+    if (state.type & LIGHTS_TYPE_DIRECTION) {
+        if (state.direction > 1) {
+            LIGHTS_ERR("Invalid direction value: 0x%02x", state.direction);
+            err = -EINVAL;
+            goto exit;
+        }
+    }
+
+    if (file->attr.write)
+        err = file->attr.write(file->attr.private_data, &state);
+    else
+        err = -ENODEV;
+
+exit:
+    kref_put(&file->intf->refs, lights_interface_put);
+
+    return -ENODEV;
+}
+
 
 /**
  * lights_device_release() - Dummy function
@@ -1263,31 +1648,50 @@ static error_t file_operations_create (
      */
     switch (attr->type) {
         case LIGHTS_TYPE_MODE:
-            file->fops.read = lights_mode_read;
+            file->fops.read = lights_mode_attribute_read;
             if (attr->write)
-                file->fops.write = lights_mode_write;
+                file->fops.write = lights_mode_attribute_write;
             break;
         case LIGHTS_TYPE_COLOR:
-            file->fops.read = lights_color_read;
+            file->fops.read = lights_color_attribute_read;
             if (attr->write)
-                file->fops.write = lights_color_write;
+                file->fops.write = lights_color_attribute_write;
             break;
         case LIGHTS_TYPE_SPEED:
-            file->fops.read = lights_speed_read;
+            file->fops.read = lights_speed_attribute_read;
             if (attr->write)
-                file->fops.write = lights_speed_write;
+                file->fops.write = lights_speed_attribute_write;
+            break;
+        case LIGHTS_TYPE_DIRECTION:
+            file->fops.read = lights_direction_attribute_read;
+            if (attr->write)
+                file->fops.write = lights_direction_attribute_write;
             break;
         case LIGHTS_TYPE_CUSTOM:
-            file->fops.read = lights_raw_read;
+            file->fops.read = lights_raw_attribute_read;
             if (attr->write)
-                file->fops.write = lights_raw_write;
+                file->fops.write = lights_raw_attribute_write;
             break;
         case LIGHTS_TYPE_LEDS:
             if (!attr->write || attr->read) {
                 LIGHTS_ERR("LIGHTS_TYPE_LEDS is write only");
                 return -EINVAL;
             }
-            file->fops.write = lights_leds_write;
+            file->fops.write = lights_leds_attribute_write;
+            break;
+        case LIGHTS_TYPE_UPDATE:
+            if (!attr->write || attr->read) {
+                LIGHTS_ERR("LIGHTS_TYPE_UPDATE is write only");
+                return -EINVAL;
+            }
+            file->fops.write = lights_update_attribute_write;
+            break;
+        case LIGHTS_TYPE_SYNC:
+            if (!attr->write || attr->read) {
+                LIGHTS_ERR("LIGHTS_TYPE_SYNC is write only");
+                return -EINVAL;
+            }
+            file->fops.write = lights_sync_attribute_write;
             break;
         default:
             return -EINVAL;
@@ -1319,7 +1723,8 @@ static struct lights_file *lights_file_create (
     if (IS_NULL(attr, intf, attr->attr.name) || IS_TRUE(attr->attr.name[0] == 0))
         return ERR_PTR(-EINVAL);
 
-    minor = find_first_zero_bit(lights_minors, LIGHTS_MAX_MINORS);
+    // TODO - bitmap is not thread safe
+    minor = find_first_zero_bit(lights_global.minors, LIGHTS_MAX_MINORS);
     if (minor >= LIGHTS_MAX_MINORS)
         return ERR_PTR(-EBUSY);
 
@@ -1333,7 +1738,7 @@ static struct lights_file *lights_file_create (
 
     file->intf = intf;
     file->minor = minor;
-    ver = MKDEV(lights_major, file->minor);
+    ver = MKDEV(lights_global.major, file->minor);
 
     /* Create a character device with a unique major:minor */
     cdev_init(&file->cdev, &file->fops);
@@ -1350,7 +1755,7 @@ static struct lights_file *lights_file_create (
      * path within lights_devnode().
      */
     file->dev = device_create(
-        lights_class,
+        lights_global.class,
         &intf->kdev,
         ver,
         NULL,
@@ -1362,7 +1767,7 @@ static struct lights_file *lights_file_create (
         goto error_free_cdev;
     }
 
-    set_bit(minor, lights_minors);
+    set_bit(minor, lights_global.minors);
 
     LIGHTS_DBG("created device '/dev/lights/%s/%s'", intf->name, attr->attr.name);
 
@@ -1377,21 +1782,21 @@ error_free_file:
 }
 
 /**
- * lights_file_release() - Destroys a character device
+ * lights_file_destroy() - Destroys a character device
  *
  * @file: Wrapper to be destroyed
  */
-static void lights_file_release (
+static void lights_file_destroy (
     struct lights_file *file
 ){
     if (IS_NULL(file))
         return;
 
-    device_destroy(lights_class, MKDEV(lights_major, file->minor));
+    device_destroy(lights_global.class, MKDEV(lights_global.major, file->minor));
     cdev_del(&file->cdev);
 
     if (file->minor < LIGHTS_MAX_MINORS && file->minor >= 0)
-        clear_bit(file->minor, lights_minors);
+        clear_bit(file->minor, lights_global.minors);
 
     LIGHTS_DBG("removed device '/dev/lights/%s/%s'", file->intf->name, file->attr.attr.name);
     kfree(file);
@@ -1402,7 +1807,9 @@ static void lights_file_release (
  *
  * @dev: user handle to the interface
  *
- * @return: NULL or the found interface
+ * @return: NULL or a reference counted interface
+ *
+ * Only called when creating files and unregsitering device.
  */
 static struct lights_interface *lights_interface_find (
     struct lights_dev *dev
@@ -1412,83 +1819,43 @@ static struct lights_interface *lights_interface_find (
     if (IS_NULL(dev))
         return NULL;
 
-    list_for_each_entry(interface, &lights_interface_list, siblings) {
-        if (interface->ldev == dev)
+    spin_lock(&lights_global.interface.lock);
+
+    list_for_each_entry(interface, &lights_global.interface.list, siblings) {
+        if (interface->ldev == dev) {
+            kref_get(&interface->refs);
             goto found;
+        }
     }
 
     interface = NULL;
 
 found:
+    spin_unlock(&lights_global.interface.lock);
+
     return interface;
 }
 
 /**
- * lights_interface_create() - Interface creator
- *
- * @name: Name of the interface (and directory within /dev/lights/)
- *
- * @return: New interface or a negative error code
- */
-static struct lights_interface *lights_interface_create (
-    const char *name
-){
-    struct lights_interface *intf;
-
-    if (IS_NULL(name) || IS_TRUE(name[0] == 0))
-        return ERR_PTR(-EINVAL);
-
-    list_for_each_entry(intf, &lights_interface_list, siblings) {
-        if (strcmp(name, intf->name) == 0)
-            goto found;
-    }
-
-    intf = NULL;
-
-found:
-    if (intf) {
-        LIGHTS_ERR("interface already exists");
-        return ERR_PTR(-EEXIST);
-    }
-
-    intf = kzalloc(sizeof(*intf), GFP_KERNEL);
-    if (!intf) {
-        return ERR_PTR(-ENOMEM);
-    }
-
-    spin_lock_init(&intf->file_lock);
-    INIT_LIST_HEAD(&intf->file_list);
-    strncpy(intf->name, name, LIGHTS_MAX_FILENAME_LENGTH);
-
-    dev_set_name(&intf->kdev, intf->name);
-    intf->kdev.class = lights_class;
-    intf->kdev.release = lights_device_release;
-    intf->kdev.groups = lights_class_groups;
-
-    device_register(&intf->kdev);
-
-    LIGHTS_DBG("created interface '%s'", intf->name);
-
-    return intf;
-}
-
-/**
- * lights_interface_release() - Destroys an interface
+ * lights_interface_destroy() - Destroys an interface
  *
  * @intf: Interface to destroy
+ *
+ * The interface is expected to have been removed from any list
+ * and have no open references.
  */
-static void lights_interface_release (
+static void lights_interface_destroy (
     struct lights_interface *intf
 ){
-    struct lights_file *file, *file_dafe;
+    struct lights_file *file, *safe;
 
     if (IS_NULL(intf))
         return;
 
     if (!list_empty(&intf->file_list)) {
-        list_for_each_entry_safe(file, file_dafe, &intf->file_list, siblings) {
+        list_for_each_entry_safe(file, safe, &intf->file_list, siblings) {
             list_del(&file->siblings);
-            lights_file_release(file);
+            lights_file_destroy(file);
         }
     }
 
@@ -1499,39 +1866,46 @@ static void lights_interface_release (
 
     LIGHTS_DBG("removed interface '%s'", intf->name);
 
+    kfree(intf->led_buffer);
     kfree(intf);
 }
 
 /**
- * lights_device_register() - Registers a new lights device
+ * lights_interface_create() - Interface creator
  *
- * @dev:    A decriptor of the device and its files
- * @Return: A negative error number on failure
+ * @name: Name of the interface (and directory within /dev/lights/)
+ *
+ * @return: New interface or a negative error code
  */
-int lights_device_register (
+static struct lights_interface *lights_interface_create (
     struct lights_dev *lights
 ){
-    struct lights_file *file;
-    struct lights_interface *intf;
     const struct lights_io_attribute **attr;
-    int err = 0;
+    struct lights_interface *intf;
+    struct lights_file *file;
+    error_t err;
 
-    if (IS_NULL(lights))
-        return -EINVAL;
+    if (IS_NULL(lights, lights->name) || IS_TRUE(lights->name[0] == 0))
+        return ERR_PTR(-EINVAL);
 
-    intf = lights_interface_create(lights->name);
-    if (IS_ERR(intf)) {
-        LIGHTS_ERR("create_lights_interface() returned %ld!", PTR_ERR(intf));
-        return PTR_ERR(intf);
-    }
+    intf = kzalloc(sizeof(*intf), GFP_KERNEL);
+    if (!intf)
+        return ERR_PTR(-ENOMEM);
 
     intf->ldev = lights;
+    intf->id = atomic_fetch_inc(&lights_global.next_id);
 
-    if (lights->caps) {
-        err = lights_append_caps(lights->caps);
-        if (err)
-            goto error_free_intf;
-    }
+    spin_lock_init(&intf->file_lock);
+    INIT_LIST_HEAD(&intf->file_list);
+    kref_init(&intf->refs);
+    strncpy(intf->name, lights->name, LIGHTS_MAX_FILENAME_LENGTH);
+
+    dev_set_name(&intf->kdev, intf->name);
+    intf->kdev.class = lights_global.class;
+    intf->kdev.release = lights_device_release;
+    intf->kdev.groups = lights_class_groups;
+
+    device_register(&intf->kdev);
 
     if (lights->attrs) {
         for (attr = lights->attrs; *attr; attr++) {
@@ -1540,25 +1914,68 @@ int lights_device_register (
             if (IS_ERR(file)) {
                 LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
                 err = PTR_ERR(file);
-                goto error_free_files;
+                goto error;
             }
 
             list_add_tail(&file->siblings, &intf->file_list);
         }
     }
 
-    mutex_lock(&lights_interface_lock);
-    list_add_tail(&intf->siblings, &lights_interface_list);
-    mutex_unlock(&lights_interface_lock);
+    LIGHTS_DBG("created interface '%s' with id '%d'", intf->name, intf->id);
+
+    return intf;
+
+error:
+    lights_interface_destroy(intf);
+
+    return ERR_PTR(err);
+}
+
+/**
+ * lights_device_register() - Registers a new lights device
+ *
+ * @dev:    A decriptor of the device and its files
+ * @Return: A negative error number on failure
+ */
+error_t lights_device_register (
+    struct lights_dev *lights
+){
+    struct lights_interface *intf, *iter;
+    error_t err = 0;
+
+    if (IS_NULL(lights))
+        return -EINVAL;
+
+    intf = lights_interface_create(lights);
+    if (IS_ERR(intf)) {
+        LIGHTS_ERR("create_lights_interface() returned %ld!", PTR_ERR(intf));
+        return PTR_ERR(intf);
+    }
+
+    if (lights->caps) {
+        err = lights_append_caps(lights->caps);
+        if (err)
+            goto error;
+    }
+
+    spin_lock(&lights_global.interface.lock);
+
+    list_for_each_entry(iter, &lights_global.interface.list, siblings) {
+        if (strcmp(iter->name, intf->name) == 0) {
+            spin_unlock(&lights_global.interface.lock);
+            err = -EEXIST;
+            goto error;
+        }
+    }
+
+    list_add_tail(&intf->siblings, &lights_global.interface.list);
+
+    spin_unlock(&lights_global.interface.lock);
 
     return 0;
 
-error_free_files:
-    list_for_each_entry(file, &intf->file_list, siblings) {
-        lights_file_release(file);
-    }
-error_free_intf:
-    kfree(intf);
+error:
+    lights_interface_destroy(intf);
 
     return err;
 }
@@ -1583,11 +2000,14 @@ void lights_device_unregister (
         return;
     }
 
-    mutex_lock(&lights_interface_lock);
+    spin_lock(&lights_global.interface.lock);
     list_del(&intf->siblings);
-    mutex_unlock(&lights_interface_lock);
+    /* Remove the ref held by the list */
+    kref_put(&intf->refs, lights_interface_put);
+    spin_unlock(&lights_global.interface.lock);
 
-    lights_interface_release(intf);
+    /* Remove the ref created by lights_interface_find() */
+    kref_put(&intf->refs, lights_interface_put);
 }
 EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
 
@@ -1604,10 +2024,11 @@ EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
  */
 error_t lights_create_file (
     struct lights_dev *dev,
-    struct lights_io_attribute *attr
+    const struct lights_io_attribute *attr
 ){
     struct lights_interface *intf;
     struct lights_file *file;
+    error_t err = 0;
 
     if (IS_NULL(dev, attr))
         return -EINVAL;
@@ -1621,19 +2042,84 @@ error_t lights_create_file (
     file = lights_file_create(intf, attr);
     if (IS_ERR(file)) {
         LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
-        return PTR_ERR(file);
+        err = PTR_ERR(file);
+        goto exit;
     }
 
+    spin_lock(&intf->file_lock);
     list_add_tail(&file->siblings, &intf->file_list);
+    spin_unlock(&intf->file_lock);
 
-    return 0;
+exit:
+    /* Remove the ref created by lights_interface_find() */
+    kref_put(&intf->refs, lights_interface_put);
+
+    return err;
 }
 EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
 
+/**
+ * lights_create_file() - Adds a file to the devices directory
+ *
+ * @dev:   A previously registered device
+ * @attrs: Array of descriptions of the files to create
+ * @count: Number of elements in @attrs
+ *
+ * @Return: A negative error number on failure
+ */
+error_t lights_create_files (
+    struct lights_dev *dev,
+    const struct lights_io_attribute *attrs,
+    size_t count
+){
+    LIST_HEAD(file_list);
+    struct lights_interface *intf;
+    struct lights_file *file, *safe;
+    error_t err;
+    int i;
 
-static struct lights_dev lights_global_dev = {
-    .name = "all",
-};
+    if (IS_NULL(dev, attrs))
+        return -EINVAL;
+
+    intf = lights_interface_find(dev);
+    if (!intf) {
+        LIGHTS_ERR("lights device not found (was it registered?)");
+        return -ENODEV;
+    }
+
+    for (i = 0; i < count; i++) {
+        file = lights_file_create(intf, &attrs[i]);
+        if (IS_ERR(file)) {
+            LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
+            err = CLEAR_ERR(file);
+            goto error;
+        }
+
+        list_add_tail(&file->siblings, &file_list);
+    }
+
+    spin_lock(&intf->file_lock);
+    list_splice(&file_list, &intf->file_list);
+    spin_unlock(&intf->file_lock);
+
+    /* Remove the ref created by lights_interface_find() */
+    kref_put(&intf->refs, lights_interface_put);
+
+    return 0;
+
+error:
+    list_for_each_entry_safe(file, safe, &file_list, siblings) {
+        list_del(&file->siblings);
+        lights_file_destroy(file);
+    }
+
+    /* Remove the ref created by lights_interface_find() */
+    kref_put(&intf->refs, lights_interface_put);
+
+    return err;
+}
+EXPORT_SYMBOL_NS_GPL(lights_create_files, LIGHTS);
+
 
 /**
  * init_default_attributes() - Creates the character devices in /dev/lights/all/
@@ -1644,36 +2130,19 @@ static error_t init_default_attributes (
     void
 ){
     error_t err;
+    struct lights_io_attribute attrs[] = {
+        LIGHTS_MODE_ATTR(NULL, io_read, io_write),
+        LIGHTS_COLOR_ATTR(NULL, io_read, io_write),
+        LIGHTS_SPEED_ATTR(NULL, io_read, io_write),
+        LIGHTS_DIRECTION_ATTR(NULL, io_read, io_write),
+        LIGHTS_SYNC_ATTR(NULL, io_write),
+    };
 
-    err = lights_device_register(&lights_global_dev);
+    err = lights_device_register(&lights_global.all);
     if (err)
         return err;
 
-    err = lights_create_file(&lights_global_dev, &LIGHTS_COLOR_ATTR(
-        NULL,
-        color_read,
-        color_write
-    ));
-    if (err)
-        return err;
-
-    err = lights_create_file(&lights_global_dev, &LIGHTS_MODE_ATTR(
-        NULL,
-        mode_read,
-        mode_write
-    ));
-    if (err)
-        return err;
-
-    err = lights_create_file(&lights_global_dev, &LIGHTS_SPEED_ATTR(
-        NULL,
-        speed_read,
-        speed_write
-    ));
-    if (err)
-        return err;
-
-    return err;
+    return lights_create_files(&lights_global.all, attrs, ARRAY_SIZE(attrs));
 }
 
 /**
@@ -1684,25 +2153,25 @@ static void lights_destroy (
 ){
     struct lights_interface *intf;
     struct lights_interface *intf_safe;
-    dev_t dev_id = MKDEV(lights_major, 0);
+    dev_t dev_id = MKDEV(lights_global.major, 0);
 
-    lights_device_unregister(&lights_global_dev);
+    lights_device_unregister(&lights_global.all);
 
-    if (!list_empty(&lights_interface_list)) {
+    if (!list_empty(&lights_global.interface.list)) {
         LIGHTS_WARN("Not all interfaces have been unregistered.");
-        mutex_lock(&lights_interface_lock);
+        spin_lock(&lights_global.interface.lock);
 
-        list_for_each_entry_safe(intf, intf_safe, &lights_interface_list, siblings) {
+        list_for_each_entry_safe(intf, intf_safe, &lights_global.interface.list, siblings) {
             list_del(&intf->siblings);
-            lights_interface_release(intf);
+            kref_put(&intf->refs, lights_interface_put);
         }
 
-        mutex_unlock(&lights_interface_lock);
+        spin_unlock(&lights_global.interface.lock);
     }
 
     // lights_unregister_all_devices();
     unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
-    class_destroy(lights_class);
+    class_destroy(lights_global.class);
 }
 
 /**
@@ -1751,35 +2220,47 @@ static int __init lights_init (void)
     int err;
     dev_t dev_id;
 
-    err = lights_read_mode(default_mode, strlen(default_mode), lights_available_modes, &lights_global_state.mode);
-    if (err < 0)
+    err = lights_read_mode(default_mode, strlen(default_mode), lights_available_modes, &lights_global.state.mode);
+    if (err < 0) {
+        LIGHTS_ERR("Invalid mode");
         return err;
+    }
 
-    err = lights_read_color(default_color, strlen(default_color), &lights_global_state.color);
-    if (err < 0)
+    err = lights_read_color(default_color, strlen(default_color), &lights_global.state.color);
+    if (err < 0) {
+        LIGHTS_ERR("Invalid color");
         return err;
+    }
 
-    err = lights_read_speed(default_speed, strlen(default_speed), &lights_global_state.speed);
-    if (err < 0)
+    err = lights_read_speed(default_speed, strlen(default_speed), &lights_global.state.speed);
+    if (err < 0) {
+        LIGHTS_ERR("Invalid speed");
         return err;
+    }
+
+    err = lights_read_direction(default_direction, strlen(default_direction), &lights_global.state.direction);
+    if (err < 0) {
+        LIGHTS_ERR("Invalid direction");
+        return err;
+    }
 
     err = alloc_chrdev_region(&dev_id, LIGHTS_FIRST_MINOR, LIGHTS_MAX_DEVICES, "lights");
     if (err < 0) {
-        LIGHTS_WARN("can't get major number");
+        LIGHTS_ERR("can't get major number");
         return err;
     }
 
-    lights_major = MAJOR(dev_id);
-    lights_class = class_create(THIS_MODULE, "lights");
+    lights_global.major = MAJOR(dev_id);
+    lights_global.class = class_create(THIS_MODULE, "lights");
 
-    if (IS_ERR(lights_class)) {
-        err = PTR_ERR(lights_class);
+    if (IS_ERR(lights_global.class)) {
+        err = PTR_ERR(lights_global.class);
         unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
-        LIGHTS_WARN("failed to create lights_class");
+        LIGHTS_ERR("failed to create lights_class");
         return err;
     }
 
-    lights_class->devnode = lights_devnode;
+    lights_global.class->devnode = lights_devnode;
 
     err = init_default_attributes();
     if (err)
@@ -1788,15 +2269,17 @@ static int __init lights_init (void)
     return err;
 }
 
-module_param(default_color, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_mode,  charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_speed, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+module_param(default_color,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+module_param(default_mode,      charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+module_param(default_speed,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+module_param(default_direction, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 module_init(lights_init);
 module_exit(lights_exit);
 
-MODULE_PARM_DESC(default_color, "A hexadecimal color code, eg. #00FF00");
-MODULE_PARM_DESC(default_mode, "The name of a color mode");
-MODULE_PARM_DESC(default_speed, "The speed of the color cycle, 1-5");
-MODULE_AUTHOR("Owen Parry <waldermort@gmail.com>");
+MODULE_PARM_DESC(default_color,     "A hexadecimal color code, eg. #00FF00");
+MODULE_PARM_DESC(default_mode,      "The name of a color mode");
+MODULE_PARM_DESC(default_speed,     "The speed of the color cycle, 1-5");
+MODULE_PARM_DESC(default_direction, "The direction of rotation, 0 or 1");
+MODULE_AUTHOR("Owen Parry <twifty@zoho.com>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("RGB Lighting Class Interface");

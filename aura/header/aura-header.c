@@ -593,7 +593,8 @@ static int transfer_add_effect (
  *
  * @return: Number of packets created
  */
-static int transfer_add_direct (
+__used
+static int _transfer_add_direct (
     struct lights_adapter_msg *msg,
     struct aura_header_zone *zone,
     uint8_t command,
@@ -641,6 +642,56 @@ static int transfer_add_direct (
     }
 
     return max_loops;
+}
+static int transfer_add_direct (
+   struct lights_adapter_msg *msg,
+   struct aura_header_zone *zone,
+   uint8_t command,
+   struct lights_color *colors,
+   uint8_t color_count
+){
+   struct packet_data *packet;
+   struct data_direct *direct;
+   size_t bytes_to_transfer = 3 * color_count;
+   size_t max_loops = (bytes_to_transfer / PACKET_DIRECT_SIZE) + 1;
+   size_t max_items_per_packet;
+   uint16_t src_offset = 0;
+   int curr_loop, i;
+
+   if (!color_count)
+       return -EINVAL;
+
+   max_items_per_packet = PACKET_DIRECT_SIZE / 3;
+
+   for (curr_loop = 0; curr_loop < max_loops; curr_loop++) {
+       msg[curr_loop] = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+       packet = packet_init(&msg[curr_loop], command);
+
+       direct = &packet->data.direct;
+       direct->flags = zone->id;
+
+       /* NOTE - LightsService has this as only greater than */
+       if (src_offset >= 0x100)
+           direct->flags = (src_offset >> 8) & 0xf;
+
+       if (curr_loop + 1 == max_loops)
+           direct->flags |= 0x80;
+
+       direct->offset = (uint8_t)src_offset;
+       direct->count  = min_t(uint8_t, color_count, max_items_per_packet);
+
+       for (i = 0; i < direct->count; i++) {
+           if (colors) {
+               lights_color_write(colors, &direct->value[i * 3]);
+           } else {
+               memset(&direct->value[i * 3], 0, 3);
+           }
+           // direct->value[i] = data ? ((uint8_t*)data)[src_offset] : 0;
+           src_offset += 3;
+       }
+   }
+
+   return max_loops;
 }
 
 /**
@@ -767,7 +818,7 @@ static error_t zone_set_mode (
         case AURA_MODE_OFF:
         case AURA_MODE_DIRECT:
             count += transfer_add_effect(&zone->msg_buffer[count], zone, &effect_direct);
-            count += transfer_add_direct(&zone->msg_buffer[count], zone, PACKET_CMD_DIRECT, NULL, 3, zone->led_count);
+            count += transfer_add_direct(&zone->msg_buffer[count], zone, PACKET_CMD_DIRECT, NULL, zone->led_count);
 
             /*
              * The command field is not used by the usb driver, so we can use
@@ -924,7 +975,7 @@ static error_t zone_set_direct (
     error_t err = 0;
     int count;
 
-    if (buffer->length != zone->led_count * 3)
+    if (buffer->length != zone->led_count)
         return -EINVAL;
 
     spin_lock(&zone->buffer_lock);
@@ -934,7 +985,6 @@ static error_t zone_set_direct (
         zone,
         PACKET_CMD_DIRECT,
         buffer->data,
-        3,
         zone->led_count
     );
 
@@ -954,22 +1004,22 @@ static error_t zone_set_direct (
 /**
  * aura_header_color_read() - Reads a zones color
  *
- * @data: Zone to read
- * @io:   Buffer to write value
+ * @data:  Zone to read
+ * @state: Buffer to write value
  *
  * @return: Error code
  */
 static error_t aura_header_color_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_COLOR))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
         return -EINVAL;
 
     spin_lock(&zone->effect_lock);
-    io->data.color = zone->effect.color;
+    state->color = zone->effect.color;
     spin_unlock(&zone->effect_lock);
 
     return 0;
@@ -978,70 +1028,42 @@ static error_t aura_header_color_read (
 /**
  * aura_header_color_write() - Writes a zones color
  *
- * @data: Zone to write
- * @io:   Buffer containing new value
+ * @data:  Zone to write
+ * @state: Buffer containing new value
  *
  * @return: Error code
  */
 static error_t aura_header_color_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_COLOR))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
         return -EINVAL;
 
-    return zone_set_color(zone, &io->data.color);
-}
-
-/**
- * aura_header_color_update() - Writes all zones color
- *
- * @state: Buffer containing color
- *
- * @return: Error code
- */
-static error_t aura_header_color_update (
-    const struct lights_state *state
-){
-    struct aura_header_controller *ctrl = aura_header_controller_get();
-    int i;
-    error_t err = 0;
-
-    if (ctrl) {
-        for (i = 0; i < ctrl->zone_count; i++) {
-            if ((err = zone_set_color(&ctrl->zones[i], &state->color)))
-                break;
-        }
-
-        aura_header_controller_put(ctrl);
-    } else {
-        err = -ENODEV;
-    }
-
-    return err;
+    return zone_set_color(zone, &state->color);
 }
 
 /**
  * aura_header_mode_read() - Reads a zones mode
  *
- * @data: Zone to read
- * @io:   Buffer to write value
+ * @data:  Zone to read
+ * @state: Buffer to write value
  *
  * @return: Error code
  */
 static error_t aura_header_mode_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_MODE))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
         return -EINVAL;
 
     spin_lock(&zone->effect_lock);
-    io->data.mode = zone->effect.mode;
+    state->mode = zone->effect.mode;
     spin_unlock(&zone->effect_lock);
 
     return 0;
@@ -1050,70 +1072,42 @@ static error_t aura_header_mode_read (
 /**
  * aura_header_mode_write() - Writes a zones mode
  *
- * @data: Zone to write
- * @io:   Buffer containing new value
+ * @data:  Zone to write
+ * @state: Buffer containing new value
  *
  * @return: Error code
  */
 static error_t aura_header_mode_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_MODE))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
         return -EINVAL;
 
-    return zone_set_mode(zone, &io->data.mode);
-}
-
-/**
- * aura_header_mode_update() - Writes a mode to all zones
- *
- * @state: Buffer containing mode
- *
- * @return: Error code
- */
-static error_t aura_header_mode_update (
-    const struct lights_state *state
-){
-    struct aura_header_controller *ctrl = aura_header_controller_get();
-    int i;
-    error_t err = 0;
-
-    if (ctrl) {
-        for (i = 0; i < ctrl->zone_count; i++) {
-            if ((err = zone_set_mode(&ctrl->zones[i], &state->mode)))
-                break;
-        }
-
-        aura_header_controller_put(ctrl);
-    } else {
-        err = -ENODEV;
-    }
-
-    return err;
+    return zone_set_mode(zone, &state->mode);
 }
 
 /**
  * aura_header_speed_read() - Reads a zones speed
  *
- * @data: Zone to read
- * @io:   Buffer to write value
+ * @data:  Zone to read
+ * @state: Buffer to write value
  *
  * @return: Error code
  */
 static error_t aura_header_speed_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_SPEED))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_SPEED))
         return -EINVAL;
 
     spin_lock(&zone->effect_lock);
-    io->data.speed = zone->effect.speed;
+    state->speed = zone->effect.speed;
     spin_unlock(&zone->effect_lock);
 
     return 0;
@@ -1122,78 +1116,43 @@ static error_t aura_header_speed_read (
 /**
  * aura_header_speed_write() - Writes a zones speed
  *
- * @data: Zone to write
- * @io:   Buffer containing new value
+ * @data:  Zone to write
+ * @state: Buffer containing new value
  *
  * @return: Error code
  */
 static error_t aura_header_speed_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_SPEED))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_SPEED))
         return -EINVAL;
 
-    return zone_set_speed(zone, io->data.speed);
-}
-
-/**
- * aura_header_speed_update() - Writes a speed to all zones
- *
- * @state: Buffer containing color
- *
- * @return: Error code
- */
- __used
-static error_t aura_header_speed_update (
-    const struct lights_state *state
-){
-    struct aura_header_controller *ctrl = aura_header_controller_get();
-    int i;
-    error_t err = 0;
-
-    if (ctrl) {
-        for (i = 0; i < ctrl->zone_count; i++) {
-            if ((err = zone_set_speed(&ctrl->zones[i], state->speed)))
-                break;
-        }
-
-        aura_header_controller_put(ctrl);
-    } else {
-        err = -ENODEV;
-    }
-
-    return err;
+    return zone_set_speed(zone, state->speed);
 }
 
 /**
  * aura_header_direction_read() - Reads a zones direction
  *
- * @data: Zone to read
- * @io:   Buffer to write value
+ * @data:  Zone to read
+ * @state: Buffer to write value
  *
  * @return: Error code
  */
 static error_t aura_header_direction_read (
     void *data,
-    struct lights_io *io
+    struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_CUSTOM))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_DIRECTION))
         return -EINVAL;
 
-    if (io->data.raw.offset == 1) {
-        io->data.raw.length = 0;
-    } else {
-        spin_lock(&zone->effect_lock);
-        io->data.raw.data[0] = zone->effect.direction + '0';
-        io->data.raw.length = 1;
-        io->data.raw.offset = 1;
-        spin_unlock(&zone->effect_lock);
-    }
+    spin_lock(&zone->effect_lock);
+    state->direction = zone->effect.direction;
+    spin_unlock(&zone->effect_lock);
 
     return 0;
 }
@@ -1201,49 +1160,41 @@ static error_t aura_header_direction_read (
 /**
  * aura_header_direction_write() - Writes a zones direction
  *
- * @data: Zone to write
- * @io:   Buffer containing new value
+ * @data:  Zone to write
+ * @state: Buffer containing new value
  *
  * @return: Error code
  */
 static error_t aura_header_direction_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_CUSTOM))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_DIRECTION))
         return -EINVAL;
 
-    if (io->data.raw.length) {
-        switch (io->data.raw.data[0]) {
-            case '0':
-            case '1':
-                return zone_set_direction(zone, io->data.raw.data[0] - '0');
-        }
-    }
-
-    return -EINVAL;
+    return zone_set_direction(zone, state->direction);
 }
 
 /**
  * aura_header_leds_write() - Writes raw RGB values to a zone
  *
- * @data: Zone to update
- * @io:   Buffer containing RGB values
+ * @data:  Zone to update
+ * @state: Buffer containing RGB values
  *
  * @return: Error code
  */
 static error_t aura_header_leds_write (
     void *data,
-    const struct lights_io *io
+    const struct lights_state *state
 ){
     struct aura_header_zone *zone = data;
 
-    if (IS_NULL(data, io) || IS_FALSE(io->type == LIGHTS_TYPE_LEDS))
+    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_LEDS))
         return -EINVAL;
 
-    return zone_set_direct(zone, &io->data.raw);
+    return zone_set_direct(zone, &state->raw);
 }
 
 
@@ -1274,6 +1225,32 @@ static error_t aura_header_zone_init (
     uint8_t index
 ){
     struct aura_header_zone *zone = &ctrl->zones[index];
+    const struct lights_io_attribute attrs[] = {
+        LIGHTS_MODE_ATTR(
+            zone,
+            aura_header_mode_read,
+            aura_header_mode_write
+        ),
+        LIGHTS_COLOR_ATTR(
+            zone,
+            aura_header_color_read,
+            aura_header_color_write
+        ),
+        LIGHTS_SPEED_ATTR(
+            zone,
+            aura_header_speed_read,
+            aura_header_speed_write
+        ),
+        LIGHTS_DIRECTION_ATTR(
+            zone,
+            aura_header_direction_read,
+            aura_header_direction_write
+        ),
+        LIGHTS_LEDS_ATTR(
+            zone,
+            aura_header_leds_write
+        )
+    };
     error_t err;
 
     if (index >= MAX_HEADER_COUNT)
@@ -1299,8 +1276,6 @@ static error_t aura_header_zone_init (
     AURA_DBG("Creating sysfs for '%s'", zone->name);
 
     zone->lights.led_count = zone->led_count;
-    zone->lights.update_mode = aura_header_mode_update;
-    zone->lights.update_color = aura_header_color_update;
     zone->lights.name = zone->name;
     zone->lights.caps = aura_header_modes;
 
@@ -1309,46 +1284,7 @@ static error_t aura_header_zone_init (
         return err;
 
     /* Create the attributes */
-    err = lights_create_file(&zone->lights, &LIGHTS_MODE_ATTR(
-        zone,
-        aura_header_mode_read,
-        aura_header_mode_write
-    ));
-    if (err)
-        goto error_out;
-
-    err = lights_create_file(&zone->lights, &LIGHTS_COLOR_ATTR(
-        zone,
-        aura_header_color_read,
-        aura_header_color_write
-    ));
-    if (err)
-        goto error_out;
-
-    err = lights_create_file(&zone->lights, &LIGHTS_SPEED_ATTR(
-        zone,
-        aura_header_speed_read,
-        aura_header_speed_write
-    ));
-    if (err)
-        goto error_out;
-
-    err = lights_create_file(&zone->lights, &LIGHTS_CUSTOM_ATTR(
-        "direction",
-        zone,
-        aura_header_direction_read,
-        aura_header_direction_write
-    ));
-    if (err)
-        goto error_out;
-
-    err = lights_create_file(&zone->lights, &LIGHTS_LEDS_ATTR(
-        zone,
-        aura_header_leds_write
-    ));
-
-error_out:
-    return err;
+    return lights_create_files(&zone->lights, attrs, ARRAY_SIZE(attrs));
 }
 
 /**

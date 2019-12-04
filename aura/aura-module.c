@@ -59,18 +59,18 @@ static void aura_module_probe_all (
     void
 ){
     aura_motherboard_probe(&global_state);
-    aura_memory_probe(&global_state);
-    aura_gpu_probe(&global_state);
-    aura_header_probe(&global_state);
+    // aura_memory_probe(&global_state);
+    // aura_gpu_probe(&global_state);
+    // aura_header_probe(&global_state);
 }
 
 static void aura_module_release_all (
     void
 ){
     aura_motherboard_release();
-    aura_memory_release();
-    aura_gpu_release();
-    aura_header_release();
+    // aura_memory_release();
+    // aura_gpu_release();
+    // aura_header_release();
 }
 
 static int __init aura_module_init (

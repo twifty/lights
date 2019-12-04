@@ -9,10 +9,13 @@
 #define LIGHTS_MAX_FILENAME_LENGTH  64
 #define LIGHTS_MAX_MODENAME_LENGTH  32
 
-#define LIGHTS_IO_MODE  "mode"
-#define LIGHTS_IO_COLOR "color"
-#define LIGHTS_IO_SPEED "speed"
-#define LIGHTS_IO_LEDS  "leds"
+#define LIGHTS_IO_MODE      "mode"
+#define LIGHTS_IO_COLOR     "color"
+#define LIGHTS_IO_SPEED     "speed"
+#define LIGHTS_IO_DIRECTION "direction"
+#define LIGHTS_IO_LEDS      "leds"
+#define LIGHTS_IO_SYNC      "sync"
+#define LIGHTS_IO_UPDATE    "update"
 
 /*
     These ids represent common modes supported by a majority
@@ -96,6 +99,24 @@ struct lights_color {
     (p1)->value == (p2)->value \
 )
 
+static inline void lights_color_read (
+    struct lights_color *color,
+    const uint8_t buf[3]
+){
+    color->r = buf[0];
+    color->g = buf[1];
+    color->b = buf[2];
+}
+
+static inline void lights_color_write (
+    const struct lights_color *color,
+    uint8_t buf[3]
+){
+    buf[0] = color->r;
+    buf[1] = color->g;
+    buf[2] = color->b;
+}
+
 /**
  * struct lights_mode
  *
@@ -116,22 +137,8 @@ struct lights_mode {
 
 struct lights_buffer {
     ssize_t         length;
-    uint8_t         *data;
+    void            *data;
     loff_t          offset;
-};
-
-/**
- * struct lights_state
- *
- * @color: The global color value
- * @mode:  The global mode value
- * @speed: The global speed value. This value ranges from 1 to 5 each
- *         representing how a second is to be divided
- */
-struct lights_state {
-    struct lights_color     color;
-    struct lights_mode      mode;
-    uint8_t                 speed;
 };
 
 /**
@@ -144,35 +151,64 @@ struct lights_state {
  * @LIGHTS_TYPE_LEDS:   @lights_buffer is used
  */
 enum lights_io_type {
-    LIGHTS_TYPE_CUSTOM,
-    LIGHTS_TYPE_MODE,
-    LIGHTS_TYPE_COLOR,
-    LIGHTS_TYPE_SPEED,
-    LIGHTS_TYPE_LEDS,
+    LIGHTS_TYPE_MODE        = 0x01,
+    LIGHTS_TYPE_COLOR       = 0x02,
+    LIGHTS_TYPE_SPEED       = 0x04,
+    LIGHTS_TYPE_DIRECTION   = 0x08,
+    LIGHTS_TYPE_LEDS        = 0x10,
+    LIGHTS_TYPE_CUSTOM      = 0x20,
+    LIGHTS_TYPE_SYNC        = 0x40,
+    LIGHTS_TYPE_UPDATE      = 0x80,
+};
+
+/**
+ * struct lights_state
+ *
+ * @color:     The global color value
+ * @mode:      The global mode value
+ * @speed:     The global speed value. This value ranges from 0 to 5 each
+ *             representing how a second is to be divided
+ * @direction: 0 or 1 to indicate clockwise or anti-clockwise.
+ */
+struct lights_state {
+    struct lights_color     color;
+    struct lights_mode      mode;
+    struct lights_buffer    raw;
+    uint8_t                 speed;
+    uint8_t                 direction;
+    uint8_t                 sync;
+    enum lights_io_type     type;
 };
 
 /**
  * struct lights_io - Used during read/write callbacks
  *
- * @type:       Indicates which of the data members is in use
- * @data.color: A color value being read from or written to the file
- * @data.mode:  A mode value being read from or written to the file
- * @data.speed: A speed value being read from or written to the file
- * @data.raw:   The raw data, in kernel space
+ * @type:           Indicates which of the data members is in use
+ * @data.color:     A color value being read from or written to the file
+ * @data.mode:      A mode value being read from or written to the file
+ * @data.speed:     A speed value being read from or written to the file
+ * @data.direction: 0 or 1 to indicate direction of mode
+ * @data.raw:       The raw data, in kernel space
  *
  * NOTE - LIGHTS_TYPE_LEDS uses the raw buffer. The size of the buffer
  * is dependant on the led_count member of lights_dev.
  */
-struct lights_io {
-    enum lights_io_type         type;
+// struct lights_io {
+//     enum lights_io_type         type;
+//
+//     union {
+//         struct lights_color     color;
+//         struct lights_mode      mode;
+//         struct lights_buffer    raw;
+//         uint8_t                 speed;
+//         uint8_t                 direction;
+//         uint8_t                 sync;
+//     } data;
+// };
 
-    union {
-        struct lights_color     color;
-        struct lights_mode      mode;
-        uint8_t                 speed;
-        struct lights_buffer    raw;
-    } data;
-};
+// typedef error_t (*lights_update_t)(const struct lights_state *);
+typedef error_t (*lights_read_t)(void *, struct lights_state *);
+typedef error_t (*lights_write_t)(void *, const struct lights_state *);
 
 /**
  * struct lights_io_attribute - Specifies how a file is to be created
@@ -193,8 +229,37 @@ struct lights_io_attribute {
     enum lights_io_type     type;
     void                    *private_data;
 
-    error_t (*read)(void *data, struct lights_io *io);
-    error_t (*write)(void *data, const struct lights_io *io);
+    lights_read_t           read;
+    lights_write_t          write;
+    // error_t (*read)(void *data, struct lights_io *io);
+    // error_t (*write)(void *data, const struct lights_io *io);
+};
+
+/**
+ * struct lights_dev - Describes the device files to be created
+ *
+ * @name:         max LIGHTS_MAX_FILENAME_LENGTH, of directory name within
+ *                the /dev/lights/ directory
+ * @led_count:    The number of leds supported by the device
+ * @caps:         A list of modes supported by the device
+ * @attrs:        A null terminated array of io attributes
+ * @update_color: A hook into the writing of /dev/lights/all/color
+ * @update_mode:  A hook into the writing of /dev/lights/all/mode
+ * @update_speed: A hook into the writing of /dev/lights/all/speed
+ *
+ * The modes listed here are available to userland in the 'caps' file. This
+ * file is created for each device when modes are given. Each mode is also
+ * added to a global list, available at /dev/lights/all/caps. The modes listed
+ * in this file are those which are defined by THIS module AND which are common
+ * to each extension.
+ */
+struct lights_dev {
+    const char                          *name;
+    uint16_t                            led_count;
+    const struct lights_mode            *caps;
+    const struct lights_io_attribute    **attrs;
+
+    // lights_update_t                     update;
 };
 
 #define LIGHTS_ATTR(_name, _mode, _type, _data, _read, _write)      \
@@ -239,38 +304,21 @@ struct lights_io_attribute {
     LIGHTS_ATTR_RW(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _read, _write) \
 )
 
+#define LIGHTS_DIRECTION_ATTR(_data, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_DIRECTION, LIGHTS_TYPE_DIRECTION, _data, _read, _write) \
+)
+
 #define LIGHTS_LEDS_ATTR(_data, _write) ( \
     LIGHTS_ATTR_WO(LIGHTS_IO_LEDS, LIGHTS_TYPE_LEDS, _data, _write) \
 )
 
-/**
- * struct lights_dev - Describes the device files to be created
- *
- * @name:         max LIGHTS_MAX_FILENAME_LENGTH, of directory name within
- *                the /dev/lights/ directory
- * @led_count:    The number of leds supported by the device
- * @caps:         A list of modes supported by the device
- * @attrs:        A null terminated array of io attributes
- * @update_color: A hook into the writing of /dev/lights/all/color
- * @update_mode:  A hook into the writing of /dev/lights/all/mode
- * @update_speed: A hook into the writing of /dev/lights/all/speed
- *
- * The modes listed here are available to userland in the 'caps' file. This
- * file is created for each device when modes are given. Each mode is also
- * added to a global list, available at /dev/lights/all/caps. The modes listed
- * in this file are those which are defined by THIS module AND which are common
- * to each extension.
- */
-struct lights_dev {
-    const char                          *name;
-    uint16_t                            led_count;
-    const struct lights_mode            *caps;
-    const struct lights_io_attribute    **attrs;
+#define LIGHTS_SYNC_ATTR(_data, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_SYNC, LIGHTS_TYPE_SYNC, _data, _write) \
+)
 
-    error_t (*update_color)(const struct lights_state *);
-    error_t (*update_mode)(const struct lights_state *);
-    error_t (*update_speed)(const struct lights_state *);
-};
+#define LIGHTS_UPDATE_ATTR(_data, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_UPDATE, LIGHTS_TYPE_UPDATE, _data, _write) \
+)
 
 /**
  * lights_device_register() - Registers a new lights device
@@ -308,7 +356,25 @@ void lights_device_unregister (
  */
 error_t lights_create_file (
     struct lights_dev *dev,
-    struct lights_io_attribute *attr
+    const struct lights_io_attribute *attr
+);
+
+/**
+ * lights_create_file() - Adds a file to the devices directory
+ *
+ * @dev:   A previously registered device
+ * @attrs: Array of descriptions of the files to create
+ * @count: Number of elements in @attrs
+ *
+ * @Return: A negative error number on failure
+ *
+ * The given attribute may exist on the stack. Internally it is copied
+ * so the user need not keep a reference to it.
+ */
+error_t lights_create_files (
+    struct lights_dev *dev,
+    const struct lights_io_attribute *attrs,
+    size_t count
 );
 
 /**
@@ -367,4 +433,4 @@ void lights_get_state (
     struct lights_state *state
 );
 
-#endif /* _UAPI_LIGHTS_H */
+#endif
