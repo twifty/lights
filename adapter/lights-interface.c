@@ -15,7 +15,7 @@
 
 #define LIGHTS_FIRST_MINOR          0
 #define LIGHTS_MAX_MINORS           512
-#define LIGHTS_MAX_DEVICES          64
+#define LIGHTS_MAX_DEVICES          512
 
 static struct {
     struct class        *class;
@@ -31,7 +31,8 @@ static struct {
     spinlock_t          state_lock;
     atomic_t            next_id;
     int                 major;
-    unsigned long       minors[BITS_TO_LONGS(LIGHTS_MAX_MINORS)];
+    spinlock_t          minor_lock;
+    unsigned long       minor_map[BITS_TO_LONGS(LIGHTS_MAX_MINORS)];
 } lights_global = {
     .interface = {
         .list = LIST_HEAD_INIT(lights_global.interface.list),
@@ -44,6 +45,7 @@ static struct {
         .count = 0,
     },
     .state_lock = __SPIN_LOCK_UNLOCKED(lights_global.state_lock),
+    .minor_lock = __SPIN_LOCK_UNLOCKED(lights_global.minor_lock),
     .next_id = ATOMIC_INIT(0),
     .all = { .name = "all" },
 };
@@ -88,11 +90,11 @@ struct lights_caps {
  * @fops:     File operations of the device
  */
 struct lights_file {
-    int                                 minor;
+    unsigned long                       minor;
     struct cdev                         cdev;
     struct device                       *dev;
     struct list_head                    siblings;
-    const struct lights_io_attribute    attr;
+    struct lights_io_attribute const    attr;
     struct lights_interface             *intf;
     struct file_operations              fops;
 };
@@ -148,7 +150,7 @@ static void lights_interface_put (
  * reference count is increased.
  */
 static error_t lights_add_caps (
-    const struct lights_mode *mode
+    struct lights_mode const *mode
 ){
     struct lights_caps *iter, *entry;
     error_t err = 0;
@@ -205,7 +207,7 @@ exit:
  * removed entirely.
  */
 static void lights_del_caps (
-    const struct lights_mode *mode
+    struct lights_mode const *mode
 ){
     struct lights_caps *iter, *safe;
 
@@ -237,10 +239,10 @@ exit:
  *
  * @return: Found mode or a negative error number
  */
-static const struct lights_mode *lights_find_caps (
+static struct lights_mode const *lights_find_caps (
     const char *name
 ){
-    const struct lights_mode *mode;
+    struct lights_mode const *mode;
     struct lights_caps *iter;
 
     if (IS_NULL(name))
@@ -279,7 +281,7 @@ static error_t lights_find_mode (
     const char __user *buf,
     size_t len
 ){
-    const struct lights_mode *iter;
+    struct lights_mode const *iter;
     char kern_buf[LIGHTS_MAX_MODENAME_LENGTH + 1];
     char *name;
     size_t count;
@@ -312,7 +314,7 @@ static error_t lights_find_mode (
         }
     }
 
-    LIGHTS_DBG("Mode '%s' not found in '%s'", name, intf->name);
+    LIGHTS_ERR("Mode '%s' not found in '%s'", name, intf->name);
 
     return -ENOENT;
 }
@@ -369,10 +371,10 @@ exit:
  * @return: Number of bytes written or a negative error code
  */
 static ssize_t lights_dump_modes (
-    const struct lights_mode *modes,
+    struct lights_mode const *modes,
     char *buffer
 ){
-    const struct lights_mode *iter = modes;
+    struct lights_mode const *iter = modes;
     size_t mode_len;
     ssize_t written = 0;
 
@@ -408,9 +410,9 @@ static ssize_t lights_dump_modes (
  * @return: Zero or a negative error number
  */
 static error_t lights_append_caps (
-    const struct lights_mode *modes
+    struct lights_mode const *modes
 ){
-    const struct lights_mode *iter = modes;
+    struct lights_mode const *iter = modes, *rem;
     error_t err;
 
     if (IS_NULL(modes))
@@ -419,7 +421,7 @@ static error_t lights_append_caps (
     while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
         err = lights_add_caps(iter);
         if (err) {
-            const struct lights_mode *rem = modes;
+            rem = modes;
             while (rem != iter) {
                 lights_del_caps(rem);
                 rem++;
@@ -438,7 +440,7 @@ static error_t lights_append_caps (
  * @modes: Zero terminated array of modes
  */
 static void lights_remove_caps (
-    const struct lights_mode *modes
+    struct lights_mode const *modes
 ){
     while (modes->id != LIGHTS_MODE_ENDOFARRAY) {
         lights_del_caps(modes);
@@ -570,10 +572,10 @@ EXPORT_SYMBOL_NS_GPL(lights_read_color, LIGHTS);
 ssize_t lights_read_mode (
     const char *buffer,
     size_t len,
-    const struct lights_mode *haystack,
+    struct lights_mode const *haystack,
     struct lights_mode *mode
 ){
-    const struct lights_mode *p;
+    struct lights_mode const *p;
     char kern_buf[LIGHTS_MAX_MODENAME_LENGTH];
     size_t count;
 
@@ -795,9 +797,9 @@ static struct lights_file *find_attribute_for_type (
  * @return: Error code
  */
 static error_t update_each_interface (
-    const struct lights_state *state
+    struct lights_state const *state
 ){
-    const struct lights_file **files;
+    struct lights_file const **files = NULL;
     struct lights_interface *intf;
     size_t count, i;
     error_t err = 0;
@@ -810,12 +812,14 @@ static error_t update_each_interface (
 
 repeat:
     count = lights_global.interface.count;
+    kfree(files);
     files = kcalloc(count, sizeof(*files), GFP_KERNEL);
+    if (!files)
+        return -ENOMEM;
 
     spin_lock(&lights_global.interface.lock);
 
     if (count < lights_global.interface.count) {
-        kfree(files);
         spin_unlock(&lights_global.interface.lock);
         goto repeat;
     }
@@ -835,7 +839,7 @@ repeat:
 
     for (i = 0; i < count; i++) {
         if (files[i]->attr.write) {
-            err = files[i]->attr.write(files[i]->attr.private_data, state);
+            err = files[i]->attr.write(files[i]->attr.thunk, state);
 
             if (err) {
                 LIGHTS_ERR(
@@ -858,7 +862,7 @@ repeat:
 /**
  * io_read() - File output handler
  *
- * @data:  Unused
+ * @thunk: Unused
  * @state: Buffer to populate
  *
  * @return: Zero
@@ -867,7 +871,7 @@ repeat:
  * under the "all" interface.
  */
 static error_t io_read (
-    void *data,
+    struct lights_thunk *thunk,
     struct lights_state *state
 ){
     lights_get_state(state);
@@ -878,7 +882,7 @@ static error_t io_read (
 /**
  * io_write() - File input handler
  *
- * @data:  Unused
+ * @thunk: Unused
  * @state: Data written to the file
  *
  * @return: Error code
@@ -888,8 +892,8 @@ static error_t io_read (
  * write method of all other interfaces for the same data type.
  */
 static error_t io_write (
-    void *data,
-    const struct lights_state *state
+    struct lights_thunk *thunk,
+    struct lights_state const *state
 ){
     if (IS_NULL(state))
         return -EINVAL;
@@ -969,11 +973,11 @@ static struct attribute *lights_class_attrs[] = {
 	NULL,
 };
 
-static const struct attribute_group lights_class_group = {
+static struct attribute_group const lights_class_group = {
 	.attrs = lights_class_attrs,
 };
 
-static const struct attribute_group *lights_class_groups[] = {
+static struct attribute_group const *lights_class_groups[] = {
 	&lights_class_group,
 	NULL,
 };
@@ -998,7 +1002,7 @@ static error_t lights_attribute_read (
         return -ENODEV;
 
     if (file->attr.read)
-        err = file->attr.read(file->attr.private_data, state);
+        err = file->attr.read(file->attr.thunk, state);
 
     kref_put(&file->intf->refs, lights_interface_put);
 
@@ -1015,7 +1019,7 @@ static error_t lights_attribute_read (
  */
 static error_t lights_attribute_write (
     struct file *filp,
-    const struct lights_state *state
+    struct lights_state const *state
 ){
     struct lights_file *file;
     error_t err = -ENODEV;
@@ -1025,7 +1029,7 @@ static error_t lights_attribute_write (
         return -ENODEV;
 
     if (file->attr.write)
-        err = file->attr.write(file->attr.private_data, state);
+        err = file->attr.write(file->attr.thunk, state);
 
     kref_put(&file->intf->refs, lights_interface_put);
 
@@ -1090,7 +1094,7 @@ static ssize_t lights_mode_attribute_write (
     size_t len,
     loff_t *off
 ){
-    const struct lights_file *file;
+    struct lights_file const *file;
     struct lights_state state = {
         .type = LIGHTS_TYPE_MODE
     };
@@ -1105,7 +1109,7 @@ static ssize_t lights_mode_attribute_write (
         goto exit;
 
     if (file->attr.write)
-        err = file->attr.write(file->attr.private_data, &state);
+        err = file->attr.write(file->attr.thunk, &state);
     else
         err = -ENODEV;
 
@@ -1431,7 +1435,7 @@ static ssize_t lights_leds_attribute_write (
     size_t len,
     loff_t *off
 ){
-    const struct lights_file *file;
+    struct lights_file const *file;
     struct lights_state state = {
         .type = LIGHTS_TYPE_LEDS
     };
@@ -1479,13 +1483,13 @@ static ssize_t lights_leds_attribute_write (
             goto exit;
         }
 
-        lights_color_read(color, kern_buf);
+        lights_color_read_rgb(color, kern_buf);
 
         color++;
         buf += 3;
     }
 
-    err = file->attr.write(file->attr.private_data, &state);
+    err = file->attr.write(file->attr.thunk, &state);
 
 exit:
     kref_put(&file->intf->refs, lights_interface_put);
@@ -1545,7 +1549,7 @@ static ssize_t lights_update_attribute_write (
     size_t len,
     loff_t *off
 ){
-    const struct lights_file *file;
+    struct lights_file const *file;
     enum lights_io_type allowed = (
         LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION
     );
@@ -1604,7 +1608,7 @@ static ssize_t lights_update_attribute_write (
     }
 
     if (file->attr.write)
-        err = file->attr.write(file->attr.private_data, &state);
+        err = file->attr.write(file->attr.thunk, &state);
     else
         err = -ENODEV;
 
@@ -1614,6 +1618,41 @@ exit:
     return -ENODEV;
 }
 
+
+static inline error_t lights_minor_get (
+    unsigned long *minor
+){
+    error_t err = 0;
+
+    spin_lock(&lights_global.minor_lock);
+
+    *minor = find_first_zero_bit(lights_global.minor_map, LIGHTS_MAX_MINORS);
+    if (*minor < LIGHTS_MAX_MINORS)
+        set_bit(*minor, lights_global.minor_map);
+    else
+        err = -EBUSY;
+
+    spin_unlock(&lights_global.minor_lock);
+
+    return err;
+}
+
+static inline error_t lights_minor_put (
+    unsigned long minor
+){
+    error_t err = 0;
+
+    spin_lock(&lights_global.minor_lock);
+
+    if (minor < LIGHTS_MAX_MINORS)
+        clear_bit(minor, lights_global.minor_map);
+    else
+        err = -EINVAL;
+
+    spin_unlock(&lights_global.minor_lock);
+
+    return err;
+}
 
 /**
  * lights_device_release() - Dummy function
@@ -1636,7 +1675,7 @@ static void lights_device_release (
  */
 static error_t file_operations_create (
     struct lights_file *file,
-    const struct lights_io_attribute *attr
+    struct lights_io_attribute const *attr
 ){
     memset(&file->fops, 0, sizeof(file->fops));
 
@@ -1713,39 +1752,42 @@ static error_t file_operations_create (
  */
 static struct lights_file *lights_file_create (
     struct lights_interface *intf,
-    const struct lights_io_attribute *attr
+    struct lights_io_attribute const *attr
 ){
-    int minor;
-    dev_t ver;
     struct lights_file *file;
+    dev_t ver;
     error_t err;
 
     if (IS_NULL(attr, intf, attr->attr.name) || IS_TRUE(attr->attr.name[0] == 0))
         return ERR_PTR(-EINVAL);
 
-    // TODO - bitmap is not thread safe
-    minor = find_first_zero_bit(lights_global.minors, LIGHTS_MAX_MINORS);
-    if (minor >= LIGHTS_MAX_MINORS)
-        return ERR_PTR(-EBUSY);
-
     file = kzalloc(sizeof(*file), GFP_KERNEL);
     if (!file)
         return ERR_PTR(-ENOMEM);
 
-    err = file_operations_create(file, attr);
-    if (err)
+    err = lights_minor_get(&file->minor);
+    if (err) {
+        LIGHTS_ERR("Failed to allocate minor number");
         goto error_free_file;
+    }
+
+    err = file_operations_create(file, attr);
+    if (err) {
+        LIGHTS_ERR("Failed to file operations: %s", ERR_NAME(err));
+        goto error_free_file;
+    }
 
     file->intf = intf;
-    file->minor = minor;
     ver = MKDEV(lights_global.major, file->minor);
 
     /* Create a character device with a unique major:minor */
     cdev_init(&file->cdev, &file->fops);
     file->cdev.owner = attr->owner;
     err = cdev_add(&file->cdev, ver, 1);
-    if (err)
+    if (err) {
+        LIGHTS_ERR("Failed to add character device: %s", ERR_NAME(err));
         goto error_free_file;
+    }
 
     /*
      * Create a device with the same major:minor,
@@ -1764,10 +1806,9 @@ static struct lights_file *lights_file_create (
 
     if (IS_ERR(file->dev)) {
         err = CLEAR_ERR(file->dev);
+        LIGHTS_ERR("Failed to create device '%s:%s': %s", intf->name, attr->attr.name, ERR_NAME(err));
         goto error_free_cdev;
     }
-
-    set_bit(minor, lights_global.minors);
 
     LIGHTS_DBG("created device '/dev/lights/%s/%s'", intf->name, attr->attr.name);
 
@@ -1775,7 +1816,9 @@ static struct lights_file *lights_file_create (
 
 error_free_cdev:
     cdev_del(&file->cdev);
+
 error_free_file:
+    lights_minor_put(file->minor);
     kfree(file);
 
     return ERR_PTR(err);
@@ -1794,9 +1837,7 @@ static void lights_file_destroy (
 
     device_destroy(lights_global.class, MKDEV(lights_global.major, file->minor));
     cdev_del(&file->cdev);
-
-    if (file->minor < LIGHTS_MAX_MINORS && file->minor >= 0)
-        clear_bit(file->minor, lights_global.minors);
+    lights_minor_put(file->minor);
 
     LIGHTS_DBG("removed device '/dev/lights/%s/%s'", file->intf->name, file->attr.attr.name);
     kfree(file);
@@ -1812,7 +1853,7 @@ static void lights_file_destroy (
  * Only called when creating files and unregsitering device.
  */
 static struct lights_interface *lights_interface_find (
-    struct lights_dev *dev
+    struct lights_dev const *dev
 ){
     struct lights_interface *interface;
 
@@ -1880,7 +1921,7 @@ static void lights_interface_destroy (
 static struct lights_interface *lights_interface_create (
     struct lights_dev *lights
 ){
-    const struct lights_io_attribute **attr;
+    struct lights_io_attribute const * const *attr;
     struct lights_interface *intf;
     struct lights_file *file;
     error_t err;
@@ -1912,8 +1953,8 @@ static struct lights_interface *lights_interface_create (
             file = lights_file_create(intf, *attr);
 
             if (IS_ERR(file)) {
-                LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
                 err = PTR_ERR(file);
+                LIGHTS_ERR("Failed to create file: %s", ERR_NAME(err));
                 goto error;
             }
 
@@ -1948,8 +1989,9 @@ error_t lights_device_register (
 
     intf = lights_interface_create(lights);
     if (IS_ERR(intf)) {
-        LIGHTS_ERR("create_lights_interface() returned %ld!", PTR_ERR(intf));
-        return PTR_ERR(intf);
+        err = PTR_ERR(intf);
+        LIGHTS_ERR("create_lights_interface() returned %s", ERR_NAME(err));
+        return err;
     }
 
     if (lights->caps) {
@@ -1969,6 +2011,7 @@ error_t lights_device_register (
     }
 
     list_add_tail(&intf->siblings, &lights_global.interface.list);
+    lights_global.interface.count++;
 
     spin_unlock(&lights_global.interface.lock);
 
@@ -2001,9 +2044,12 @@ void lights_device_unregister (
     }
 
     spin_lock(&lights_global.interface.lock);
+
     list_del(&intf->siblings);
     /* Remove the ref held by the list */
     kref_put(&intf->refs, lights_interface_put);
+    lights_global.interface.count--;
+
     spin_unlock(&lights_global.interface.lock);
 
     /* Remove the ref created by lights_interface_find() */
@@ -2023,8 +2069,8 @@ EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
  * so the user need not keep a reference to it.
  */
 error_t lights_create_file (
-    struct lights_dev *dev,
-    const struct lights_io_attribute *attr
+    struct lights_dev const *dev,
+    struct lights_io_attribute const *attr
 ){
     struct lights_interface *intf;
     struct lights_file *file;
@@ -2041,8 +2087,8 @@ error_t lights_create_file (
 
     file = lights_file_create(intf, attr);
     if (IS_ERR(file)) {
-        LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
         err = PTR_ERR(file);
+        LIGHTS_ERR("Failed to create file: %s", ERR_NAME(err));
         goto exit;
     }
 
@@ -2068,8 +2114,8 @@ EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
  * @Return: A negative error number on failure
  */
 error_t lights_create_files (
-    struct lights_dev *dev,
-    const struct lights_io_attribute *attrs,
+    struct lights_dev const *dev,
+    struct lights_io_attribute const * const attrs,
     size_t count
 ){
     LIST_HEAD(file_list);
@@ -2090,8 +2136,8 @@ error_t lights_create_files (
     for (i = 0; i < count; i++) {
         file = lights_file_create(intf, &attrs[i]);
         if (IS_ERR(file)) {
-            LIGHTS_ERR("Failed to create file with error %ld", PTR_ERR(file));
             err = CLEAR_ERR(file);
+            LIGHTS_ERR("Failed to create file: %s", ERR_NAME(err));
             goto error;
         }
 

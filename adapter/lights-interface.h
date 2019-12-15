@@ -6,6 +6,8 @@
 #include <linux/sysfs.h>
 #include <include/types.h>
 
+#include "lights-thunk.h"
+
 #define LIGHTS_MAX_FILENAME_LENGTH  64
 #define LIGHTS_MAX_MODENAME_LENGTH  32
 
@@ -99,7 +101,7 @@ struct lights_color {
     (p1)->value == (p2)->value \
 )
 
-static inline void lights_color_read (
+static inline void lights_color_read_rgb (
     struct lights_color *color,
     const uint8_t buf[3]
 ){
@@ -108,13 +110,31 @@ static inline void lights_color_read (
     color->b = buf[2];
 }
 
-static inline void lights_color_write (
-    const struct lights_color *color,
+static inline void lights_color_write_rgb (
+    struct lights_color const *color,
     uint8_t buf[3]
 ){
     buf[0] = color->r;
     buf[1] = color->g;
     buf[2] = color->b;
+}
+
+static inline void lights_color_read_rbg (
+    struct lights_color *color,
+    const uint8_t buf[3]
+){
+    color->r = buf[0];
+    color->b = buf[1];
+    color->g = buf[2];
+}
+
+static inline void lights_color_write_rbg (
+    struct lights_color const *color,
+    uint8_t buf[3]
+){
+    buf[0] = color->r;
+    buf[1] = color->b;
+    buf[2] = color->g;
 }
 
 /**
@@ -180,59 +200,31 @@ struct lights_state {
     enum lights_io_type     type;
 };
 
-/**
- * struct lights_io - Used during read/write callbacks
- *
- * @type:           Indicates which of the data members is in use
- * @data.color:     A color value being read from or written to the file
- * @data.mode:      A mode value being read from or written to the file
- * @data.speed:     A speed value being read from or written to the file
- * @data.direction: 0 or 1 to indicate direction of mode
- * @data.raw:       The raw data, in kernel space
- *
- * NOTE - LIGHTS_TYPE_LEDS uses the raw buffer. The size of the buffer
- * is dependant on the led_count member of lights_dev.
- */
-// struct lights_io {
-//     enum lights_io_type         type;
-//
-//     union {
-//         struct lights_color     color;
-//         struct lights_mode      mode;
-//         struct lights_buffer    raw;
-//         uint8_t                 speed;
-//         uint8_t                 direction;
-//         uint8_t                 sync;
-//     } data;
-// };
-
 // typedef error_t (*lights_update_t)(const struct lights_state *);
-typedef error_t (*lights_read_t)(void *, struct lights_state *);
-typedef error_t (*lights_write_t)(void *, const struct lights_state *);
+typedef error_t (*lights_read_t)(struct lights_thunk *, struct lights_state *);
+typedef error_t (*lights_write_t)(struct lights_thunk *, struct lights_state const *);
 
 /**
  * struct lights_io_attribute - Specifies how a file is to be created
  *
- * @owner:        The owning module (THIS_MODULE)
- * @attr:         Specifies the name and mode of a file
- * @type:         Specifies how data written/read is translated
- * @private_data: A user defined pointer to data associated with the file
- * @read:         Called to populate the io object
- * @write:        Called with populated io
+ * @owner: The owning module (THIS_MODULE)
+ * @attr:  Specifies the name and mode of a file
+ * @type:  Specifies how data written/read is translated
+ * @data:  A user defined pointer to data associated with the file
+ * @read:  Called to populate the io object
+ * @write: Called with populated io
  *
- * The @private_data member is passed to the callbacks. This allows
+ * The @private_thunk member is passed to the callbacks. This allows
  * for extensions to associate arbitrary data with each file.
  */
 struct lights_io_attribute {
     struct module           *owner;
     struct attribute        attr;
     enum lights_io_type     type;
-    void                    *private_data;
+    struct lights_thunk     *thunk;
 
     lights_read_t           read;
     lights_write_t          write;
-    // error_t (*read)(void *data, struct lights_io *io);
-    // error_t (*write)(void *data, const struct lights_io *io);
 };
 
 /**
@@ -243,9 +235,6 @@ struct lights_io_attribute {
  * @led_count:    The number of leds supported by the device
  * @caps:         A list of modes supported by the device
  * @attrs:        A null terminated array of io attributes
- * @update_color: A hook into the writing of /dev/lights/all/color
- * @update_mode:  A hook into the writing of /dev/lights/all/mode
- * @update_speed: A hook into the writing of /dev/lights/all/speed
  *
  * The modes listed here are available to userland in the 'caps' file. This
  * file is created for each device when modes are given. Each mode is also
@@ -254,21 +243,19 @@ struct lights_io_attribute {
  * to each extension.
  */
 struct lights_dev {
-    const char                          *name;
-    uint16_t                            led_count;
-    const struct lights_mode            *caps;
-    const struct lights_io_attribute    **attrs;
-
-    // lights_update_t                     update;
+    const char                                  *name;
+    uint16_t                                    led_count;
+    struct lights_mode const                    *caps;
+    struct lights_io_attribute const * const    *attrs;
 };
 
-#define LIGHTS_ATTR(_name, _mode, _type, _data, _read, _write)      \
+#define LIGHTS_ATTR(_name, _mode, _type, _thunk, _read, _write)      \
 (struct lights_io_attribute) {                                      \
     .owner = THIS_MODULE,                                           \
     .attr = {.name = _name,                                         \
              .mode = VERIFY_OCTAL_PERMISSIONS(_mode) },             \
     .type          = _type,                                         \
-    .private_data  = _data,                                         \
+    .thunk         = _thunk,                                         \
     .read          = _read,                                         \
     .write         = _write,                                        \
 }
@@ -276,48 +263,48 @@ struct lights_dev {
 /**
  * Helper macros for creating lights_io_attribute instances.
  */
-#define LIGHTS_ATTR_RO(_name, _type, _data, _read) (    \
-    LIGHTS_ATTR(_name, 0444, _type, _data, _read, NULL) \
+#define LIGHTS_ATTR_RO(_name, _type, _thunk, _read) (    \
+    LIGHTS_ATTR(_name, 0444, _type, _thunk, _read, NULL) \
 )
 
-#define LIGHTS_ATTR_WO(_name, _type, _data, _write) ( \
-    LIGHTS_ATTR(_name, 0200, _type, _data, NULL, _write) \
+#define LIGHTS_ATTR_WO(_name, _type, _thunk, _write) ( \
+    LIGHTS_ATTR(_name, 0200, _type, _thunk, NULL, _write) \
 )
 
-#define LIGHTS_ATTR_RW(_name, _type, _data, _read, _write) ( \
-    LIGHTS_ATTR(_name, 0644, _type, _data, _read, _write)    \
+#define LIGHTS_ATTR_RW(_name, _type, _thunk, _read, _write) ( \
+    LIGHTS_ATTR(_name, 0644, _type, _thunk, _read, _write)    \
 )
 
-#define LIGHTS_CUSTOM_ATTR(_name, _data, _read, _write) ( \
-    LIGHTS_ATTR_RW(_name, LIGHTS_TYPE_CUSTOM, _data, _read, _write) \
+#define LIGHTS_CUSTOM_ATTR(_name, _thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(_name, LIGHTS_TYPE_CUSTOM, _thunk, _read, _write) \
 )
 
-#define LIGHTS_MODE_ATTR(_data, _read, _write) ( \
-    LIGHTS_ATTR_RW(LIGHTS_IO_MODE, LIGHTS_TYPE_MODE, _data, _read, _write) \
+#define LIGHTS_MODE_ATTR(_thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_MODE, LIGHTS_TYPE_MODE, _thunk, _read, _write) \
 )
 
-#define LIGHTS_COLOR_ATTR(_data, _read, _write) ( \
-    LIGHTS_ATTR_RW(LIGHTS_IO_COLOR, LIGHTS_TYPE_COLOR, _data, _read, _write) \
+#define LIGHTS_COLOR_ATTR(_thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_COLOR, LIGHTS_TYPE_COLOR, _thunk, _read, _write) \
 )
 
-#define LIGHTS_SPEED_ATTR(_data, _read, _write) ( \
-    LIGHTS_ATTR_RW(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _data, _read, _write) \
+#define LIGHTS_SPEED_ATTR(_thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_SPEED, LIGHTS_TYPE_SPEED, _thunk, _read, _write) \
 )
 
-#define LIGHTS_DIRECTION_ATTR(_data, _read, _write) ( \
-    LIGHTS_ATTR_RW(LIGHTS_IO_DIRECTION, LIGHTS_TYPE_DIRECTION, _data, _read, _write) \
+#define LIGHTS_DIRECTION_ATTR(_thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_DIRECTION, LIGHTS_TYPE_DIRECTION, _thunk, _read, _write) \
 )
 
-#define LIGHTS_LEDS_ATTR(_data, _write) ( \
-    LIGHTS_ATTR_WO(LIGHTS_IO_LEDS, LIGHTS_TYPE_LEDS, _data, _write) \
+#define LIGHTS_LEDS_ATTR(_thunk, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_LEDS, LIGHTS_TYPE_LEDS, _thunk, _write) \
 )
 
-#define LIGHTS_SYNC_ATTR(_data, _write) ( \
-    LIGHTS_ATTR_WO(LIGHTS_IO_SYNC, LIGHTS_TYPE_SYNC, _data, _write) \
+#define LIGHTS_SYNC_ATTR(_thunk, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_SYNC, LIGHTS_TYPE_SYNC, _thunk, _write) \
 )
 
-#define LIGHTS_UPDATE_ATTR(_data, _write) ( \
-    LIGHTS_ATTR_WO(LIGHTS_IO_UPDATE, LIGHTS_TYPE_UPDATE, _data, _write) \
+#define LIGHTS_UPDATE_ATTR(_thunk, _write) ( \
+    LIGHTS_ATTR_WO(LIGHTS_IO_UPDATE, LIGHTS_TYPE_UPDATE, _thunk, _write) \
 )
 
 /**
@@ -331,7 +318,7 @@ struct lights_dev {
  * names of devices for which multiple instances may exist ("dimm-0").
  */
 error_t lights_device_register (
-    struct lights_dev * dev
+    struct lights_dev *dev
 );
 
 /**
@@ -340,7 +327,7 @@ error_t lights_device_register (
  * @dev: A device previously registered with lights_device_register()
  */
 void lights_device_unregister (
-    struct lights_dev * dev
+    struct lights_dev *dev
 );
 
 /**
@@ -355,8 +342,8 @@ void lights_device_unregister (
  * so the user need not keep a reference to it.
  */
 error_t lights_create_file (
-    struct lights_dev *dev,
-    const struct lights_io_attribute *attr
+    struct lights_dev const *dev,
+    struct lights_io_attribute const *attr
 );
 
 /**
@@ -372,8 +359,8 @@ error_t lights_create_file (
  * so the user need not keep a reference to it.
  */
 error_t lights_create_files (
-    struct lights_dev *dev,
-    const struct lights_io_attribute *attrs,
+    struct lights_dev const *dev,
+    struct lights_io_attribute const * const attrs,
     size_t count
 );
 
@@ -405,7 +392,7 @@ ssize_t lights_read_color (
 ssize_t lights_read_mode (
     const char *buffer,
     size_t len,
-    const struct lights_mode *haystack,
+    struct lights_mode const *haystack,
     struct lights_mode *mode
 );
 

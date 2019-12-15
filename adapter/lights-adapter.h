@@ -7,11 +7,12 @@
 
 #include <include/quirks.h>
 #include <include/types.h>
+#include "lights-thunk.h"
 #include "usb/usb-driver.h"
 
 struct lights_adapter_msg;
 
-typedef void (*lights_adapter_done_t) (struct lights_adapter_msg const * const result, void *data, error_t error);
+typedef void (*lights_adapter_done_t) (struct lights_adapter_msg const * const, struct lights_thunk*, error_t);
 
 /* Used to sanity check while loops */
 #define LIGHTS_ADAPTER_MAX_MSGS 32
@@ -25,12 +26,14 @@ enum lights_adapter_flags {
     LIGHTS_CLIENT_SCCB          = I2C_CLIENT_SCCB,          /* Use Omnivision SCCB protocol */
 };
 
-enum lights_adapter_msg_type {
-    MSG_QUICK       = I2C_SMBUS_QUICK,      /* 0 */
-    MSG_BYTE        = I2C_SMBUS_BYTE,       /* 1 */
-    MSG_BYTE_DATA   = I2C_SMBUS_BYTE_DATA,  /* 2 */
-    MSG_WORD_DATA   = I2C_SMBUS_WORD_DATA,  /* 3 */
-    MSG_BLOCK_DATA  = I2C_SMBUS_BLOCK_DATA, /* 5 */
+enum lights_adapter_msg_flags {
+    MSG_READ        = 0X0001,
+    MSG_SWAPPED     = 0X0002,
+    MSG_QUICK       = 0X0004,
+    MSG_BYTE        = 0X0008,
+    MSG_BYTE_DATA   = 0X0010,
+    MSG_WORD_DATA   = 0X0020,
+    MSG_BLOCK_DATA  = 0X0040,
 };
 
 enum lights_adapter_protocol {
@@ -62,10 +65,10 @@ struct lights_adapter_client {
             uint16_t            flags;
         }                       i2c_client,
                                 smbus_client;
-        // struct i2c_client i2c_client;
-        // struct i2c_client smbus_client;
         struct usb_client usb_client;
     };
+
+    /* Private */
     struct lights_adapter_context *adapter;
 };
 #define LIGHTS_I2C_CLIENT(_adapter, _addr, _flags) \
@@ -126,7 +129,7 @@ struct lights_adapter_client {
  * this function.
  */
 error_t lights_adapter_xfer (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msgs,
     size_t msg_count
 );
@@ -137,7 +140,7 @@ error_t lights_adapter_xfer (
  * @client:    Hardware parameters
  * @msgs:      One or more messages to send
  * @msg_count: Number of messages to send
- * @cb_data:   Second parameter of @callback
+ * @thunk:     Second parameter of @callback
  * @callback:  Completion function
  *
  * @return: Zero or a negative error code
@@ -148,10 +151,10 @@ error_t lights_adapter_xfer (
  * the mutex lock.
  */
 error_t lights_adapter_xfer_async (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msgs,
     size_t msg_count,
-    void *cb_data,
+    struct lights_thunk *thunk,
     lights_adapter_done_t callback
 );
 
@@ -180,12 +183,9 @@ void lights_adapter_unregister (
  * is then stored in the given client.
  *
  * This was done so that clients can be created on the stack and hardware
- * probed without the need to allocate memory. One a bus has been validated
+ * probed without the need to allocate memory. Once a bus has been validated
  * to contain the relevent device, the caller may then setup full async
  * access to the device.
- *
- * The actual async allocations are done on the first call to
- * @lights_adapter_xfer_async.
  *
  * Each call to @lights_adapter_register must be paired with a call to
  * @lights_adapter_unregister.
@@ -194,6 +194,19 @@ error_t lights_adapter_register (
     struct lights_adapter_client *client,
     size_t max_async
 );
+
+/**
+ * lights_adapter_is_registered() - Checks if a client was previously registered
+ *
+ * @client: Client to check
+ *
+ * @return: Boolean
+ */
+static inline bool lights_adapter_is_registered (
+    struct lights_adapter_client *client
+){
+    return client->adapter;
+}
 
 /*
  * This needs to be large enough to hold the max possible transfer data.
@@ -215,19 +228,17 @@ error_t lights_adapter_register (
  * @next:    The next message value
  */
 struct lights_adapter_msg {
-    u8      read;
-    u8      command;
-    u8      type;
-    u8      length;
-    u8      swapped;
-
-    union {
-        u8  byte;
-        u16 word;
-        u8  block[LIGHTS_ADAPTER_BLOCK_MAX];
-    }       data;
+    uint32_t    flags;
+    uint8_t     command;
+    uint8_t     length;
 
     struct lights_adapter_msg *next;
+
+    union {
+        uint8_t     byte;
+        uint16_t    word;
+        uint8_t     block[LIGHTS_ADAPTER_BLOCK_MAX];
+    }           data;
 };
 
 /**
@@ -253,58 +264,86 @@ static inline struct lights_adapter_msg const *adapter_seek_msg (
     return head;
 }
 
-#define ADAPTER_READ_MSG(_reg, _type, _swapped) \
-(struct lights_adapter_msg){ \
-    .read = true, \
-    .type = (_type), \
-    .command = (_reg), \
-    .swapped = (_swapped) \
+static inline bool lights_adapter_msg_value(
+    struct lights_adapter_msg const *msg,
+    enum lights_adapter_msg_flags type,
+    void const *value
+){
+    if (msg && msg->flags & type) {
+        switch (type) {
+            case MSG_QUICK: *(uint8_t*)value = msg->data.byte; break;
+            case MSG_BYTE: *(uint8_t*)value = msg->data.byte; break;
+            case MSG_BYTE_DATA: *(uint8_t*)value = msg->data.byte; break;
+            case MSG_WORD_DATA: *(uint16_t*)value = msg->data.word; break;
+            case MSG_BLOCK_DATA: *(uint8_t const **)value = msg->data.block; break;
+            default:
+                return false;
+        }
+        return true;
+    }
+    return false;
 }
 
-#define ADAPTER_WRITE_MSG(_reg, _type, _data, _swapped) \
+static inline uint16_t lights_adapter_msg_read_flags (
+    struct lights_adapter_msg const *msg
+){
+    return msg->flags >> 16;
+}
+
+static inline void lights_adapter_msg_write_flags (
+    struct lights_adapter_msg *msg,
+    uint16_t value
+){
+    msg->flags |= (value << 16);
+}
+
+#define ADAPTER_READ_MSG(_reg, _flags) \
 (struct lights_adapter_msg){ \
-    .type = (_type), \
+    .flags = MSG_READ | (_flags), \
+    .command = (_reg), \
+}
+
+#define ADAPTER_WRITE_MSG(_reg, _flags, _data) \
+(struct lights_adapter_msg){ \
+    .flags = (_flags), \
     .command = (_reg), \
     .data = _data, \
-    .swapped = (_swapped) \
 }
 
 #define ADAPTER_READ_BYTE() \
-    ADAPTER_READ_MSG(0, MSG_BYTE, false)
+    ADAPTER_READ_MSG(0, MSG_BYTE)
 
 #define ADAPTER_READ_BYTE_DATA(_reg) \
-    ADAPTER_READ_MSG((_reg), MSG_BYTE_DATA, false)
+    ADAPTER_READ_MSG((_reg), MSG_BYTE_DATA)
 
 #define ADAPTER_READ_WORD_DATA(_reg) \
-    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA, false)
+    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA)
 
 #define ADAPTER_READ_WORD_DATA_SWAPPED(_reg) \
-    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA, true)
+    ADAPTER_READ_MSG((_reg), MSG_WORD_DATA | MSG_SWAPPED)
 
 #define ADAPTER_WRITE_BYTE(_val) \
-    ADAPTER_WRITE_MSG(0, MSG_BYTE, {.byte = (u8)(_val)}, false)
+    ADAPTER_WRITE_MSG(0, MSG_BYTE, {.byte = (u8)(_val)})
 
 #define ADAPTER_WRITE_BYTE_DATA(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), MSG_BYTE_DATA, {.byte = (u8)(_val)}, false)
+    ADAPTER_WRITE_MSG((_reg), MSG_BYTE_DATA, {.byte = (u8)(_val)})
 
 #define ADAPTER_WRITE_WORD_DATA(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA, {.word = (u16)(_val)}, false)
+    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA, {.word = (u16)(_val)})
 
 #define ADAPTER_WRITE_WORD_DATA_SWAPPED(_reg, _val) \
-    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA, {.word = (u16)(_val)}, true)
+    ADAPTER_WRITE_MSG((_reg), MSG_WORD_DATA | MSG_SWAPPED, {.word = (u16)(_val)})
 
 #define ADAPTER_READ_BLOCK_DATA(_reg, _len) \
 (struct lights_adapter_msg){ \
-    .read = true, \
-    .type = MSG_BLOCK_DATA, \
+    .flags = MSG_READ | MSG_BLOCK_DATA, \
     .command = (_reg), \
     .length = (_len), \
 }
-// ADAPTER_READ_MSG((_reg), MSG_BLOCK_DATA, false)
 /* NOTE: The caller is required to populate the data */
 #define ADAPTER_WRITE_BLOCK_DATA(_reg, _len) \
 (struct lights_adapter_msg){ \
-    .type = MSG_BLOCK_DATA, \
+    .flags = MSG_BLOCK_DATA, \
     .command = (_reg), \
     .length = (_len), \
 }

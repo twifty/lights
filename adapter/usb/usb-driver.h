@@ -45,15 +45,15 @@ typedef void (*usb_callback_t)(struct usb_client *);
  * @controller:   Internal driver data
  */
 struct usb_client {
-    const struct usb_device_id  *ids;
+    struct usb_device_id  const *ids;
     const char                  *name;
     uint8_t                     index;
     size_t                      packet_size;
 
-    usb_callback_t              onConnect;
-    usb_callback_t              onDisconnect;
-    usb_callback_t              onSuspend;
-    usb_callback_t              onResume;
+    usb_callback_t              on_connect;
+    usb_callback_t              on_disconnect;
+    usb_callback_t              on_suspend;
+    usb_callback_t              on_resume;
 
     /* Private */
     struct usb_controller       *controller;
@@ -74,7 +74,7 @@ struct usb_client {
  * accessed by setting the index member of the client.
  */
 error_t usb_read_packet (
-    const struct usb_client *client,
+    struct usb_client const *client,
     struct usb_packet *packet
 );
 
@@ -89,8 +89,8 @@ error_t usb_read_packet (
  * This function is blocking.
  */
 error_t usb_write_packet (
-    const struct usb_client *client,
-    const struct usb_packet *packet
+    struct usb_client const *client,
+    struct usb_packet const *packet
 );
 
 /**

@@ -114,7 +114,7 @@ void reg_write (
 }
 
 uint32_t reg_field_get_value_ex(
-    const struct reg_fields *field
+    struct reg_fields const *field
 ){
     return (field->value & field->mask) >> field->shift;
 }
@@ -131,7 +131,7 @@ uint32_t reg_field_set_value_ex(
 uint32_t reg_update_ex(
     struct aura_reg_service *service,
     uint32_t addr,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 ){
     uint32_t ret;
@@ -159,7 +159,7 @@ uint32_t reg_set_ex(
     struct aura_reg_service *service,
     uint32_t addr,
     uint32_t init,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 ){
     uint32_t value = 0, mask = 0;
@@ -216,7 +216,7 @@ uint32_t reg_get_value(
 uint32_t reg_update_seq_ex(
     struct aura_reg_service *service,
     uint32_t addr,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 ){
     uint32_t value, i;

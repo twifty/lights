@@ -21,7 +21,7 @@
 #define IS_NULL(...) \
     _EXEC("dummy", ##__VA_ARGS__, _EXEC_4, _EXEC_3, _EXEC_2, _EXEC_1)(_IS_NULL, ##__VA_ARGS__)
 #define IS_TRUE(_1) WARN(_1, __LIGHTS_PREFIX "expr '%s' is TRUE", #_1)
-#define IS_FALSE(_1) WARN(!(_1), "lights hw: expr '%s' is FALSE", #_1)
+#define IS_FALSE(_1) WARN(!(_1), __LIGHTS_PREFIX "expr '%s' is FALSE", #_1)
 #else
 #define IS_NULL(...)
 #define IS_TRUE(_1)

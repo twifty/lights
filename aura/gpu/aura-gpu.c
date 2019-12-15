@@ -38,7 +38,7 @@ static const uint8_t chipset_addresses[] = { 0x29, 0x2A, 0x60 };
     NOTE - If anybody has a datasheet for this ITE IT8915FN chip, please pass
     it on to me so that I can correctly configure these registers.
  */
-enum {
+enum AURA_GPU_CONSTS {
     // AURA_GPU_CHIPSET_ADDR           = 0x29,
     AURA_GPU_CHIPSET_MAGIC_HI       = 0x20,
     AURA_GPU_CHIPSET_MAGIC_LO       = 0x21,
@@ -76,6 +76,8 @@ enum {
         TODO - This may not be a mode
      */
     AURA_GPU_SECONDARY_MODE_ADDR    = 0x32,
+
+    AURA_GPU_DISABLE                = 0x01,
 };
 
 /*
@@ -133,20 +135,41 @@ struct zone_reg {
     uint8_t apply;
 };
 
-/**
- * struct zone_context - State of the zone
- *
- * @gpu_ctrl: Owning controller
- * @mode:     Current mode
- * @color:    Current color
- * @reg:      Register offsets for colors and mode
- */
-struct zone_context {
-    struct aura_gpu_controller  *gpu_ctrl;
+struct zone_effect {
     struct lights_mode          mode;
     struct lights_color         color;
-    const struct zone_reg       reg;
 };
+
+#define effect_dump(_msg, _effect) ( \
+    AURA_DBG( \
+        "%s Mode: '%s', Color: 0x%06x", \
+        (_msg), \
+        (_effect)->mode.name, \
+        (_effect)->color.value \
+    ) \
+)
+
+/**
+ * struct aura_gpu_zone - Storage for a single zone
+ *
+ * @ctrl:   Owning controller
+ * @lock:   Read/Write lock
+ * @thunk:  Magic member
+ * @effect: Active Color and Mode
+ * @reg:    Register offsets
+ */
+struct aura_gpu_zone {
+    struct aura_gpu_controller  *ctrl;
+    spinlock_t                  lock;
+    struct lights_thunk         thunk;
+
+    struct zone_effect          effect;
+    struct zone_reg const       reg;
+};
+#define ZONE_HASH 'ZONE'
+#define zone_from_thunk(ptr) ( \
+    lights_thunk_container(ptr, struct aura_gpu_zone, thunk, ZONE_HASH) \
+)
 
 /**
  * struct aura_gpu_controller - Single GPU storage
@@ -156,33 +179,20 @@ struct zone_context {
  * @lock:          Read/Write lock of this object
  * @id:            The numeric of the GPU (As seen in /dev/lights/gpu-ID)
  * @zone_count:    Number of lighting zones (Currently only one)
- * @zone_contexts: Array of zone data
+ * @aura_gpu_zones: Array of zone data
  * @lights:        Userland access
  * @lights_name:   Name as seen in /dev/lights/
  */
 struct aura_gpu_controller {
     struct list_head                siblings;
     struct lights_adapter_client    lights_client;
-
-    struct mutex                    lock;
     uint8_t                         id;
 
     /* Allow multiple zones for future */
     uint8_t                         zone_count;
-    struct zone_context             *zone_contexts;
+    struct aura_gpu_zone            *zones;
     struct lights_dev               lights;
     char                            lights_name[6];
-};
-
-/**
- * struct callback_data - Used to iterate pci devices
- *
- * @count: Number of found GPUs
- * @error: Any error that occured while creating controller
- */
-struct callback_data {
-    uint8_t count;
-    error_t error;
 };
 
 /**
@@ -194,7 +204,7 @@ struct callback_data {
  * @return: Zero or a negative error number
  */
 static error_t lights_mode_to_aura_gpu_mode (
-    const struct lights_mode *mode,
+    struct lights_mode const *mode,
     enum aura_gpu_mode *gpu_mode
 ){
     if (lights_is_custom_mode(mode)) {
@@ -233,7 +243,7 @@ static error_t lights_mode_to_aura_gpu_mode (
  *
  * @return: NULL or a globally recognizable mode
  */
-static const struct lights_mode *aura_gpu_mode_to_lights_mode (
+static struct lights_mode const *aura_gpu_mode_to_lights_mode (
     enum aura_gpu_mode gpu_mode
 ){
     if (gpu_mode == AURA_MODE_DIRECT) {
@@ -257,9 +267,9 @@ static const struct lights_mode *aura_gpu_mode_to_lights_mode (
  * This function is blocking.
  */
 static error_t aura_gpu_i2c_read_byte (
-    struct lights_adapter_client * client,
+    struct lights_adapter_client *client,
     uint8_t reg,
-    uint8_t * value
+    uint8_t *value
 ){
     error_t err;
     struct lights_adapter_msg msgs[] = {
@@ -309,8 +319,8 @@ static error_t aura_gpu_i2c_write_byte (
  * @return: Zero or a negative error number
  */
 static error_t aura_gpu_discover (
-    struct i2c_adapter * i2c_adapter,
-    struct lights_adapter_client * client
+    struct i2c_adapter *i2c_adapter,
+    struct lights_adapter_client *client
 ){
     uint8_t offset[2] = { AURA_GPU_CHIPSET_MAGIC_HI, AURA_GPU_CHIPSET_MAGIC_LO };
     uint8_t value[2] = {0};
@@ -351,16 +361,16 @@ static error_t aura_gpu_discover (
  * This function is blocking.
  */
 static error_t aura_gpu_fetch_zone (
-    struct zone_context * zone
+    struct aura_gpu_zone *zone
 ){
     enum aura_gpu_mode gpu_mode;
-    const struct lights_mode * mode;
+    struct lights_mode const *mode;
     struct lights_color color;
-    struct lights_adapter_client * client = &zone->gpu_ctrl->lights_client;
+    struct lights_adapter_client *client = &zone->ctrl->lights_client;
     uint8_t mode_raw;
     error_t err;
 
-    mutex_lock(&zone->gpu_ctrl->lock);
+    spin_lock(&zone->lock);
 
     err = aura_gpu_i2c_read_byte(client, zone->reg.red, &color.r);
     if (err)
@@ -399,278 +409,244 @@ static error_t aura_gpu_fetch_zone (
         goto error;
     }
 
-    memcpy((void*)&zone->mode, mode, sizeof(*mode));
-    memcpy((void*)&zone->color, &color, sizeof(color));
+    zone->effect.mode = *mode;
+    zone->effect.color = color;
 
 error:
-    mutex_unlock(&zone->gpu_ctrl->lock);
+    spin_unlock(&zone->lock);
 
     return err;
 }
 
+
 /**
- * aura_gpu_set_color_callback() - Callback handler
+ * aura_gpu_zone_update_callback() - Async callback handler
  *
  * @result: Sent messages
- * @_data:  Zone which was updated
+ * @thunk:  Zone which was updated
  * @error:  Any error while writing
  *
  * The hardware was updated before this call, here we sync the local object.
  */
-static void aura_gpu_set_color_callback (
+static void aura_gpu_zone_update_callback (
     struct lights_adapter_msg const * const result,
-    void *_data,
+    struct lights_thunk *thunk,
     error_t error
 ){
-    struct zone_context *zone = _data;
-    struct lights_adapter_msg const * color_msg;
-    uint8_t color_byte[3];
+    struct aura_gpu_zone *zone = zone_from_thunk(thunk);
+    struct lights_adapter_msg const *iter = result;
+    enum aura_gpu_mode gpu_mode;
+    struct lights_mode const *mode;
+    uint8_t color_bytes[3];
+    bool disable = false;
     int i;
 
-    if (IS_NULL(result, _data))
+    if (IS_NULL(result, thunk, zone))
         return;
 
     if (error) {
-        AURA_DBG("Failed to set color %d", error);
+        AURA_DBG("Failed to update: %s", ERR_NAME(error));
         return;
     }
 
-    color_msg = result;
+    if (!lights_adapter_msg_value(iter, MSG_BYTE_DATA, &gpu_mode)) {
+        AURA_ERR("Failed to read mode from messages");
+        return;
+    }
+
+    if (AURA_GPU_DISABLE == lights_adapter_msg_read_flags(iter))
+        disable = true;
+
     for (i = 0; i < 3; i++) {
-        if (!color_msg) {
-            AURA_DBG("Next message not found");
+        iter = iter->next;
+
+        if (!lights_adapter_msg_value(iter, MSG_BYTE_DATA, &color_bytes[i])) {
+            AURA_ERR("Failed to read mode from messages");
             return;
         }
-        if (color_msg->type != MSG_BYTE_DATA) {
-            AURA_ERR("Message has an invalid type '%d'", color_msg->type);
-            return;
-        }
-        color_byte[i] = color_msg->data.byte;
-        color_msg = color_msg->next;
-    }
-
-    mutex_lock(&zone->gpu_ctrl->lock);
-
-    zone->color.r = color_byte[0];
-    zone->color.g = color_byte[1];
-    zone->color.b = color_byte[2];
-
-    mutex_unlock(&zone->gpu_ctrl->lock);
-}
-
-/**
- * aura_gpu_apply_zone_color() - Begins the async writer
- *
- * @zone:  The zone to update
- * @color: The new color to apply
- *
- * @return: Zero or a negative error number
- */
-static error_t aura_gpu_apply_zone_color (
-    struct zone_context *zone,
-    const struct lights_color *color
-){
-    uint8_t msg_count = 3;
-    struct lights_adapter_msg msgs[] = {
-        /* The controller is fussy about block read/writes */
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.red,   color->r),
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.green, color->g),
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.blue,  color->b),
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01)
-    };
-
-    if (lights_custom_mode_id(&zone->mode) != AURA_MODE_DIRECT) {
-        AURA_DBG("Non-Direct mode detected, applying save");
-        msg_count = 4;
-    } else {
-        AURA_DBG("Current mode: %s %x", zone->mode.name, lights_custom_mode_id(&zone->mode));
-    }
-
-    return lights_adapter_xfer_async(
-        &zone->gpu_ctrl->lights_client,
-        msgs,
-        msg_count,
-        zone,
-        aura_gpu_set_color_callback
-    );
-}
-
-/**
- * aura_gpu_set_mode_callback() - Callback handler
- *
- * @result: Sent messages
- * @_data:  Zone which was updated
- * @error:  Any error while writing
- *
- * The hardware was updated before this call, here we sync the local object.
- */
-static void aura_gpu_set_mode_callback (
-    struct lights_adapter_msg const * const result,
-    void *_data,
-    error_t error
-){
-    struct zone_context *zone = _data;
-    const struct lights_mode *mode;
-
-    if (IS_NULL(result, _data))
-        return;
-
-    if (error) {
-        AURA_DBG("Failed to set mode %d", error);
-        return;
-    }
-
-    if (result->type != MSG_BYTE_DATA) {
-        AURA_ERR("Message has an invalid type '%d'", result->type);
-        return;
     }
 
     /* If the APPLY was not set, the mode is really DIRECT */
-    if (result->data.byte == AURA_MODE_STATIC && result->next == NULL)
-        mode = aura_gpu_mode_to_lights_mode(AURA_MODE_DIRECT);
-    else
-        mode = aura_gpu_mode_to_lights_mode(result->data.byte);
+    if (!iter->next && gpu_mode == AURA_MODE_STATIC) {
+        mode = aura_gpu_mode_to_lights_mode(disable ? AURA_MODE_OFF : AURA_MODE_DIRECT);
+    } else {
+        mode = aura_gpu_mode_to_lights_mode(gpu_mode);
+    }
 
     if (!mode) {
-        AURA_DBG("Not a valid aura mode 0x%02x", result->data.byte);
+        AURA_DBG("Not a valid aura mode 0x%02x", gpu_mode);
         return;
     }
 
-    mutex_lock(&zone->gpu_ctrl->lock);
+    effect_dump("pre update:", &zone->effect);
 
-    memcpy((void*)&zone->mode, mode, sizeof(*mode));
+    spin_lock(&zone->lock);
 
-    mutex_unlock(&zone->gpu_ctrl->lock);
+    if (!disable)
+        lights_color_read_rgb(&zone->effect.color, color_bytes);
+
+    zone->effect.mode = *mode;
+
+    spin_unlock(&zone->lock);
+
+    effect_dump("post update:", &zone->effect);
 }
 
 /**
- * aura_gpu_apply_zone_mode() - Begins the async writer
+ * aura_gpu_zone_update() - Begins the async updater
  *
- * @zone: The zone to update
- * @mode: The new mode to apply
+ * @zone:   Zone being updated
+ * @effect: New values
  *
- * @return: Zero or a negative error number
+ * @return: Error code
  */
-static error_t aura_gpu_apply_zone_mode (
-    struct zone_context *zone,
-    const struct lights_mode *mode
+static error_t aura_gpu_zone_update (
+    struct aura_gpu_zone *zone,
+    struct zone_effect const *effect
 ){
-    uint8_t msg_count = 1;
+    uint8_t count = 4;
     enum aura_gpu_mode gpu_mode;
-    struct lights_adapter_msg msgs[] = {
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.mode,  0),
-        ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01)
-    };
+    struct lights_adapter_msg msgs[5];
+    bool off = false;
     error_t err;
 
-    err = lights_mode_to_aura_gpu_mode(mode, &gpu_mode);
+    if (IS_NULL(zone, effect))
+        return -EINVAL;
+
+    err = lights_mode_to_aura_gpu_mode(&effect->mode, &gpu_mode);
     if (err)
         return err;
 
-    /* DIRECT mode requires special handling */
-    if (gpu_mode == AURA_MODE_DIRECT)
-        gpu_mode = AURA_MODE_STATIC;
-    else
-        msg_count = 2;
+    switch (gpu_mode) {
+        case AURA_MODE_DIRECT:
+            msgs[0] = ADAPTER_WRITE_BYTE_DATA(zone->reg.mode,  AURA_MODE_STATIC);
+            break;
+        case AURA_MODE_OFF:
+            msgs[0] = ADAPTER_WRITE_BYTE_DATA(zone->reg.mode,  AURA_MODE_STATIC);
+            lights_adapter_msg_write_flags(&msgs[0], AURA_GPU_DISABLE);
+            off = true;
+            count = 5;
+            break;
+        default:
+            msgs[0] = ADAPTER_WRITE_BYTE_DATA(zone->reg.mode,  gpu_mode);
+            count = 5;
+            break;
+    }
 
-    msgs[0].data.byte = gpu_mode;
+    msgs[1] = ADAPTER_WRITE_BYTE_DATA(zone->reg.red,   off ? 0 : effect->color.r);
+    msgs[2] = ADAPTER_WRITE_BYTE_DATA(zone->reg.green, off ? 0 : effect->color.g);
+    msgs[3] = ADAPTER_WRITE_BYTE_DATA(zone->reg.blue,  off ? 0 : effect->color.b);
+    msgs[4] = ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01);
 
     return lights_adapter_xfer_async(
-        &zone->gpu_ctrl->lights_client,
+        &zone->ctrl->lights_client,
         msgs,
-        msg_count,
-        zone,
-        aura_gpu_set_mode_callback
+        count,
+        &zone->thunk,
+        aura_gpu_zone_update_callback
     );
 }
 
 /**
- * aura_gpu_get_mode() - Reads a zones mode
+ * aura_gpu_controller_update() - Updates all values of the controller
  *
- * @data:  The zone to read
+ * @ctrl:   Controller being updated
+ * @effect: New values
+ *
+ * @return: Error code
+ */
+static error_t aura_gpu_controller_update (
+    struct aura_gpu_controller *ctrl,
+    struct zone_effect const *effect
+){
+    int i;
+    error_t err = 0;
+
+    if (IS_NULL(ctrl, effect))
+        return -EINVAL;
+
+    for (i = 0; i < ctrl->zone_count && !err; i++)
+        err = aura_gpu_zone_update(&ctrl->zones[i], effect);
+
+    return err;
+}
+
+
+/**
+ * aura_gpu_read() - Reads a zones state
+ *
+ * @thunk: The zone to read
  * @state: Buffer to write into
  *
  * @return: Zero or a negative error number
  *
  * The returned mode is from the local cache not the hardware.
  */
-static error_t aura_gpu_get_mode (
-    void *data,
+static error_t aura_gpu_read (
+    struct lights_thunk *thunk,
     struct lights_state *state
 ){
-    struct zone_context *zone = data;
+    struct aura_gpu_zone *zone = zone_from_thunk(thunk);
 
-    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+    if (IS_NULL(thunk, state, zone))
         return -EINVAL;
 
-    state->mode = zone->mode;
+    spin_lock(&zone->lock);
+
+    if (state->type & LIGHTS_TYPE_MODE)
+        state->mode = zone->effect.mode;
+
+    if (state->type & LIGHTS_TYPE_COLOR)
+        state->color = zone->effect.color;
+
+    spin_unlock(&zone->lock);
 
     return 0;
 }
 
 /**
- * aura_gpu_set_mode() - Writes a zones mode
+ * aura_gpu_write() - Writes a zones values
  *
- * @data:  The zone to read
- * @state: Buffer containing new mode
- *
- * @return: Zero or a negative error number
- *
- * The actual writing is done asynchronously.
- */
-static error_t aura_gpu_set_mode (
-    void *data,
-    const struct lights_state *state
-){
-    struct zone_context *zone = data;
-
-    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_gpu_apply_zone_mode(zone, &state->mode);
-}
-
-/**
- * aura_gpu_get_color() - Reads a zones color
- *
- * @data:  The zone to read
- * @state: The buffer to write into
+ * @thunk: The zone to write
+ * @state: The buffer containing the new values
  *
  * @return: Zero or a negative error number
  */
-static error_t aura_gpu_get_color (
-    void *data,
-    struct lights_state *state
+static error_t aura_gpu_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
 ){
-    struct zone_context *zone = data;
+    struct aura_gpu_zone *zone = zone_from_thunk(thunk);
+    struct zone_effect effect;
+    bool update = false;
+    error_t err = 0;
 
-    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+    if (IS_NULL(thunk, state, zone))
         return -EINVAL;
 
-    state->color = zone->color;
+    spin_lock(&zone->lock);
 
-    return 0;
+    effect = zone->effect;
+
+    if (state->type & LIGHTS_TYPE_COLOR) {
+        effect.color = state->color;
+        update = true;
+    }
+
+    if (state->type & LIGHTS_TYPE_MODE) {
+        effect.mode = state->mode;
+        update = true;
+    }
+
+    if (update)
+        err = aura_gpu_zone_update(zone, &effect);
+
+    spin_unlock(&zone->lock);
+
+    return err;
+    // return aura_gpu_apply_zone_color(zone, &state->color);
 }
 
-/**
- * aura_gpu_set_color() - Writes a zones color
- *
- * @data:  The zone to write
- * @state: The buffer containing the new color
- *
- * @return: Zero or a negative error number
- */
-static error_t aura_gpu_set_color (
-    void *data,
-    const struct lights_state *state
-){
-    struct zone_context *zone = data;
-
-    if (IS_NULL(zone, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_gpu_apply_zone_color(zone, &state->color);
-}
 
 /**
  * aura_gpu_create_fs() - Creates Userland access to the GPU
@@ -680,29 +656,33 @@ static error_t aura_gpu_set_color (
  * @return: Zero or a negative error number
  */
 static error_t aura_gpu_create_fs (
-    struct aura_gpu_controller *gpu_ctrl
+    struct aura_gpu_controller *ctrl
 ){
     struct lights_io_attribute attrs[] = {
         LIGHTS_MODE_ATTR(
-            &gpu_ctrl->zone_contexts[0],
-            aura_gpu_get_mode,
-            aura_gpu_set_mode
+            &ctrl->zones[0].thunk,
+            aura_gpu_read,
+            aura_gpu_write
         ),
         LIGHTS_COLOR_ATTR(
-            &gpu_ctrl->zone_contexts[0],
-            aura_gpu_get_color,
-            aura_gpu_set_color
+            &ctrl->zones[0].thunk,
+            aura_gpu_read,
+            aura_gpu_write
+        ),
+        LIGHTS_UPDATE_ATTR(
+            &ctrl->zones[0].thunk,
+            aura_gpu_write
         )
     };
-    uint8_t id = gpu_ctrl->id;
+    uint8_t id = ctrl->id;
     error_t err;
 
-    gpu_ctrl->lights.name = gpu_ctrl->lights_name;
-    gpu_ctrl->lights.caps = aura_gpu_modes;
+    ctrl->lights.name = ctrl->lights_name;
+    ctrl->lights.caps = aura_gpu_modes;
 
-    for (id = gpu_ctrl->id; id < 2; id++) {
-        snprintf(gpu_ctrl->lights_name, sizeof(gpu_ctrl->lights_name), "gpu-%d", id);
-        err = lights_device_register(&gpu_ctrl->lights);
+    for (id = ctrl->id; id < 2; id++) {
+        snprintf(ctrl->lights_name, sizeof(ctrl->lights_name), "gpu-%d", id);
+        err = lights_device_register(&ctrl->lights);
         if (err) {
             if (err == -EEXIST)
                 continue;
@@ -712,14 +692,14 @@ static error_t aura_gpu_create_fs (
     }
 
     /* Create the attributes */
-    err = lights_create_files(&gpu_ctrl->lights, attrs, ARRAY_SIZE(attrs));
+    err = lights_create_files(&ctrl->lights, attrs, ARRAY_SIZE(attrs));
     if (err)
         goto error_release;
 
     return 0;
 
 error_release:
-    lights_device_unregister(&gpu_ctrl->lights);
+    lights_device_unregister(&ctrl->lights);
 
     return err;
 }
@@ -751,8 +731,8 @@ static uint8_t aura_gpu_count (
 static struct aura_gpu_controller *aura_gpu_controller_create (
     struct i2c_adapter *i2c_adapter
 ){
-    struct aura_gpu_controller *gpu_ctrl;
-    struct zone_context *zone_ctx;
+    struct aura_gpu_controller *ctrl;
+    struct aura_gpu_zone *zones;
     struct lights_adapter_client client;
     uint8_t zone_count = 1;
     error_t err;
@@ -762,27 +742,29 @@ static struct aura_gpu_controller *aura_gpu_controller_create (
     if (err)
         return err == -ENODEV ? NULL : ERR_PTR(err);
 
-    gpu_ctrl = kzalloc(sizeof(*gpu_ctrl), GFP_KERNEL);
-    if (!gpu_ctrl)
+    ctrl = kzalloc(sizeof(*ctrl), GFP_KERNEL);
+    if (!ctrl)
         return ERR_PTR(-ENOMEM);
 
-    gpu_ctrl->lights_client = client;
+    ctrl->lights_client = client;
 
-    err = lights_adapter_register(&gpu_ctrl->lights_client, 32);
+    err = lights_adapter_register(&ctrl->lights_client, 32);
     if (err) {
         AURA_DBG("Failed to register lights_adapter: %s", ERR_NAME(err));
         goto error_free_ctrl;
     }
 
-    zone_ctx = kzalloc(sizeof(*zone_ctx) * zone_count, GFP_KERNEL);
-    if (!zone_ctx) {
+    zones = kzalloc(sizeof(*zones) * zone_count, GFP_KERNEL);
+    if (!zones) {
         err = -ENOMEM;
         goto error_free_ctrl;
     }
 
-    zone_ctx[0].gpu_ctrl = gpu_ctrl;
+    lights_thunk_init(&zones[0].thunk, ZONE_HASH);
+    zones[0].ctrl = ctrl;
+
     /* Work around the const */
-    memcpy((void*)&zone_ctx[0].reg, &(struct zone_reg){
+    memcpy((void*)&zones[0].reg, &(struct zone_reg){
         .red   = AURA_GPU_RED_ADDR,
         .green = AURA_GPU_GREEN_ADDR,
         .blue  = AURA_GPU_BLUE_ADDR,
@@ -790,34 +772,34 @@ static struct aura_gpu_controller *aura_gpu_controller_create (
         .apply = AURA_GPU_APPLY_ADDR,
     }, sizeof(struct zone_reg));
 
-    err = aura_gpu_fetch_zone(&zone_ctx[0]);
+    err = aura_gpu_fetch_zone(&zones[0]);
     if (err)
         goto error_free_zone;
 
-    gpu_ctrl->zone_count = zone_count;
-    gpu_ctrl->zone_contexts = zone_ctx;
-    gpu_ctrl->id = aura_gpu_count();
+    ctrl->zone_count = zone_count;
+    ctrl->zones = zones;
+    ctrl->id = aura_gpu_count();
 
-    err = aura_gpu_create_fs(gpu_ctrl);
+    err = aura_gpu_create_fs(ctrl);
     if (err)
         goto error_free_zone;
 
-    list_add_tail(&gpu_ctrl->siblings, &aura_gpu_ctrl_list);
+    list_add_tail(&ctrl->siblings, &aura_gpu_ctrl_list);
 
     AURA_INFO(
         "Detected AURA capable GPU on '%s' at 0x%02x with Color: 0x%06x, Mode: %s",
         i2c_adapter->name,
-        gpu_ctrl->lights_client.i2c_client.addr,
-        gpu_ctrl->zone_contexts[0].color.value,
-        gpu_ctrl->zone_contexts[0].mode.name
+        ctrl->lights_client.i2c_client.addr,
+        ctrl->zones[0].effect.color.value,
+        ctrl->zones[0].effect.mode.name
     );
 
-    return gpu_ctrl;
+    return ctrl;
 
 error_free_zone:
-    kfree(zone_ctx);
+    kfree(zones);
 error_free_ctrl:
-    kfree(gpu_ctrl);
+    kfree(ctrl);
 
     return ERR_PTR(err);
 }
@@ -828,18 +810,18 @@ error_free_ctrl:
  * @gpu_ctrl: The controller to delete
  */
 static void aura_gpu_controller_destroy (
-    struct aura_gpu_controller *gpu_ctrl
+    struct aura_gpu_controller *ctrl
 ){
-    list_del(&gpu_ctrl->siblings);
+    list_del(&ctrl->siblings);
 
-    if (gpu_ctrl->zone_contexts) {
-        kfree(gpu_ctrl->zone_contexts);
+    if (ctrl->zones) {
+        kfree(ctrl->zones);
     }
 
-    lights_adapter_unregister(&gpu_ctrl->lights_client);
-    lights_device_unregister(&gpu_ctrl->lights);
+    lights_adapter_unregister(&ctrl->lights_client);
+    lights_device_unregister(&ctrl->lights);
 
-    kfree(gpu_ctrl);
+    kfree(ctrl);
 }
 
 
@@ -900,22 +882,14 @@ static void aura_gpu_adapter_destroy (
  */
 static error_t aura_gpu_probe_device (
     struct device *dev,
-    void *data
+    void *found
 ){
-    struct callback_data *cb_data = data;
     struct i2c_adapter *adapter = to_i2c_adapter(dev);
-    // struct aura_gpu_adapter *gpu_adapter;
     struct aura_gpu_controller *gpu_controller;
-    error_t err;
+    error_t err = 0;
 
-    if (dev->type != &i2c_adapter_type || cb_data->count >= MAX_SUPPORTED_GPUS)
-        return cb_data->count;
-
-    // gpu_adapter = aura_gpu_adapter_create(adapter, NULL);
-    // if (IS_ERR(gpu_adapter)) {
-    //     err = CLEAR_ERR(gpu_adapter);
-    //     goto error;
-    // }
+    if (dev->type != &i2c_adapter_type || *(int*)found >= MAX_SUPPORTED_GPUS)
+        return 0;
 
     gpu_controller = aura_gpu_controller_create(adapter);
     if (IS_ERR(gpu_controller)) {
@@ -928,17 +902,9 @@ static error_t aura_gpu_probe_device (
         goto error;
     }
 
-    AURA_DBG("Found %d controllers", cb_data->count);
-    cb_data->count++;
-
-    return cb_data->count;
+    *(int*)found += 1;
 
 error:
-    // if (gpu_adapter)
-    //     aura_gpu_adapter_destroy(gpu_adapter);
-
-    cb_data->error = err;
-
     return err;
 }
 
@@ -968,24 +934,19 @@ void aura_gpu_release (
  * @return: Zero or a negative error number
  */
 error_t aura_gpu_probe (
-    const struct lights_state *state
+    struct lights_state const *state
 ){
-    struct callback_data data = {0};
     struct i2c_adapter *adapters[MAX_SUPPORTED_GPUS];
     struct aura_gpu_adapter *gpu_adapter = NULL;
-    struct aura_gpu_controller *gpu_controller;
-    error_t err;
+    struct aura_gpu_controller *ctrl;
+    struct zone_effect effect;
     int adapter_count = 0;
-    int i = 0;
+    int i = 0, found = 0;
+    error_t err;
 
-    i2c_for_each_dev(&data, aura_gpu_probe_device);
-    if (data.error) {
-        err = data.error;
-        AURA_DBG("aura_gpu_probe_device() Failed with error %d", err);
-        goto error;
-    }
+    err = i2c_for_each_dev(&found, aura_gpu_probe_device);
 
-    if (data.count < MAX_SUPPORTED_GPUS) {
+    if (!err && found < MAX_SUPPORTED_GPUS) {
         AURA_DBG("Trying built-in drivers");
 
         adapter_count = gpu_adapters_create(adapters, ARRAY_SIZE(adapters));
@@ -995,13 +956,13 @@ error_t aura_gpu_probe (
         }
 
         for (i = 0; i < adapter_count; i++) {
-            gpu_controller = aura_gpu_controller_create(adapters[i]);
-            if (IS_ERR_OR_NULL(gpu_controller)) {
+            ctrl = aura_gpu_controller_create(adapters[i]);
+            if (IS_ERR_OR_NULL(ctrl)) {
                 gpu_adapter_destroy(adapters[i]);
                 adapters[i] = NULL;
 
-                if (gpu_controller) {
-                    err = CLEAR_ERR(gpu_controller);
+                if (ctrl) {
+                    err = CLEAR_ERR(ctrl);
                     goto error;
                 }
             } else {
@@ -1010,13 +971,25 @@ error_t aura_gpu_probe (
                     err = CLEAR_ERR(gpu_adapter);
                     goto error;
                 } else {
+                    found++;
                     adapters[i] = NULL;
                 }
             }
         }
     }
 
-    return data.count;
+    if (!err && found) {
+        effect.mode = state->mode;
+        effect.color = state->color;
+
+        list_for_each_entry(ctrl, &aura_gpu_ctrl_list, siblings) {
+            err = aura_gpu_controller_update(ctrl, &effect);
+            if (err)
+                goto error;
+        }
+    }
+
+    return err;
 
 error:
     for (i = 0; i < adapter_count; i++) {

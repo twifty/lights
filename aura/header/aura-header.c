@@ -22,7 +22,7 @@ MODULE_PARM_DESC(header_led_count, "An array of numbers representing the count o
 static inline struct aura_header_controller *aura_header_controller_get (
     void
 );
-static inline void aura_header_controller_put (
+static inline int aura_header_controller_put (
     struct aura_header_controller *ctrl
 );
 
@@ -53,7 +53,7 @@ enum aura_header_mode {
     INDEX_MODE_DIRECT               = INDEX_MODE_LAST + 2,
 };
 
-static const struct lights_mode aura_header_modes[] = {
+static struct lights_mode const aura_header_modes[] = {
     LIGHTS_MODE(OFF),
     LIGHTS_MODE(STATIC),
     LIGHTS_MODE(BREATHING),
@@ -75,7 +75,7 @@ static const struct lights_mode aura_header_modes[] = {
 };
 
 static error_t get_header_mode (
-    const struct lights_mode *mode,
+    struct lights_mode const *mode,
     enum aura_header_mode *header_mode
 ){
     if (lights_is_custom_mode(mode)) {
@@ -116,7 +116,7 @@ static error_t get_header_mode (
 }
 
 static uint8_t get_aura_mode (
-    const struct lights_mode *mode
+    struct lights_mode const *mode
 ){
     enum aura_header_mode aura_mode;
 
@@ -125,8 +125,7 @@ static uint8_t get_aura_mode (
     return (uint8_t)aura_mode;
 }
 
-__used
-static const struct lights_mode *get_lights_mode (
+static struct lights_mode const *get_lights_mode (
     enum aura_header_mode header_mode
 ){
     if (header_mode == AURA_MODE_CYCLE_RANDOM_FLICKER) {
@@ -156,8 +155,8 @@ enum HEADER_CONSTS {
 };
 
 enum HEADER_CONTROL {
-    MSG_CMD_DISABLE         = 0x00,
-    MSG_CMD_ENABLE          = 0x01,
+    MSG_CMD_ENABLE          = 0x00,
+    MSG_CMD_DISABLE         = 0x01,
 
     PACKET_CONTROL          = 0xEC,
     PACKET_CMD_READ         = 0x80,
@@ -265,10 +264,11 @@ struct aura_effect {
  *
  * @ctrl:        Owning controller
  * @lights:      Userland access
- * @effect:      Current settings
+ * @active:      Current effect
+ * @pending:     Effect in the process of being written
  * @msg_buffer:  Buffer for multi packet transfer
- * @effect_lock: Lock for reading/writing pplied effect
- * @buffer_lock: Lock for @msg_buffer
+ * @thunk:       Magic member for callbacks
+ * @lock:        Lock for reading/writing effects and buffer
  * @led_count:   Number of LEDs configured for this zone
  * @name:        Name of the zone (argb-strip-X)
  * @id:          Zero based index of the zone
@@ -277,16 +277,19 @@ struct aura_header_zone {
     struct aura_header_controller   *ctrl;
 
     struct lights_dev               lights;
-    struct aura_effect              effect;
+    struct aura_effect              active, pending;
     struct lights_adapter_msg       *msg_buffer;
-
-    spinlock_t                      effect_lock;
-    spinlock_t                      buffer_lock;
+    struct lights_thunk             thunk;
+    spinlock_t                      lock;
 
     uint16_t                        led_count;
     char                            name[16]; // "argb-strip-00"
     uint8_t                         id;
 };
+#define ZONE_HASH 'ZONE'
+#define zone_from_thunk(ptr) ( \
+    lights_thunk_container(ptr, struct aura_header_zone, thunk, ZONE_HASH) \
+)
 
 /**
  * struct aura_header_controller - Storage for multiple zones
@@ -320,11 +323,12 @@ struct aura_header_controller {
  * @connected: Flag to indicate if connected/disconnected
  */
 struct aura_header_container {
-    struct delayed_work             worker;
+    struct delayed_work             connect;
+    struct delayed_work             disconnect;
     struct lights_adapter_client    client;
     struct aura_header_controller   *ctrl;
     spinlock_t                      lock;
-    bool                            connected;
+    // bool                            connected;
 };
 
 /**
@@ -335,7 +339,7 @@ struct aura_header_container {
  * it will not be bound correctly.
  */
 static const char *driver_name = "aura-argb-headers";
-static const struct usb_device_id device_ids[] = {
+static struct usb_device_id const device_ids[] = {
     { USB_DEVICE(0x0b05, 0x1867) },
     { USB_DEVICE(0x0b05, 0x1872) },
     { } /* Terminating entry */
@@ -343,31 +347,17 @@ static const struct usb_device_id device_ids[] = {
 
 static struct aura_header_container global;
 
-static const struct aura_effect effect_direct = {
+static struct aura_effect const effect_direct = {
     .mode = aura_header_modes[INDEX_MODE_DIRECT]
 };
 
-static const struct aura_effect effect_default = {
-    .mode = aura_header_modes[AURA_MODE_RAINBOW]
+static struct aura_effect const effect_off = {
+    .mode = aura_header_modes[AURA_MODE_OFF]
 };
 
-static inline void zone_get_effect (
-    struct aura_header_zone *zone,
-    struct aura_effect *effect
-){
-    spin_lock(&zone->effect_lock);
-    memcpy(effect, &zone->effect, sizeof(*effect));
-    spin_unlock(&zone->effect_lock);
-}
-
-static inline void zone_set_effect (
-    struct aura_header_zone *zone,
-    const struct aura_effect *effect
-){
-    spin_lock(&zone->effect_lock);
-    memcpy(&zone->effect, effect, sizeof(*effect));
-    spin_unlock(&zone->effect_lock);
-}
+static struct aura_effect const effect_default = {
+    .mode = aura_header_modes[AURA_MODE_RAINBOW]
+};
 
 /**
  * usb_get_zone_count() - Fetches the number of available zones from device
@@ -540,8 +530,14 @@ static error_t usb_device_reset (
         return err;
     }
 
-    for (i = 0; i < ctrl->zone_count; i++)
-        zone_set_effect(&ctrl->zones[i], &effect_default);
+    for (i = 0; i < ctrl->zone_count; i++) {
+        spin_lock(&ctrl->zones[i].lock);
+
+        ctrl->zones[i].active  = effect_default;
+        ctrl->zones[i].pending = effect_default;
+
+        spin_unlock(&ctrl->zones[i].lock);
+    }
 
     return err;
 }
@@ -560,7 +556,7 @@ uint8_t aura_speeds[] = {0xFF, 0xCC, 0x99, 0x66, 0x33, 0x00};
 static int transfer_add_effect (
     struct lights_adapter_msg *msg,
     struct aura_header_zone *zone,
-    const struct aura_effect *effect
+    struct aura_effect const *effect
 ){
     /*
         The speed given should be an int between 0 (slowest) and 5 (fastest)
@@ -575,7 +571,7 @@ static int transfer_add_effect (
     packet->data.effect.red          = effect->color.r;
     packet->data.effect.green        = effect->color.g;
     packet->data.effect.blue         = effect->color.b;
-    packet->data.effect.direction    = effect->direction;
+    packet->data.effect.direction    = effect->direction & 0x01;
     packet->data.effect.speed        = aura_speeds[effect->speed];
 
     return 1;
@@ -647,7 +643,7 @@ static int transfer_add_direct (
    struct lights_adapter_msg *msg,
    struct aura_header_zone *zone,
    uint8_t command,
-   struct lights_color *colors,
+   struct lights_color const *colors,
    uint8_t color_count
 ){
    struct packet_data *packet;
@@ -682,7 +678,7 @@ static int transfer_add_direct (
 
        for (i = 0; i < direct->count; i++) {
            if (colors) {
-               lights_color_write(colors, &direct->value[i * 3]);
+               lights_color_write_rgb(colors, &direct->value[i * 3]);
            } else {
                memset(&direct->value[i * 3], 0, 3);
            }
@@ -722,24 +718,31 @@ static int transfer_add_enable (
     return 1;
 }
 
+
 /**
- * zone_set_callback() - Async completion handler
+ * aura_header_zone_update_callback() - Async completion handler
  *
  * @result: Packets sent
- * @data:   Context
+ * @thunk:  Context
  * @error:  Error encountered while transfering data
  */
-static void zone_set_callback (
+static void aura_header_zone_update_callback (
     struct lights_adapter_msg const * const result,
-    void *data,
+    struct lights_thunk *thunk,
     error_t error
 ){
-    struct aura_header_zone *zone = data;
-    const struct lights_adapter_msg *iter = result;
-    const struct packet_data *packet;
-    const struct lights_mode *mode;
+    struct aura_header_zone *zone = zone_from_thunk(thunk);
+    struct lights_adapter_msg const *iter = result;
+    struct packet_data const *packet;
+    struct lights_mode const *mode;
     struct aura_effect effect = {0};
+    bool disable = false;
     int i;
+
+    AURA_DBG("in callback");
+
+    if (IS_NULL(result, thunk, zone))
+        return;
 
     if (error) {
         AURA_DBG("Failed to apply update: %s", ERR_NAME(error));
@@ -747,9 +750,11 @@ static void zone_set_callback (
     }
 
     packet = packet_cast(iter);
+    if (MSG_CMD_DISABLE == lights_adapter_msg_read_flags(iter))
+        disable = true;
 
     if (PACKET_CMD_ENABLE == packet->command) {
-        iter = packet_cast(iter->next);
+        iter = iter->next;
         if (!iter) {
             AURA_ERR("Expected second message following 'PACKET_CMD_ENABLE'");
             return;
@@ -758,7 +763,7 @@ static void zone_set_callback (
     }
 
     if (PACKET_CMD_EFFECT == packet->command) {
-        if (MSG_CMD_DISABLE == iter->command)
+        if (disable)
             mode = get_lights_mode(AURA_MODE_OFF);
         else
             mode = get_lights_mode(packet->data.effect.mode);
@@ -782,421 +787,332 @@ static void zone_set_callback (
         effect.color.b   = packet->data.effect.blue;
 
         effect_dump("Applying effect: ", &effect);
-        zone_set_effect(zone, &effect);
+
+        spin_lock(&zone->lock);
+        zone->active = effect;
+        spin_unlock(&zone->lock);
+    } else {
+        AURA_ERR("Unexpected packet type: %x", packet->command);
+        packet_dump("packet 2 post:", packet);
     }
 }
 
 /**
- * zone_set_mode() - Applies a mode to a zone
+ * aura_header_zone_update() - Begins an async transaction
  *
- * @zone: Zone to update
- * @mode: Mode to apply
+ * @zone:   Zone being updated
+ * @effect: Optional new effect to apply
+ * @colors: Optional colors for direct mode
  *
  * @return: Error code
+ *
+ * This function expects a zone lock to already be in place.
  */
-static error_t zone_set_mode (
+static error_t aura_header_zone_update (
     struct aura_header_zone *zone,
-    const struct lights_mode *mode
+    struct aura_effect const *effect,
+    struct lights_color const *colors
 ){
-    enum aura_header_mode header_mode;
-    struct aura_effect effect;
+    bool update_colors = false;
+    size_t count = 0;
     error_t err;
-    int count = 0;
+    int i;
 
-    err = get_header_mode(mode, &header_mode);
-    if (err)
-        return err;
+    if (IS_NULL(zone))
+        return -EINVAL;
 
-    zone_get_effect(zone, &effect);
+    if (effect) {
+        effect_dump("aura_header_zone_update() ", effect);
 
-    if (header_mode == get_aura_mode(&effect.mode))
-        return 0;
+        /* If pending.mode is off, send enable */
+        if (AURA_MODE_OFF == get_aura_mode(&zone->pending.mode)) {
+            count += transfer_add_enable(
+                &zone->msg_buffer[count],
+                zone,
+                true
+            );
+        }
 
-    spin_lock(&zone->buffer_lock);
+        count += transfer_add_effect(
+            &zone->msg_buffer[count],
+            zone,
+            effect
+        );
 
-    switch (header_mode) {
-        case AURA_MODE_OFF:
-        case AURA_MODE_DIRECT:
-            count += transfer_add_effect(&zone->msg_buffer[count], zone, &effect_direct);
-            count += transfer_add_direct(&zone->msg_buffer[count], zone, PACKET_CMD_DIRECT, NULL, zone->led_count);
-
-            /*
-             * The command field is not used by the usb driver, so we can use
-             * it as a flag. Here we let the callback know the mode is OFF.
-             */
-            if (AURA_MODE_OFF == header_mode)
-                zone->msg_buffer[0].command = MSG_CMD_DISABLE;
-            break;
-
-        default:
-            if (AURA_MODE_OFF == get_aura_mode(&effect.mode))
-                count += transfer_add_enable(&zone->msg_buffer[count], zone, true);
-
-            effect.mode = *mode;
-            count += transfer_add_effect(&zone->msg_buffer[count], zone, &effect);
-            break;
+        switch (get_aura_mode(&effect->mode)) {
+            case AURA_MODE_OFF:
+                lights_adapter_msg_write_flags(&zone->msg_buffer[0], MSG_CMD_DISABLE);
+                update_colors = true;
+                break;
+            case AURA_MODE_DIRECT:
+                update_colors = true;
+                break;
+            default:
+                break;
+        }
     }
 
-    err = lights_adapter_xfer_async(
-        &global.client,
-        zone->msg_buffer,
-        count,
-        zone,
-        zone_set_callback
-    );
+    if (colors || update_colors) {
+        count += transfer_add_direct(
+            &zone->msg_buffer[count],
+            zone,
+            PACKET_CMD_DIRECT,
+            colors,
+            zone->led_count
+        );
+    }
 
-    spin_unlock(&zone->buffer_lock);
+    if (count) {
+        AURA_DBG("Transfering %ld packets", count);
+        for (i = 0; i < count; i++)
+            packet_dump("packet:", &zone->msg_buffer[i]);
+
+        err = lights_adapter_xfer_async(
+            &global.client,
+            zone->msg_buffer,
+            count,
+            &zone->thunk,
+            aura_header_zone_update_callback
+        );
+    } else {
+        err = -EINVAL;
+    }
+
+    /* Update the pending effect */
+    if (!err && effect)
+        zone->pending = *effect;
 
     return err;
 }
 
 /**
- * zone_set_color() - Applies a color to a zone
+ * aura_header_zone_write() - Userland write handler
  *
- * @zone:  Zone to update
- * @color: Color to apply
+ * @thunk: Zone being updated
+ * @state: New state to apply to the zone
  *
  * @return: Error code
  */
-static error_t zone_set_color (
-    struct aura_header_zone *zone,
-    const struct lights_color *color
+static error_t aura_header_zone_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_header_zone *zone = zone_from_thunk(thunk);
+    struct lights_color const *colors = NULL;
+    struct aura_effect effect;
+    enum aura_header_mode header_mode;
+    uint8_t speed, direction;
+    bool update_effect = false;
+    bool update_colors = false;
+    error_t err;
+
+    if (IS_NULL(thunk, state, zone))
+        return -EINVAL;
+
+    spin_lock(&zone->lock);
+
+    effect = zone->pending;
+
+    if (state->type & LIGHTS_TYPE_COLOR) {
+        if (!lights_color_equal(&state->color, &effect.color)) {
+            effect.color = state->color;
+            update_effect = true;
+        }
+    }
+
+    if (state->type & LIGHTS_TYPE_SPEED) {
+        speed = max_t(uint8_t, state->speed, 5);
+
+        if (speed != effect.speed) {
+            effect.speed = speed;
+            update_effect = true;
+        }
+    }
+
+    if (state->type & LIGHTS_TYPE_DIRECTION) {
+        direction = max_t(uint8_t, state->direction, 1);
+
+        if (direction != effect.direction) {
+            effect.direction = direction;
+            update_effect = true;
+        }
+    }
+
+    if (state->type & LIGHTS_TYPE_MODE) {
+        err = get_header_mode(&state->mode, &header_mode);
+        if (err) {
+            AURA_ERR("state.mode is invalid");
+            goto exit;
+        }
+
+        /* Return early if mode isn't changing */
+        if (header_mode != get_aura_mode(&zone->pending.mode)) {
+            switch (header_mode) {
+                case AURA_MODE_OFF:
+                    /* Overwrite above changes */
+                    effect = effect_off;
+                    update_colors = true;
+                    break;
+
+                case AURA_MODE_DIRECT:
+                    /* Overwrite above changes */
+                    effect = effect_direct;
+                    update_colors = true;
+                    break;
+
+                default:
+                    effect.mode = state->mode;
+                    break;
+            }
+            update_effect = true;
+        }
+    }
+
+    if (state->type & LIGHTS_TYPE_LEDS) {
+        if (AURA_MODE_DIRECT != get_aura_mode(&effect.mode)) {
+            AURA_ERR("LED colors cannot be applied to mode '%s'", effect.mode.name);
+            err = -EPERM;
+            goto exit;
+        }
+        if (IS_TRUE(state->raw.length != zone->led_count)) {
+            err = -EINVAL;
+            goto exit;
+        }
+        if (IS_NULL(state->raw.data)) {
+            err = -EINVAL;
+            goto exit;
+        }
+        colors = state->raw.data;
+        update_colors = true;
+    }
+
+    err = aura_header_zone_update(
+        zone,
+        update_effect ? &effect : NULL,
+        update_colors ? colors : NULL
+    );
+
+exit:
+    spin_unlock(&zone->lock);
+
+    return err;
+}
+
+/**
+ * aura_header_zone_read() - Userland read handler
+ *
+ * @thunk: Zone being read
+ * @state: Buffer to write effect values into
+ *
+ * @return: Error code
+ */
+static error_t aura_header_zone_read (
+    struct lights_thunk *thunk,
+    struct lights_state *state
+){
+    struct aura_header_zone *zone = zone_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, zone) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    spin_lock(&zone->lock);
+
+    if (state->type & LIGHTS_TYPE_MODE)
+        state->mode = zone->active.mode;
+
+    if (state->type & LIGHTS_TYPE_COLOR)
+        state->color = zone->active.color;
+
+    if (state->type & LIGHTS_TYPE_SPEED)
+        state->speed = zone->active.speed;
+
+    if (state->type & LIGHTS_TYPE_DIRECTION)
+        state->direction = zone->active.direction;
+
+    spin_unlock(&zone->lock);
+
+    return 0;
+}
+
+
+/**
+ * aura_header_controller_update() - Applies global state to all zones
+ *
+ * @ctrl: Ctrl to update
+ *
+ * @return: Error code
+ */
+static error_t aura_header_controller_update (
+    struct aura_header_controller *ctrl
 ){
     struct lights_adapter_msg msg;
+    struct lights_state state;
     struct aura_effect effect;
+    enum aura_header_mode header_mode;
     error_t err = 0;
+    int i;
 
-    zone_get_effect(zone, &effect);
-
-    if (lights_color_equal(color, &effect.color))
-        return 0;
-
-    effect.color = *color;
-    transfer_add_effect(&msg, zone, &effect);
-
-    err = lights_adapter_xfer_async(
-        &global.client,
-        &msg,
-        1,
-        zone,
-        zone_set_callback
-    );
-
-    return err;
-}
-
-/**
- * zone_set_speed() - Applies a speed to a zone
- *
- * @zone:  Zone to update
- * @speed: Speed to apply (value between 0 and 5 inclusive)
- *
- * @return: Error code
- */
-static error_t zone_set_speed (
-    struct aura_header_zone *zone,
-    uint8_t speed
-){
-    struct lights_adapter_msg msg;
-    struct aura_effect effect;
-    error_t err = 0;
-
-    zone_get_effect(zone, &effect);
-
-    if (speed > MAX_SPEED_VALUE)
-        speed = 5;
-
-    if (speed == effect.speed)
-        return 0;
-
-    effect.speed = speed;
-    transfer_add_effect(&msg, zone, &effect);
-
-    err = lights_adapter_xfer_async(
-        &global.client,
-        &msg,
-        1,
-        zone,
-        zone_set_callback
-    );
-
-    return err;
-}
-
-/**
- * zone_set_direction() - Applies a direction to a zone
- *
- * @zone:      Zone to update
- * @direction: 0 or 1 indicating direction
- *
- * @return: Error code
- */
-static error_t zone_set_direction (
-    struct aura_header_zone *zone,
-    uint8_t direction
-){
-    struct lights_adapter_msg msg;
-    struct aura_effect effect;
-    error_t err = 0;
-
-    zone_get_effect(zone, &effect);
-
-    if (direction > 1)
-        direction = 1;
-    if (direction == effect.direction)
-        return 0;
-
-    effect.direction = direction;
-    transfer_add_effect(&msg, zone, &effect);
-
-    err = lights_adapter_xfer_async(
-        &global.client,
-        &msg,
-        1,
-        zone,
-        zone_set_callback
-    );
-
-    return err;
-}
-
-/**
- * zone_set_direct() - Applies color to all LEDs in a zone
- *
- * @zone:   Zone to update
- * @buffer: Array of RGB triplets
- *
- * @return: Error code
- */
-static error_t zone_set_direct (
-    struct aura_header_zone *zone,
-    const struct lights_buffer *buffer
-){
-    error_t err = 0;
-    int count;
-
-    if (buffer->length != zone->led_count)
+    if (IS_NULL(ctrl))
         return -EINVAL;
 
-    spin_lock(&zone->buffer_lock);
+    lights_get_state(&state);
 
-    count = transfer_add_direct(
-        zone->msg_buffer,
-        zone,
-        PACKET_CMD_DIRECT,
-        buffer->data,
-        zone->led_count
-    );
+    for (i = 0; i < ctrl->zone_count && !err; i++) {
+        effect = ctrl->zones[i].pending;
 
-    err = lights_adapter_xfer_async(
-        &global.client,
-        zone->msg_buffer,
-        count,
-        zone,
-        zone_set_callback
-    );
+        if (state.type & LIGHTS_TYPE_COLOR)
+            effect.color = state.color;
 
-    spin_unlock(&zone->buffer_lock);
+        if (state.type & LIGHTS_TYPE_SPEED)
+            effect.speed = max_t(uint8_t, state.speed, 5);
 
-    return err;
-}
+        if (state.type & LIGHTS_TYPE_DIRECTION)
+            effect.direction = max_t(uint8_t, state.direction, 1);
 
-/**
- * aura_header_color_read() - Reads a zones color
- *
- * @data:  Zone to read
- * @state: Buffer to write value
- *
- * @return: Error code
- */
-static error_t aura_header_color_read (
-    void *data,
-    struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
+        if (state.type & LIGHTS_TYPE_MODE) {
+            err = get_header_mode(&state.mode, &header_mode);
+            if (err) {
+                AURA_ERR("state.mode is invalid");
+                return err;
+            }
 
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
-        return -EINVAL;
+            switch (header_mode) {
+                case AURA_MODE_OFF:
+                    /* Overwrite above changes */
+                    effect = effect_off;
+                    break;
 
-    spin_lock(&zone->effect_lock);
-    state->color = zone->effect.color;
-    spin_unlock(&zone->effect_lock);
+                case AURA_MODE_DIRECT:
+                    /* Overwrite above changes */
+                    effect = effect_direct;
+                    break;
+
+                default:
+                    effect.mode = state.mode;
+                    break;
+            }
+        }
+
+        transfer_add_effect(
+            &msg,
+            &ctrl->zones[i],
+            &effect
+        );
+
+        err = lights_adapter_xfer(&global.client, &msg, 1);
+        if (err) {
+            AURA_DBG("read failed with %d", err);
+            return err;
+        }
+
+        if (!err) {
+            ctrl->zones[i].active = effect;
+            ctrl->zones[i].pending = effect;
+        }
+    }
 
     return 0;
 }
-
-/**
- * aura_header_color_write() - Writes a zones color
- *
- * @data:  Zone to write
- * @state: Buffer containing new value
- *
- * @return: Error code
- */
-static error_t aura_header_color_write (
-    void *data,
-    const struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return zone_set_color(zone, &state->color);
-}
-
-/**
- * aura_header_mode_read() - Reads a zones mode
- *
- * @data:  Zone to read
- * @state: Buffer to write value
- *
- * @return: Error code
- */
-static error_t aura_header_mode_read (
-    void *data,
-    struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    spin_lock(&zone->effect_lock);
-    state->mode = zone->effect.mode;
-    spin_unlock(&zone->effect_lock);
-
-    return 0;
-}
-
-/**
- * aura_header_mode_write() - Writes a zones mode
- *
- * @data:  Zone to write
- * @state: Buffer containing new value
- *
- * @return: Error code
- */
-static error_t aura_header_mode_write (
-    void *data,
-    const struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return zone_set_mode(zone, &state->mode);
-}
-
-/**
- * aura_header_speed_read() - Reads a zones speed
- *
- * @data:  Zone to read
- * @state: Buffer to write value
- *
- * @return: Error code
- */
-static error_t aura_header_speed_read (
-    void *data,
-    struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_SPEED))
-        return -EINVAL;
-
-    spin_lock(&zone->effect_lock);
-    state->speed = zone->effect.speed;
-    spin_unlock(&zone->effect_lock);
-
-    return 0;
-}
-
-/**
- * aura_header_speed_write() - Writes a zones speed
- *
- * @data:  Zone to write
- * @state: Buffer containing new value
- *
- * @return: Error code
- */
-static error_t aura_header_speed_write (
-    void *data,
-    const struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_SPEED))
-        return -EINVAL;
-
-    return zone_set_speed(zone, state->speed);
-}
-
-/**
- * aura_header_direction_read() - Reads a zones direction
- *
- * @data:  Zone to read
- * @state: Buffer to write value
- *
- * @return: Error code
- */
-static error_t aura_header_direction_read (
-    void *data,
-    struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_DIRECTION))
-        return -EINVAL;
-
-    spin_lock(&zone->effect_lock);
-    state->direction = zone->effect.direction;
-    spin_unlock(&zone->effect_lock);
-
-    return 0;
-}
-
-/**
- * aura_header_direction_write() - Writes a zones direction
- *
- * @data:  Zone to write
- * @state: Buffer containing new value
- *
- * @return: Error code
- */
-static error_t aura_header_direction_write (
-    void *data,
-    const struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_DIRECTION))
-        return -EINVAL;
-
-    return zone_set_direction(zone, state->direction);
-}
-
-/**
- * aura_header_leds_write() - Writes raw RGB values to a zone
- *
- * @data:  Zone to update
- * @state: Buffer containing RGB values
- *
- * @return: Error code
- */
-static error_t aura_header_leds_write (
-    void *data,
-    const struct lights_state *state
-){
-    struct aura_header_zone *zone = data;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_LEDS))
-        return -EINVAL;
-
-    return zone_set_direct(zone, &state->raw);
-}
-
 
 /**
  * aura_header_zone_release() - Releases memory contained within a zone
@@ -1225,36 +1141,43 @@ static error_t aura_header_zone_init (
     uint8_t index
 ){
     struct aura_header_zone *zone = &ctrl->zones[index];
-    const struct lights_io_attribute attrs[] = {
+    struct lights_io_attribute const attrs[] = {
         LIGHTS_MODE_ATTR(
-            zone,
-            aura_header_mode_read,
-            aura_header_mode_write
+            &zone->thunk,
+            aura_header_zone_read,
+            aura_header_zone_write
         ),
         LIGHTS_COLOR_ATTR(
-            zone,
-            aura_header_color_read,
-            aura_header_color_write
+            &zone->thunk,
+            aura_header_zone_read,
+            aura_header_zone_write
         ),
         LIGHTS_SPEED_ATTR(
-            zone,
-            aura_header_speed_read,
-            aura_header_speed_write
+            &zone->thunk,
+            aura_header_zone_read,
+            aura_header_zone_write
         ),
         LIGHTS_DIRECTION_ATTR(
-            zone,
-            aura_header_direction_read,
-            aura_header_direction_write
+            &zone->thunk,
+            aura_header_zone_read,
+            aura_header_zone_write
         ),
         LIGHTS_LEDS_ATTR(
-            zone,
-            aura_header_leds_write
+            &zone->thunk,
+            aura_header_zone_write
+        ),
+        LIGHTS_UPDATE_ATTR(
+            &zone->thunk,
+            aura_header_zone_write
         )
     };
     error_t err;
 
     if (index >= MAX_HEADER_COUNT)
         return -EINVAL;
+
+    lights_thunk_init(&zone->thunk, ZONE_HASH);
+    spin_lock_init(&zone->lock);
 
     zone->id = index;
     zone->ctrl = ctrl;
@@ -1268,9 +1191,6 @@ static error_t aura_header_zone_init (
     );
     if (!zone->msg_buffer)
         return -ENOMEM;
-
-    spin_lock_init(&zone->effect_lock);
-    spin_lock_init(&zone->buffer_lock);
 
     snprintf(zone->name, sizeof(zone->name), "argb-strip-%d", index);
     AURA_DBG("Creating sysfs for '%s'", zone->name);
@@ -1317,6 +1237,7 @@ static struct aura_header_controller *aura_header_controller_create (
     void
 ){
     struct aura_header_controller *ctrl;
+    // struct lights_state state;
     uint8_t i;
     error_t err;
 
@@ -1348,10 +1269,19 @@ static struct aura_header_controller *aura_header_controller_create (
             goto error_free;
     }
 
-    /* Set device and all zones into a known state */
+    /*
+     * Set device and all zones into a known state. If this is the first
+     * call on a fresh boot, the underlying device will disconnect and
+     * reconnect with a new device number. But, we have no way of knowing
+     * when that will happen.
+     */
     err = usb_device_reset(ctrl);
     if (err)
         goto error_free;
+
+    /* Apply any global state, ASYNC cannot be used */
+    // lights_get_state(&state);
+    // aura_header_controller_update(ctrl, &state);
 
     AURA_DBG("Created AURA header controller");
 
@@ -1374,7 +1304,7 @@ static inline struct aura_header_controller *aura_header_controller_get (
     struct aura_header_controller *ctrl = NULL;
 
     spin_lock(&global.lock);
-    if (global.connected && global.ctrl) {
+    if (global.ctrl) {
         ctrl = global.ctrl;
         kref_get(&ctrl->refs);
     }
@@ -1400,11 +1330,55 @@ static void aura_header_controller_put_kref (
  * aura_header_controller_put() - Returns a reference counted handle
  *
  * @ctrl: Controller
+ *
+ * @return: 1 if ctrl was destroyed. 0 otherwise
  */
-static inline void aura_header_controller_put (
+static inline int aura_header_controller_put (
     struct aura_header_controller *ctrl
 ){
-    kref_put(&ctrl->refs, aura_header_controller_put_kref);
+    return kref_put(&ctrl->refs, aura_header_controller_put_kref);
+}
+
+/**
+ * aura_header_driver_connect_worker() - Updates a connected controller
+ *
+ * @work: Delayed work job
+ */
+static void aura_header_driver_connect_worker (
+    struct work_struct *work
+){
+    struct aura_header_controller *ctrl;
+    error_t err;
+
+    ctrl = aura_header_controller_get();
+    if (ctrl) {
+        err = aura_header_controller_update(ctrl);
+        if (err) {
+            AURA_ERR("Failed to apply state to controller: %s", ERR_NAME(err));
+        }
+
+        aura_header_controller_put(ctrl);
+    }
+}
+
+/**
+ * aura_header_driver_disconnect_worker() - Destroys a disconnected controller
+ *
+ * @work: Delayed work job
+ */
+static void aura_header_driver_disconnect_worker (
+    struct work_struct *work
+){
+    spin_lock(&global.lock);
+
+    if (global.ctrl && aura_header_controller_put(global.ctrl)) {
+        AURA_INFO("Destroyed global controller");
+        global.ctrl = NULL;
+    } else if (global.ctrl) {
+        AURA_INFO("Released handle (refs %d)", kref_read(&global.ctrl->refs));
+    }
+
+    spin_unlock(&global.lock);
 }
 
 /**
@@ -1415,43 +1389,56 @@ static inline void aura_header_controller_put (
 static void aura_header_driver_on_connect (
     struct usb_client *client
 ){
+    struct aura_header_controller *ctrl;
     bool create = false;
 
     spin_lock(&global.lock);
-    if (!global.connected) {
-        create = !global.ctrl;
-        global.connected = true;
+    if (global.ctrl) {
+        /*
+         * A previous device disconnected but the 5 second
+         * destructor has not yet been invoked. Increase
+         * the ref count to cancel the destruction.
+         */
+         kref_get(&global.ctrl->refs);
+         AURA_INFO("Using existing USB controller (refs: %d)", kref_read(&global.ctrl->refs));
+    } else {
+        /*
+         * A previous controller was either destroyed or
+         * not yet created. Since both connect/disconnect
+         * are mutually exclusive, we don't need to worry
+         * about contention
+         */
+         create = true;
     }
     spin_unlock(&global.lock);
 
+    /*
+     * When a controller is created it needs the global state applying to it.
+     * The problem is that when it's created on a fresh boot, the device
+     * disconnects, and upon reconnection it is set back to its default state.
+     *
+     * Applying a state in this instance, causes it to be removed upon
+     * reconnection. Applying again after reconnections makes for an
+     * unappealing sight. Race conditions also exist.
+     *
+     * There is no way to detect if the device will disconnect, nor can we
+     * sleep the current thread. We need to delay the state update until
+     * either enough time has passed or a reconnect event is detected.
+     */
     if (create) {
-        global.ctrl = aura_header_controller_create();
-        if (IS_ERR(global.ctrl)) {
-            CLEAR_ERR(global.ctrl);
-            global.connected = false;
+        ctrl = aura_header_controller_create();
+        if (IS_ERR(ctrl)) {
+            CLEAR_ERR(ctrl);
+            return;
         }
+
+        global.ctrl = ctrl;
+        AURA_INFO("Created global USB controller (refs: %d)", kref_read(&global.ctrl->refs));
+
+        queue_delayed_work(system_wq, &global.connect, 1 * HZ);
+    } else {
+        mod_delayed_work(system_wq, &global.connect, 0);
     }
-}
-
-/**
- * aura_header_driver_work_callback() - Destroyes a disconnected controller
- *
- * @work: Delayed work job
- */
-static void aura_header_driver_work_callback (
-    struct work_struct *work
-){
-    struct aura_header_controller *ctrl = NULL;
-
-    spin_lock(&global.lock);
-    if (false == global.connected) {
-        ctrl = global.ctrl;
-        global.ctrl = NULL;
-    }
-    spin_unlock(&global.lock);
-
-    if (ctrl)
-        aura_header_controller_put(ctrl);
 }
 
 /**
@@ -1468,14 +1455,15 @@ static void aura_header_driver_on_disconnect (
     bool schedule = false;
 
     spin_lock(&global.lock);
-    if (true == global.connected) {
-        global.connected = false;
-        schedule = true;
-    }
+    schedule = global.ctrl;
     spin_unlock(&global.lock);
 
-    if (schedule)
-        schedule_delayed_work(&global.worker, 5 * HZ);
+    if (schedule) {
+        AURA_INFO("Scheduling destruction");
+        schedule_delayed_work(&global.disconnect, 5 * HZ);
+    } else {
+        AURA_INFO("No controller to destruct");
+    }
 }
 
 /**
@@ -1486,21 +1474,21 @@ static void aura_header_driver_on_disconnect (
  * @return: Error code
  */
 error_t aura_header_probe (
-    const struct lights_state *state
+    struct lights_state const *state
 ){
     struct usb_client usb = {
         .name = driver_name,
         .packet_size = PACKET_SIZE,
         .ids = device_ids,
-        .onConnect = aura_header_driver_on_connect,
-        .onDisconnect = aura_header_driver_on_disconnect,
+        .on_connect = aura_header_driver_on_connect,
+        .on_disconnect = aura_header_driver_on_disconnect,
     };
 
     LIGHTS_USB_CLIENT_INIT(&global.client, &usb);
-    INIT_DELAYED_WORK(&global.worker, aura_header_driver_work_callback);
+    INIT_DELAYED_WORK(&global.connect, aura_header_driver_connect_worker);
+    INIT_DELAYED_WORK(&global.disconnect, aura_header_driver_disconnect_worker);
     spin_lock_init(&global.lock);
     global.ctrl = NULL;
-    global.connected = false;
 
     return lights_adapter_register(&global.client, 32);
 }
@@ -1513,14 +1501,19 @@ void aura_header_release (
 ){
     struct aura_header_controller *ctrl = NULL;
 
+    /* Remove here to prevent 5 second delay */
     spin_lock(&global.lock);
-    global.connected = false;
     ctrl = global.ctrl;
     global.ctrl = NULL;
     spin_unlock(&global.lock);
 
-    if (ctrl)
-        aura_header_controller_put(ctrl);
+    if (ctrl && aura_header_controller_put(ctrl))
+        AURA_INFO("Destroyed global controller");
 
-    lights_adapter_unregister(&global.client);
+    if (lights_adapter_is_registered(&global.client))
+        /* This should cause an on_disconnect event */
+        lights_adapter_unregister(&global.client);
+
+    cancel_delayed_work_sync(&global.connect);
+    cancel_delayed_work_sync(&global.disconnect);
 }

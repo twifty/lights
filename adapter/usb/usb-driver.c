@@ -24,7 +24,7 @@
         len );      \
 })
 
-static const struct file_operations usb_fops = {
+static struct file_operations const usb_fops = {
     .owner = THIS_MODULE,
 };
 
@@ -200,10 +200,10 @@ static void usb_controller_destroy (
  * @return: True or False
  */
 static inline bool usb_container_match (
-    const struct usb_controller *ctrl,
-    const struct usb_device_id *id
+    struct usb_controller const *ctrl,
+    struct usb_device_id const *id
 ){
-    const struct usb_device_id *iter;
+    struct usb_device_id const *iter;
 
     for (
         iter = ctrl->usb_driver.id_table;
@@ -256,7 +256,7 @@ static inline bool usb_container_match (
  * @return: Null or a reference counted node instance
  */
 static struct usb_controller *usb_store_find_controller_by_id (
-    const struct usb_device_id *id
+    struct usb_device_id const *id
 ){
     struct usb_controller *ctrl;
 
@@ -352,7 +352,7 @@ static struct usb_context *usb_controller_find_context (
  * @return: Context or an error code
  */
 static struct usb_context *usb_store_find_context (
-    const struct usb_client *client
+    struct usb_client const *client
 ){
     struct usb_controller *ctrl;
 
@@ -472,16 +472,16 @@ static int usb_controller_callback_create (
     for (type = CALLBACK_FIRST; type <= CALLBACK_LAST; type <<= 1) {
         switch (type) {
             case CALLBACK_CONNECT:
-                func = client->onConnect;
+                func = client->on_connect;
                 break;
             case CALLBACK_DISCONNECT:
-                func = client->onDisconnect;
+                func = client->on_disconnect;
                 break;
             case CALLBACK_SUSPEND:
-                func = client->onSuspend;
+                func = client->on_suspend;
                 break;
             case CALLBACK_RESUME:
-                func = client->onResume;
+                func = client->on_resume;
                 break;
         }
 
@@ -691,7 +691,7 @@ static void usb_context_write_packet_callback (
  */
 static error_t usb_context_write_packet (
     struct usb_context *context,
-    const struct usb_packet *packet
+    struct usb_packet const *packet
 ){
     size_t packet_size = context->packet_size;
     error_t err;
@@ -829,7 +829,7 @@ static error_t usb_context_read_packet (
  */
 static error_t usb_context_read_write (
     struct usb_context *context,
-    const struct usb_packet *packet,
+    struct usb_packet const *packet,
     bool do_read
 ){
     error_t err = 0;
@@ -845,8 +845,10 @@ static error_t usb_context_read_write (
     if (err)
         goto error_out;
 
-    if (STATE_IDLE != read_state(context))
+    if (STATE_IDLE != read_state(context)) {
+        err = -EIO;
         goto error_out;
+    }
 
     /* Send the packet */
     err = usb_context_write_packet(context, packet);
@@ -967,7 +969,7 @@ error:
  */
 static int usb_driver_connect (
     struct usb_interface *intf,
-    const struct usb_device_id *id
+    struct usb_device_id const *id
 ){
     struct usb_controller *ctrl;
     int ret;
@@ -1152,7 +1154,7 @@ static int usb_driver_post_reset (
  * @return: Error code
  */
 error_t usb_read_packet (
-    const struct usb_client *client,
+    struct usb_client const *client,
     struct usb_packet *packet
 ){
     struct usb_context *context;
@@ -1180,8 +1182,8 @@ error_t usb_read_packet (
  * @return: Error code
  */
 error_t usb_write_packet (
-    const struct usb_client *client,
-    const struct usb_packet *packet
+    struct usb_client const *client,
+    struct usb_packet const *packet
 ){
     struct usb_context *context;
     error_t err;
@@ -1208,7 +1210,7 @@ error_t usb_write_packet (
  * @return: Reference counted node or an Error Code
  */
 static struct usb_controller *usb_store_create_controller (
-    const struct usb_client *client
+    struct usb_client const *client
 ){
     struct usb_controller *ctrl, *iter;
     size_t name_len;

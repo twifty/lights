@@ -184,7 +184,7 @@ static uint32_t nuvoton_func (
         I2C_FUNC_SMBUS_BLOCK_DATA;
 }
 
-static const struct i2c_algorithm nuvoton_algorithm = {
+static struct i2c_algorithm const nuvoton_algorithm = {
     .smbus_xfer     = nuvoton_transfer,
     .functionality  = nuvoton_func,
 };
@@ -192,7 +192,7 @@ static const struct i2c_algorithm nuvoton_algorithm = {
 static error_t nuvoton_read_smba (
     uint16_t *smba
 ){
-    const struct chip_id *chip;
+    struct chip_id const *chip;
     uint8_t super_io_addr[2] = { 0x2e, 0x4e };
     uint8_t addr;
     uint16_t value;

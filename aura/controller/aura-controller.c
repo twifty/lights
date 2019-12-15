@@ -3,15 +3,10 @@
 #include <linux/kref.h>
 
 #include <adapter/lights-adapter.h>
-#include <adapter/lib/reserve.h>
 #include "aura-controller.h"
 
 #define AURA_APPLY_VAL 0x01
 
-/**
- * enum aura_registers - [description]
- *
- */
 enum aura_registers {
     AURA_REG_DEVICE_NAME        = 0x1000,   /* Device String 16 bytes               */
     AURA_REG_COLORS_DIRECT_EC1  = 0x8000,   /* Colors for Direct Mode 15 bytes      */
@@ -88,7 +83,16 @@ struct aura_zone_context {
     struct lights_color             *effect;
     struct lights_color             *direct;
     struct aura_controller_context  *context;
+
+    struct lights_thunk             thunk;
 };
+#define AURA_ZONE_HASH 'ZONE'
+#define zone_from_thunk(ptr) ( \
+    lights_thunk_container(ptr, struct aura_zone_context, thunk, AURA_ZONE_HASH) \
+)
+#define zone_from_public(ptr) ( \
+    container_of(ptr, struct aura_zone_context, zone) \
+)
 
 /**
  * struct aura_controller_context - Storage for a group of zones
@@ -105,62 +109,38 @@ struct aura_zone_context {
  * @zone_count:     Number of zones
  * @version:        Version of the control (determines some registers)
  * @lights_client:  Userland access
- * @name:           Chipset name
+ * @name:           Interface name
+ * @firmware:       Chipset name
  */
 struct aura_controller_context {
     struct aura_controller          ctrl;
-    reserve_t                       callback_pool;
 
-    struct mutex                    lock;             /* Read/Write access lock */
-    const struct lights_mode        *mode;            /* The current mode, only applied if non direct */
-    struct aura_zone_context        *zone_all;        /* A special zone used to represent all the others */
-    struct aura_zone_context        *zone_contexts;   /* Data for each available zone, plus an extra representing all */
-    struct aura_colors              *effect_colors;   /* Each zones effect color cache */
-    struct aura_colors              *direct_colors;   /* Each zones direct color cache */
-//    struct aura_colors           *unknown_colors;    /* LightingService reads this array from 0x81C0 upon handshake */
-    uint8_t                         is_direct;        /* Flag to indicate if direct mode is enabled */
+    struct mutex                    lock;
+    struct lights_mode const        *mode;
+    struct aura_zone_context        *zone_all;
+    struct aura_zone_context        *zone_contexts;
+    struct aura_colors              *effect_colors;
+    struct aura_colors              *direct_colors;
+
+    /* LightingService reads this array from 0x81C0 upon handshake */
+//    struct aura_colors           *unknown_colors;
+
+    uint8_t                         is_direct;
     uint8_t                         zone_count;
     uint8_t                         version;
 
     struct lights_adapter_client    lights_client;
-    char                            name[32];
+    struct lights_thunk             thunk;
+    char                            *name;
+    char                            firmware[32];
 };
-
-#define context_from_ctrl(ptr) (\
+#define AURA_CTRL_HASH 'CTX'
+#define ctrl_from_thunk(ptr) ( \
+    lights_thunk_container(ptr, struct aura_controller_context, thunk, AURA_CTRL_HASH) \
+)
+#define ctrl_from_public(ptr) ( \
     container_of(ptr, struct aura_controller_context, ctrl) \
 )
-
-#define zone_from_context(ptr) (\
-    container_of(ptr, struct aura_zone_context, zone) \
-)
-
-
-struct aura_callback_context {
-    struct aura_controller_context  *context;
-    struct lights_color             *color;
-};
-
-inline struct aura_callback_context *aura_callback_cache_alloc (
-    struct aura_controller_context *context
-){
-    struct aura_callback_context *cb;
-
-    cb = reserve_alloc(context->callback_pool);
-    if (IS_ERR(cb)) {
-        AURA_ERR("Failed to allocate from reserve");
-        return ERR_CAST(cb);
-    }
-
-    cb->context = context;
-
-    return cb;
-}
-
-inline void aura_callback_cache_free (
-    struct aura_callback_context const *data
-){
-    reserve_free(data->context->callback_pool, data);
-}
 
 struct lights_mode aura_available_modes[] = {
     LIGHTS_MODE(OFF),
@@ -199,7 +179,7 @@ static const char *zone_names[] = {
  *
  * @return: The array of capabilities
  */
-const struct lights_mode *aura_controller_get_caps (
+struct lights_mode const *aura_controller_get_caps (
     void
 ){
     return aura_available_modes;
@@ -303,7 +283,7 @@ static error_t aura_controller_read_block (
  * @return: Error code
  */
 static error_t lights_mode_to_aura_mode (
-    const struct lights_mode *mode,
+    struct lights_mode const *mode,
     enum aura_mode *aura_mode
 ){
     if (lights_is_custom_mode(mode)) {
@@ -345,10 +325,10 @@ static error_t lights_mode_to_aura_mode (
  *
  * @return: Global Mode
  */
-static const struct lights_mode *chipset_mode_to_lights_mode (
+static struct lights_mode const *chipset_mode_to_lights_mode (
     uint8_t id
 ){
-    const struct lights_mode *p;
+    struct lights_mode const *p;
     enum aura_mode aura_mode;
 
     lights_for_each_mode(p, aura_available_modes) {
@@ -407,7 +387,7 @@ static struct aura_colors *aura_colors_create (
         }
 
         for (i = 0, j = 0; i < count; i += 3, j++) {
-            lights_color_read(&colors->zone[j], &buffer[i]);
+            lights_color_read_rbg(&colors->zone[j], &buffer[i]);
         }
     }
 
@@ -478,6 +458,7 @@ static error_t aura_zones_create (
     // Create a zone which represents all the others
     context->zone_all = &zone[count];
 
+    lights_thunk_init(&zone[count].thunk, AURA_ZONE_HASH);
     zone[count].zone.id     = ZONE_ID_ALL;
     zone[count].zone.name   = "all";
     zone[count].zone.ctrl   = &context->ctrl;
@@ -491,6 +472,7 @@ static error_t aura_zones_create (
         if (err || zone_id >= ARRAY_SIZE(zone_names))
             goto error_free_zone;
 
+        lights_thunk_init(&zone[i].thunk, AURA_ZONE_HASH);
         zone[i].zone.id     = zone_id;
         zone[i].zone.name   = zone_names[zone_id];
         zone[i].zone.ctrl   = &context->ctrl;
@@ -521,16 +503,14 @@ error_free_colors:
  *
  * @context: The context to free
  */
-void aura_controller_context_destroy (
+static void aura_controller_context_destroy (
     struct aura_controller_context *context
 ){
-    if (context->callback_pool)
-        reserve_put(context->callback_pool);
-
     lights_adapter_unregister(&context->lights_client);
     kfree(context->zone_contexts);
     kfree(context->direct_colors);
     kfree(context->effect_colors);
+    kfree(context->name);
     kfree(context);
 }
 
@@ -561,18 +541,19 @@ static inline bool is_printable (
  *
  * @return: The controller, NULL if not found or a negative error
  */
-struct aura_controller *aura_controller_create (
-    struct lights_adapter_client *client
+struct aura_controller const *aura_controller_create (
+    struct lights_adapter_client *client,
+    const char *name
 ){
     struct aura_controller_context *context;
     struct lights_color * color;
-    char ctrl_name[17] = {0};
+    char firmware[17] = {0};
     uint8_t zone_count, mode_id;
     error_t err;
     int i;
 
-    if (IS_NULL(client))
-        return ERR_PTR(-ENODEV);
+    if (IS_NULL(client, name) || IS_TRUE(name[0] == '\0'))
+        return ERR_PTR(-EINVAL);
 
     // AURA_DBG("Reading ZoneCount");
     zone_count = 0;
@@ -594,14 +575,14 @@ struct aura_controller *aura_controller_create (
 
     // Read the device name and EC version
     // AURA_DBG("Reading ControllerName");
-    err = aura_controller_read_block(client, AURA_REG_DEVICE_NAME, ctrl_name, 16);
+    err = aura_controller_read_block(client, AURA_REG_DEVICE_NAME, firmware, 16);
     if (err) {
-        AURA_DBG("Failed to read device name");
+        AURA_DBG("Failed to read device firmware name");
         return NULL;
     }
 
-    if (!is_printable(ctrl_name)) {
-        AURA_DBG("Device name appears invalid");
+    if (!is_printable(firmware)) {
+        AURA_DBG("Device firmware name appears invalid");
         return NULL;
     }
 
@@ -609,7 +590,8 @@ struct aura_controller *aura_controller_create (
     if (!context)
         return ERR_PTR(-ENOMEM);
 
-    memcpy(context->name, ctrl_name, 16);
+    lights_thunk_init(&context->thunk, AURA_CTRL_HASH);
+    memcpy(context->firmware, firmware, 16);
     memcpy(&context->lights_client, client, sizeof(*client));
     mutex_init(&context->lock);
 
@@ -621,12 +603,12 @@ struct aura_controller *aura_controller_create (
 
     context->zone_count = zone_count;
 
-    if (strncmp(context->name, "AUMA0-E6K5", 10) == 0 || strncmp(context->name, "AUDA0-E6K5", 10) == 0)
+    if (strncmp(context->firmware, "AUMA0-E6K5", 10) == 0 || strncmp(context->firmware, "AUDA0-E6K5", 10) == 0)
         context->version = 2;
     else
         context->version = 1;
 
-    AURA_INFO("device '%s' has an %s controller.", context->name, context->version == 1 ? "EC1" : "EC2");
+    AURA_INFO("device '%s' has an %s controller.", name, context->version == 1 ? "EC1" : "EC2");
 
     // Build the zones
     // AURA_DBG("Creating Zones");
@@ -656,12 +638,7 @@ struct aura_controller *aura_controller_create (
         goto error;
     }
 
-    context->callback_pool = reserve_get(aura_callback_context, 32, SLAB_POISON, GFP_KERNEL);
-    if (IS_ERR(context->callback_pool)) {
-        err = CLEAR_ERR(context->callback_pool);
-        goto error;
-    }
-
+    context->name            = kstrdup(name, GFP_KERNEL);
     context->ctrl.name       = context->name;
     context->ctrl.version    = context->version;
     context->ctrl.zone_count = context->zone_count;
@@ -692,9 +669,9 @@ error:
  * @ctrl: Previously allocated with @aura_controller_create
  */
 void aura_controller_destroy (
-    struct aura_controller *ctrl
+    struct aura_controller const *ctrl
 ){
-    struct aura_controller_context *context = context_from_ctrl(ctrl);
+    struct aura_controller_context *context = ctrl_from_public(ctrl);
 
     if (IS_NULL(ctrl))
         return;
@@ -712,13 +689,14 @@ void aura_controller_destroy (
  * @return: The number of found slaves
  */
 int aura_controller_create_slaves (
-    struct aura_controller * ctrl,
-    struct aura_controller ** slaves,
+    struct aura_controller const *ctrl,
+    struct aura_controller const **slaves,
     size_t count
 ){
-    struct aura_controller_context * context = context_from_ctrl(ctrl);
+    struct aura_controller_context *context = ctrl_from_public(ctrl);
     struct lights_adapter_client client;
-    struct aura_controller * slave;
+    struct aura_controller const *slave;
+    char name[LIGHTS_MAX_FILENAME_LENGTH];
     uint8_t addr, next;
     int found = 0;
     error_t err;
@@ -726,14 +704,19 @@ int aura_controller_create_slaves (
     if (IS_NULL(ctrl, slaves) || IS_TRUE(4 != count))
         return 0;
 
+    if (strlen(context->name) > LIGHTS_MAX_FILENAME_LENGTH - 3) {
+        AURA_ERR("Interface name too long");
+        return 0;
+    }
+
+    snprintf(name, sizeof(name), "%s-%d", context->name, found + 1);
     memcpy(&client, &context->lights_client, sizeof(client));
 
     for (addr = 0xAA; addr <= 0xAD; ++addr) {
         err = aura_controller_read_byte(&context->lights_client, 0x8000 | addr, &next);
         if (!err && next) {
             LIGHTS_SMBUS_CLIENT_UPDATE(&client, next >> 1);
-            // client.smbus_client.addr = next >> 1;
-            slave = aura_controller_create(&client);
+            slave = aura_controller_create(&client, name);
             if (IS_NULL(slave)) {
                 err = -EIO;
                 goto error;
@@ -741,10 +724,19 @@ int aura_controller_create_slaves (
             if (!IS_ERR(slave)) {
                 slaves[found] = slave;
                 found++;
+                snprintf(name, sizeof(name), "%s-%d", context->name, found + 1);
                 continue;
             }
         }
         break;
+    }
+
+    /* Change name of main controller */
+    if (found) {
+        kfree(context->name);
+        snprintf(name, sizeof(name), "%s-%d", context->name, 0);
+        context->name = kstrdup(name, GFP_KERNEL);
+        context->ctrl.name = context->name;
     }
 
     return found;
@@ -758,6 +750,255 @@ error:
     return err;
 }
 
+/**
+ * aura_controller_color_read() - Reads the color of a single zone
+ *
+ * @thunk: A struct aura_zone_context
+ * @state: Buffer to read into
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_color_read (
+    struct lights_thunk *thunk,
+    struct lights_state *state
+){
+    struct aura_zone_context *ctx = zone_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+        return -EINVAL;
+
+    return aura_controller_get_zone_color(&ctx->zone, &state->color);
+}
+
+/**
+ * aura_controller_color_write() - Writes a single zone color
+ *
+ * @thunk: A struct aura_zone_context
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_color_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_zone_context *ctx = zone_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
+        return -EINVAL;
+
+    return aura_controller_set_zone_color(&ctx->zone, &state->color);
+}
+
+/**
+ * aura_controller_mode_read() - Reads the mode of a single zone
+ *
+ * @thunk: A struct aura_controller_context
+ * @state: Buffer to read into
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_mode_read (
+    struct lights_thunk *thunk,
+    struct lights_state *state
+){
+    struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    return aura_controller_get_mode(&ctx->ctrl, &state->mode);
+}
+
+/**
+ * aura_controller_mode_write() - Writes a single zone mode
+ *
+ * @thunk: A struct aura_controller_context
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_mode_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+        return -EINVAL;
+
+    return aura_controller_set_mode(&ctx->ctrl, &state->mode);
+}
+
+/**
+ * aura_memory_leds_write() - Writes color values to all zones
+ *
+ * @thunk: Memory controller
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_leds_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
+
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_LEDS))
+        return -EINVAL;
+
+    if (state->raw.length != ctx->zone_count)
+        return -EINVAL;
+
+    return aura_controller_set_colors(&ctx->ctrl, state->raw.data, ctx->zone_count);
+}
+
+/**
+ * aura_controller_update_write() - Writes color and mode values to all zones
+ *
+ * @thunk: Memory controller
+ * @state: Buffer to read from
+ *
+ * @return: Error code
+ */
+static error_t aura_controller_update_write (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
+    struct lights_mode const *mode = NULL;
+    struct lights_color const *color = NULL;
+
+    if (IS_NULL(thunk, state, ctx))
+        return -EINVAL;
+
+    if (state->type & LIGHTS_TYPE_MODE)
+        mode = &state->mode;
+
+    if (state->type & LIGHTS_TYPE_COLOR)
+        color = &state->color;
+
+    if (mode) {
+        if (color)
+            return aura_controller_update(&ctx->ctrl, mode, color);
+        return aura_controller_set_mode(&ctx->ctrl, mode);
+    } else if (color) {
+        return aura_controller_set_colors(&ctx->ctrl, color, 0);
+    }
+
+    return -EINVAL;
+}
+
+/**
+ * aura_controller_register_ctrl() - Creates a lights_fs for a controller
+ *
+ * @ctrl:   Controller to register
+ * @lights: Instance to register
+ * @name:   Name of the lights interface
+ *
+ * @return: Error code
+ */
+error_t aura_controller_register_ctrl (
+    struct aura_controller const *ctrl,
+    struct lights_dev *lights,
+    const char *name
+){
+    struct aura_controller_context *ctx = ctrl_from_public(ctrl);
+    struct lights_io_attribute attrs[4];
+    error_t err;
+
+    if (IS_NULL(ctrl, lights))
+        return -EINVAL;
+
+    lights->name = name ? name : ctx->name;
+    lights->caps = aura_controller_get_caps();
+    lights->led_count = ctx->zone_count;
+
+    err = lights_device_register(lights);
+    if (err)
+        return err;
+
+    attrs[0] = LIGHTS_MODE_ATTR(
+        &ctx->thunk,
+        aura_controller_mode_read,
+        aura_controller_mode_write
+    );
+    attrs[1] = LIGHTS_COLOR_ATTR(
+        &ctx->zone_all->thunk,
+        aura_controller_color_read,
+        aura_controller_color_write
+    );
+    attrs[2] = LIGHTS_LEDS_ATTR(
+        &ctx->thunk,
+        aura_controller_leds_write
+    );
+    attrs[3] = LIGHTS_UPDATE_ATTR(
+        &ctx->thunk,
+        aura_controller_update_write
+    );
+
+    err = lights_create_files(lights, attrs, ARRAY_SIZE(attrs));
+    if (!err)
+        return 0;
+
+    lights_device_unregister(lights);
+
+    return err;
+}
+
+/**
+ * aura_controller_register_zone() - Creates a lights_fs for a zone
+ *
+ * @zone:   The zone for which to allow userland access
+ * @lights: Instance to register
+ * @name:   Name of lights interface
+ *
+ * @return: Error code
+ *
+ * If @name is given as NULL, the default name of the zone will be used.
+ */
+error_t aura_controller_register_zone (
+    struct aura_zone const *_zone,
+    struct lights_dev *lights,
+    const char *name
+){
+    struct aura_zone_context *zone = zone_from_public(_zone);
+    struct lights_io_attribute attrs[3];
+    error_t err;
+
+    if (IS_NULL(_zone, lights, zone))
+        return -EINVAL;
+
+    lights->name = name ? name : zone->zone.name;
+    lights->caps = aura_controller_get_caps();
+
+    err = lights_device_register(lights);
+    if (err)
+        return err;
+
+    attrs[0] = LIGHTS_MODE_ATTR(
+        &zone->context->thunk,
+        aura_controller_mode_read,
+        aura_controller_mode_write
+    );
+    attrs[1] = LIGHTS_COLOR_ATTR(
+        &zone->thunk,
+        aura_controller_color_read,
+        aura_controller_color_write
+    );
+    attrs[2] = LIGHTS_UPDATE_ATTR(
+        &zone->context->thunk,
+        aura_controller_update_write
+    );
+
+    err = lights_create_files(lights, attrs, ARRAY_SIZE(attrs));
+    if (!err)
+        return 0;
+
+    lights_device_unregister(lights);
+
+    return err;
+}
 
 
 /**
@@ -768,11 +1009,11 @@ error:
  *
  * @return: The zone or a negative error number
  */
-struct aura_zone *aura_controller_get_zone (
-    struct aura_controller *ctrl,
+struct aura_zone const *aura_controller_get_zone (
+    struct aura_controller const *ctrl,
     uint8_t index
 ){
-    struct aura_controller_context *ctx = context_from_ctrl(ctrl);
+    struct aura_controller_context *ctx = ctrl_from_public(ctrl);
 
     if (IS_NULL(ctrl))
         return ERR_PTR(-EINVAL);
@@ -786,51 +1027,69 @@ struct aura_zone *aura_controller_get_zone (
     return ERR_PTR(-EINVAL);
 }
 
+
 /**
  * aura_controller_set_zone_color_callback() - Async handler for color setting
  *
  * @result: Messages sent to the device
- * @_data:  Context of the call
+ * @thunk:  Context of the call
  * @error:  A negative error number if async failed
  */
 static void aura_controller_set_zone_color_callback (
     struct lights_adapter_msg const * const result,
-    void *_data,
+    struct lights_thunk *thunk,
     error_t error
 ){
-    struct aura_callback_context *data = _data;
+    struct aura_zone_context *zone = zone_from_thunk(thunk);
     struct lights_adapter_msg const * color_msg;
-    struct lights_color color;
+    struct lights_color *target;
+    uint16_t delta;
+    int i;
 
-    if (IS_NULL(result, _data))
+    if (IS_NULL(result, thunk, zone))
         return;
 
     if (error) {
         AURA_DBG("Failed to set color");
-        goto exit;
+        return;
+    }
+
+    delta = zone->offset * 3;
+    if (zone->context->direct_colors->reg + delta == result->data.word) {
+        target = &zone->context->direct_colors->zone[zone->offset];
+    } else if (zone->context->effect_colors->reg + delta == result->data.word) {
+        target = &zone->context->effect_colors->zone[zone->offset];
+    } else {
+        AURA_ERR("Failed to detect color target");
+        return;
     }
 
     color_msg = adapter_seek_msg(result, 1);
     if (!color_msg) {
         AURA_ERR("Failed to seek message");
-        goto exit;
+        return;
     }
 
-    if (color_msg->length != 3) {
+    if (zone->zone.id == ZONE_ID_ALL) {
+        if (color_msg->length != zone->context->zone_count * 3) {
+            AURA_ERR("Message has an invalid length '%d'", color_msg->length);
+            return;
+        }
+    } else if (color_msg->length != 3) {
         AURA_ERR("Message has an invalid length '%d'", color_msg->length);
-        goto exit;
+        return;
     }
 
-    lights_color_read(&color, color_msg->data.block);
+    mutex_lock(&zone->context->lock);
 
-    mutex_lock(&data->context->lock);
+    if (zone->zone.id == ZONE_ID_ALL) {
+        for (i = 0; i < zone->context->zone_count; i++)
+            lights_color_read_rbg(&target[i], &color_msg->data.block[i * 3]);
+    } else {
+        lights_color_read_rbg(target, color_msg->data.block);
+    }
 
-    *data->color = color;
-
-    mutex_unlock(&data->context->lock);
-
-exit:
-    aura_callback_cache_free(data);
+    mutex_unlock(&zone->context->lock);
 }
 
 /**
@@ -844,32 +1103,38 @@ exit:
  * The color is applied asynchronously
  */
 error_t aura_controller_set_zone_color (
-    struct aura_zone *zone,
-    const struct lights_color *color
+    struct aura_zone const *_zone,
+    struct lights_color const *color
 ){
-    struct aura_zone_context *zone_ctx = zone_from_context(zone);
+    struct aura_zone_context *zone = zone_from_public(_zone);
     struct aura_controller_context *context;
-    struct aura_colors *target;
-    struct aura_callback_context *cb_data;
     struct lights_adapter_msg msgs[4];
-
+    uint16_t target;
     error_t err;
-    int count = 0;
+    int count = 0, i;
 
-    if (IS_NULL(zone, color))
+    if (IS_NULL(_zone, color, zone))
         return -EINVAL;
 
-    context = zone_ctx->context;
+    context = zone->context;
 
     if (context->is_direct)
-        target = context->direct_colors;
+        target = context->direct_colors->reg;
     else
-        target = context->effect_colors;
+        target = context->effect_colors->reg;
 
-    msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target->reg + (3 * zone_ctx->offset));
-    msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, 3);
+    if (zone->zone.id == ZONE_ID_ALL) {
+        msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target);
+        msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, zone->context->zone_count * 3);
+        for (i = 0; i < zone->context->zone_count; i++)
+            lights_color_write_rbg(color, &msgs[1].data.block[i * 3]);
+    } else {
+        msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target + (3 * zone->offset));
+        msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, 3);
+        lights_color_write_rbg(color, msgs[1].data.block);
+    }
 
-    lights_color_write(color, msgs[1].data.block);
+    AURA_DBG("Applying color 0x%06x to '%s' zone '%s'", color->value, context->name, zone->zone.name);
 
     if (!context->is_direct) {
         msgs[2] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_APPLY);
@@ -879,22 +1144,13 @@ error_t aura_controller_set_zone_color (
         count = 2;
     }
 
-    cb_data = aura_callback_cache_alloc(context);
-    if (IS_ERR(cb_data))
-        return PTR_ERR(cb_data);
-
-    cb_data->color = &target->zone[zone_ctx->offset];
-
     err = lights_adapter_xfer_async(
         &context->lights_client,
         msgs,
         count,
-        cb_data,
+        &zone->thunk,
         aura_controller_set_zone_color_callback
     );
-
-    if (err)
-        aura_callback_cache_free(cb_data);
 
     return err;
 }
@@ -911,10 +1167,10 @@ error_t aura_controller_set_zone_color (
  * the device when an async set_color is pending.
  */
 error_t aura_controller_get_zone_color (
-    struct aura_zone *zone,
+    struct aura_zone const *zone,
     struct lights_color *color
 ){
-    struct aura_zone_context *zone_ctx = zone_from_context(zone);
+    struct aura_zone_context *zone_ctx = zone_from_public(zone);
     struct aura_controller_context *context;
 
     if (IS_NULL(zone, color))
@@ -945,47 +1201,54 @@ error_t aura_controller_get_zone_color (
  * aura_controller_set_zone_color_callback() - Async handler for color setting
  *
  * @result: Messages sent to the device
- * @_data:  Context of the call
+ * @thunk:  Context of the call
  * @error:  A negative error number if async failed
  */
 static void aura_controller_set_color_callback (
     struct lights_adapter_msg const * const result,
-    void *_data,
+    struct lights_thunk *thunk,
     error_t error
 ){
-    struct aura_callback_context *data = _data;
+    struct aura_controller_context *ctrl = ctrl_from_thunk(thunk);
     struct lights_adapter_msg const * color_msg;
+    struct lights_color *target;
     int i;
 
-    if (IS_NULL(result, _data))
+    if (IS_NULL(result, thunk, ctrl))
         return;
 
     if (error) {
         AURA_DBG("Failed to set color");
-        goto exit;
+        return;
+    }
+
+    if (result->data.word == ctrl->direct_colors->reg) {
+        target = ctrl->direct_colors->zone;
+    } else if (result->data.word == ctrl->effect_colors->reg) {
+        target = ctrl->effect_colors->zone;
+    } else {
+        AURA_ERR("Failed to detect color target");
+        return;
     }
 
     color_msg = adapter_seek_msg(result, 1);
     if (!color_msg) {
         AURA_ERR("Failed to seek message");
-        goto exit;
+        return;
     }
 
-    if (color_msg->length != data->context->zone_count * 3) {
+    if (color_msg->length != ctrl->zone_count * 3) {
         AURA_ERR("Message has an invalid length '%d'", color_msg->length);
-        goto exit;
+        return;
     }
 
-    mutex_lock(&data->context->lock);
+    mutex_lock(&ctrl->lock);
 
-    for (i = 0; i <= data->context->zone_count; i++) {
-        lights_color_read(&data->color[i], &color_msg->data.block[i * 3]);
+    for (i = 0; i <= ctrl->zone_count; i++) {
+        lights_color_read_rbg(&target[i], &color_msg->data.block[i * 3]);
     }
 
-    mutex_unlock(&data->context->lock);
-
-exit:
-    aura_callback_cache_free(data);
+    mutex_unlock(&ctrl->lock);
 }
 
 /**
@@ -1001,36 +1264,37 @@ exit:
  * @count must be equal to the zone count.
  */
 error_t aura_controller_set_colors (
-    struct aura_controller *ctrl,
-    const struct lights_color *colors,
+    struct aura_controller const *_ctrl,
+    struct lights_color const * const colors,
     uint8_t count
 ){
-    struct aura_controller_context *context = context_from_ctrl(ctrl);
-    struct aura_colors *target;
-    struct aura_callback_context *cb_data;
+    struct aura_controller_context *ctrl = ctrl_from_public(_ctrl);
     struct lights_adapter_msg msgs[4];
+    struct lights_color const *color;
+    uint16_t target;
     int i;
     error_t err;
 
-    if (IS_NULL(ctrl, colors) || IS_FALSE(count == 1 || count == context->zone_count))
+    if (IS_NULL(_ctrl, colors, ctrl) || IS_FALSE(count == 1 || count == ctrl->zone_count))
         return -EINVAL;
 
-    if (context->is_direct)
-        target = context->direct_colors;
+    if (ctrl->is_direct)
+        target = ctrl->direct_colors->reg;
     else
-        target = context->effect_colors;
+        target = ctrl->effect_colors->reg;
 
-    msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target->reg);
-    msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, context->zone_count * 3);
+    msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target);
+    msgs[1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, ctrl->zone_count * 3);
 
-    for (i = 0; i < context->zone_count; i++) {
-        lights_color_write(colors, &msgs[1].data.block[i * 3]);
+    color = colors;
+    for (i = 0; i < ctrl->zone_count; i++) {
+        lights_color_write_rbg(color, &msgs[1].data.block[i * 3]);
 
         if (count > 1)
-            colors++;
+            color++;
     }
 
-    if (!context->is_direct) {
+    if (!ctrl->is_direct) {
         msgs[2] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_APPLY);
         msgs[3] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, AURA_APPLY_VAL);
         count = 4;
@@ -1038,23 +1302,15 @@ error_t aura_controller_set_colors (
         count = 2;
     }
 
-    cb_data = aura_callback_cache_alloc(context);
-    if (IS_ERR(cb_data))
-        return PTR_ERR(cb_data);
+    AURA_DBG("Applying color 0x%06x to '%s' all zones", color->value, ctrl->name);
 
-    cb_data->color = target->zone;
-
-    AURA_DBG("Queing %d messages to update color", count);
     err = lights_adapter_xfer_async(
-        &context->lights_client,
+        &ctrl->lights_client,
         msgs,
         count,
-        cb_data,
+        &ctrl->thunk,
         aura_controller_set_color_callback
     );
-
-    if (err)
-        aura_callback_cache_free(cb_data);
 
     return err;
 }
@@ -1064,52 +1320,49 @@ error_t aura_controller_set_colors (
  * aura_controller_set_zone_color_callback() - Async handler for mode setting
  *
  * @result: Messages sent to the device
- * @_data:  Context of the call
+ * @thunk:  Context of the call
  * @error:  A negative error number if async failed
  */
 static void aura_controller_set_mode_callback (
     struct lights_adapter_msg const * const result,
-    void *_data,
+    struct lights_thunk *thunk,
     error_t error
 ){
-    struct aura_callback_context *data = _data;
-    struct lights_adapter_msg const * mode_msg;
-    const struct lights_mode *lights_mode;
+    struct aura_controller_context *ctrl = ctrl_from_thunk(thunk);
+    struct lights_adapter_msg const *mode_msg;
+    struct lights_mode const *lights_mode;
     enum aura_mode aura_mode;
 
-    if (IS_NULL(result, _data))
+    if (IS_NULL(result, thunk, ctrl))
         return;
 
     if (error) {
         AURA_DBG("Failed to set mode");
-        goto exit;
+        return;
     }
 
     mode_msg = adapter_seek_msg(result, 1);
     if (!mode_msg) {
         AURA_ERR("Failed to seek message");
-        goto exit;
+        return;
     }
 
     aura_mode = mode_msg->data.byte;
     lights_mode = chipset_mode_to_lights_mode(aura_mode);
     if (!lights_mode) {
         AURA_ERR("Message contains an invalid mode '0x%02x'", aura_mode);
-        goto exit;
+        return;
     }
 
-    mutex_lock(&data->context->lock);
+    mutex_lock(&ctrl->lock);
 
     if (aura_mode == AURA_MODE_DIRECT) {
-        data->context->is_direct = true;
+        ctrl->is_direct = true;
     } else {
-        data->context->mode = lights_mode;
+        ctrl->mode = lights_mode;
     }
 
-    mutex_unlock(&data->context->lock);
-
-exit:
-    aura_callback_cache_free(data);
+    mutex_unlock(&ctrl->lock);
 }
 
 /**
@@ -1123,12 +1376,11 @@ exit:
  * NOTE: A single zone cannot have its own mode.
  */
 error_t aura_controller_set_mode (
-    struct aura_controller *ctrl,
-    const struct lights_mode *mode
+    struct aura_controller const *ctrl,
+    struct lights_mode const *mode
 ){
-    struct aura_controller_context *context = context_from_ctrl(ctrl);
+    struct aura_controller_context *context = ctrl_from_public(ctrl);
     enum aura_mode aura_mode;
-    struct aura_callback_context *cb_data;
     error_t err;
     int count = 0;
 
@@ -1136,12 +1388,12 @@ error_t aura_controller_set_mode (
 
     if (IS_NULL(ctrl, mode))
         return -EINVAL;
+    if (IS_NULL(context, context->mode))
+        return -EINVAL;
 
     err = lights_mode_to_aura_mode(mode, &aura_mode);
     if (err)
         return err;
-
-    AURA_DBG("setting mode: '%s' to all zones", mode->name);
 
     if (aura_mode == AURA_MODE_DIRECT) {
         if (!context->is_direct) {
@@ -1167,21 +1419,14 @@ error_t aura_controller_set_mode (
         msgs[count + 1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, AURA_APPLY_VAL);
         count += 2;
 
-        cb_data = aura_callback_cache_alloc(context);
-        if (IS_ERR(cb_data))
-            return PTR_ERR(cb_data);
-
-        AURA_DBG("Queing %d messages to update mode", count);
+        // AURA_DBG("Queing %d messages to update mode", count);
         err = lights_adapter_xfer_async(
             &context->lights_client,
             msgs,
             count,
-            cb_data,
+            &context->thunk,
             aura_controller_set_mode_callback
         );
-
-        if (err)
-            aura_callback_cache_free(cb_data);
     }
 
     return err;
@@ -1196,10 +1441,10 @@ error_t aura_controller_set_mode (
  * @return: Zero or negative error number
  */
 error_t aura_controller_get_mode (
-    struct aura_controller *ctrl,
+    struct aura_controller const *ctrl,
     struct lights_mode *mode
 ){
-    struct aura_controller_context *ctx = context_from_ctrl(ctrl);
+    struct aura_controller_context *ctx = ctrl_from_public(ctrl);
 
     if (IS_NULL(ctrl, mode))
         return -EINVAL;
@@ -1211,4 +1456,154 @@ error_t aura_controller_get_mode (
     mutex_unlock(&ctx->lock);
 
     return 0;
+}
+
+
+/**
+ * aura_controller_update_callback() - Async handler for update
+ *
+ * @result: Messages sent to the device
+ * @thunk:  Context of the call
+ * @error:  A negative error number if async failed
+ */
+static void aura_controller_update_callback (
+    struct lights_adapter_msg const * const result,
+    struct lights_thunk *thunk,
+    error_t error
+){
+    struct aura_controller_context *context = ctrl_from_thunk(thunk);
+    struct lights_adapter_msg const *msg;
+    struct aura_colors *target;
+    struct lights_mode const *lights_mode = NULL;
+    enum aura_mode aura_mode;
+    bool is_direct = false;
+    int i;
+
+    if (IS_NULL(result, thunk, context))
+        return;
+
+    if (error) {
+        AURA_DBG("Failed to update");
+        return;
+    }
+
+    msg = result;
+    if (msg->data.word == AURA_REG_DIRECT) {
+        msg = msg->next;
+        if (msg) {
+            is_direct = msg->data.byte;
+            msg = msg->next;
+        }
+    }
+
+    if (!is_direct) {
+        target = context->effect_colors;
+
+        if (msg && msg->data.word == AURA_REG_MODE) {
+            msg = msg->next;
+            if (msg) {
+                aura_mode = msg->data.byte;
+                msg = msg->next;
+
+                lights_mode = chipset_mode_to_lights_mode(aura_mode);
+                if (!lights_mode) {
+                    AURA_ERR("Message contains an invalid mode '0x%02x'", aura_mode);
+                    return;
+                }
+            }
+        }
+    } else {
+        target = context->direct_colors;
+    }
+
+    msg = adapter_seek_msg(msg, 1);
+    if (msg && msg->length == context->zone_count * 3) {
+        mutex_lock(&context->lock);
+
+        context->is_direct = is_direct;
+
+        for (i = 0; i <= context->zone_count; i++)
+            lights_color_read_rbg(&target->zone[i], &msg->data.block[i * 3]);
+
+        if (lights_mode)
+            context->mode = lights_mode;
+
+        mutex_unlock(&context->lock);
+    } else {
+        AURA_ERR("Failed to find color array in messages");
+    }
+}
+
+/**
+ * aura_controller_update() - Writes a mode and color to all zones
+ *
+ * @ctrl:  Previously allocated with aura_controller_create()
+ * @mode:  New mode to apply
+ * @color: New color to apply
+ *
+ * @return: Error code
+ */
+error_t aura_controller_update (
+    struct aura_controller const *ctrl,
+    struct lights_mode const *mode,
+    struct lights_color const *color
+){
+    struct aura_controller_context *context = ctrl_from_public(ctrl);
+    enum aura_mode aura_mode;
+    struct lights_adapter_msg msgs[8];
+    uint16_t target;
+    size_t count = 0;
+    int i;
+    error_t err;
+
+    if (IS_NULL(ctrl, mode, color))
+        return -EINVAL;
+
+    err = lights_mode_to_aura_mode(mode, &aura_mode);
+    if (err)
+        return err;
+
+    if (aura_mode == AURA_MODE_DIRECT) {
+        target = context->direct_colors->reg;
+        if (!context->is_direct) {
+            count = 2;
+            msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_DIRECT);
+            msgs[1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, 0x01);
+        }
+    } else {
+        target = context->effect_colors->reg;
+        if (context->is_direct) {
+            count = 2;
+            msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_DIRECT);
+            msgs[1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, 0x00);
+        }
+        if (mode->id != context->mode->id) {
+            msgs[count]     = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_MODE);
+            msgs[count + 1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, aura_mode);
+            count += 2;
+        }
+    }
+
+    msgs[count    ] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, target);
+    msgs[count + 1] = ADAPTER_WRITE_BLOCK_DATA(CMD_WRITE_BLOCK, context->zone_count * 3);
+    for (i = 0; i < context->zone_count; i++) {
+        lights_color_write_rbg(color, &msgs[count + 1].data.block[i * 3]);
+    }
+    count += 2;
+
+    if (!context->is_direct) {
+        msgs[count    ] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_APPLY);
+        msgs[count + 1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, AURA_APPLY_VAL);
+        count += 2;
+    }
+
+    err = lights_adapter_xfer_async(
+        &context->lights_client,
+        msgs,
+        count,
+        &context->thunk,
+        aura_controller_update_callback
+    );
+
+    return err;
 }

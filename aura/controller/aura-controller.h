@@ -42,7 +42,7 @@ struct aura_zone {
  *
  * @return: The array of capabilities
  */
-const struct lights_mode *aura_controller_get_caps (
+struct lights_mode const *aura_controller_get_caps (
     void
 );
 
@@ -50,47 +50,81 @@ const struct lights_mode *aura_controller_get_caps (
  * aura_controller_create() - Tests for and creates an interface
  *
  * @client: The lights managed i2c_adapter
+ * @name:   The interface name
  *
  * @return: The controller, NULL if not found or a negative error
  */
-struct aura_controller *aura_controller_create (
-    struct lights_adapter_client *client
+struct aura_controller const *aura_controller_create (
+    struct lights_adapter_client *client,
+    const char *name
 );
 
 /**
  * aura_controller_destroy() - Releases the controller
  *
- * @ctrl: Previously allocated with @aura_controller_create
+ * @ctrl: Previously allocated with aura_controller_create()
  */
 void aura_controller_destroy (
-    struct aura_controller *ctrl
+    struct aura_controller const *ctrl
 );
 
 /**
  * aura_controller_create_slaves() - Creates slave controllers
  *
- * @ctrl:   Previously allocated with @aura_controller_create
+ * @ctrl:   Previously allocated with aura_controller_create()
  * @slaves: Array to hold found slave controllers
  * @count:  Length of @slaves array (MUST be 4)
  *
  * @return: The number of found slaves
  */
 int aura_controller_create_slaves (
-    struct aura_controller *ctrl,
-    struct aura_controller *slaves[4],
+    struct aura_controller const *ctrl,
+    struct aura_controller const ** slaves,
     size_t count
+);
+
+/**
+ * aura_controller_register_ctrl() - Creates a lights_fs for a controller
+ *
+ * @ctrl:   Controller to register
+ * @lights: Instance to register
+ * @name:   Name of the lights interface
+ *
+ * @return: Error code
+ */
+error_t aura_controller_register_ctrl (
+    struct aura_controller const *ctrl,
+    struct lights_dev *lights,
+    const char *name
+);
+
+/**
+ * aura_controller_register_zone() - Creates a lights_fs for a zone
+ *
+ * @zone:   The zone for which to allow userland access
+ * @lights: Instance to register
+ * @name:   Name of lights interface
+ *
+ * @return: Error code
+ *
+ * If @name is given as NULL, the default name of the zone will be used.
+ */
+error_t aura_controller_register_zone (
+    struct aura_zone const *zone,
+    struct lights_dev *lights,
+    const char *name
 );
 
 /**
  * aura_controller_get_zone() - Fetches a zone by its index
  *
- * @ctrl:  Previously allocated with @aura_controller_create
+ * @ctrl:  Previously allocated with aura_controller_create()
  * @index: Zero based index of the zone
  *
  * @return: The zone or a negative error number
  */
-struct aura_zone *aura_controller_get_zone (
-    struct aura_controller *ctrl,
+struct aura_zone const *aura_controller_get_zone (
+    struct aura_controller const *ctrl,
     uint8_t index
 );
 
@@ -105,8 +139,8 @@ struct aura_zone *aura_controller_get_zone (
  * The color is applied asynchronously
  */
 error_t aura_controller_set_zone_color (
-    struct aura_zone *zone,
-    const struct lights_color *color
+    struct aura_zone const *zone,
+    struct lights_color const *color
 );
 
 /**
@@ -121,14 +155,14 @@ error_t aura_controller_set_zone_color (
  * the device when an async set_color is pending.
  */
 error_t aura_controller_get_zone_color (
-    struct aura_zone *zone,
+    struct aura_zone const *zone,
     struct lights_color *color
 );
 
 /**
  * aura_controller_set_colors() - Applies a color to all zones
  *
- * @ctrl:  Previously allocated with @aura_controller_create
+ * @ctrl:  Previously allocated with aura_controller_create()
  * @color: Color to apply
  * @count: Number of colors
  *
@@ -138,22 +172,22 @@ error_t aura_controller_get_zone_color (
  * @count must be equal to the zone count.
  */
 error_t aura_controller_set_colors (
-    struct aura_controller *ctrl,
-    const struct lights_color *colors,
+    struct aura_controller const *ctrl,
+    struct lights_color const * const colors,
     uint8_t count
 );
 
 /**
  * aura_controller_set_color() - Applies a color to all zones
  *
- * @ctrl:  Previously allocated with @aura_controller_create
+ * @ctrl:  Previously allocated with aura_controller_create()
  * @color: Color to apply
  *
  * @return: Zero or negative error number
  */
 static inline error_t aura_controller_set_color (
-    struct aura_controller *ctrl,
-    const struct lights_color *color
+    struct aura_controller const *ctrl,
+    struct lights_color const *color
 ){
     return aura_controller_set_colors(ctrl, color, 1);
 };
@@ -161,7 +195,7 @@ static inline error_t aura_controller_set_color (
 /**
  * aura_controller_set_mode() - Applies a mode to all zones
  *
- * @ctrl:  Previously allocated with @aura_controller_create
+ * @ctrl:  Previously allocated with aura_controller_create()
  * @color: Mode to apply
  *
  * @return: Zero or negative error number
@@ -169,21 +203,36 @@ static inline error_t aura_controller_set_color (
  * NOTE: A single zone cannot have its own mode.
  */
 error_t aura_controller_set_mode (
-    struct aura_controller *ctrl,
-    const struct lights_mode *mode
+    struct aura_controller const *ctrl,
+    struct lights_mode const *mode
 );
 
 /**
  * aura_controller_get_mode() - Reads the mode of all zones
  *
- * @ctrl: Previously allocated with @aura_controller_create
+ * @ctrl: Previously allocated with aura_controller_create()
  * @mode: Buffer to read into
  *
  * @return: Zero or negative error number
  */
 error_t aura_controller_get_mode (
-    struct aura_controller *ctrl,
+    struct aura_controller const *ctrl,
     struct lights_mode *mode
+);
+
+/**
+ * aura_controller_update() - Writes a mode and color to all zones
+ *
+ * @ctrl:  Previously allocated with aura_controller_create()
+ * @mode:  New mode to apply
+ * @color: New color to apply
+ *
+ * @return: Error code
+ */
+error_t aura_controller_update (
+    struct aura_controller const *ctrl,
+    struct lights_mode const *mode,
+    struct lights_color const *color
 );
 
 #endif

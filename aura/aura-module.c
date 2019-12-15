@@ -55,22 +55,40 @@ error:
     return err;
 }
 
-static void aura_module_probe_all (
+static error_t aura_module_probe_all (
     void
 ){
-    aura_motherboard_probe(&global_state);
-    // aura_memory_probe(&global_state);
-    // aura_gpu_probe(&global_state);
-    // aura_header_probe(&global_state);
+    probe_func_t *iter;
+    probe_func_t funcs[] = {
+        aura_motherboard_probe,
+        aura_memory_probe,
+        aura_gpu_probe,
+        // aura_header_probe,
+        NULL
+    };
+    error_t err = 0;
+
+    for (iter = funcs; *iter != NULL && !err; iter++) {
+        err = (*iter)(&global_state);
+    }
+
+    return err;
 }
 
 static void aura_module_release_all (
     void
 ){
-    aura_motherboard_release();
-    // aura_memory_release();
-    // aura_gpu_release();
-    // aura_header_release();
+    release_func_t *iter;
+    release_func_t funcs[] = {
+        aura_motherboard_release,
+        aura_memory_release,
+        aura_gpu_release,
+        aura_header_release,
+        NULL
+    };
+
+    for (iter = funcs; *iter != NULL; iter++)
+        (*iter)();
 }
 
 static int __init aura_module_init (
@@ -82,9 +100,11 @@ static int __init aura_module_init (
     if (err)
         return err;
 
-    aura_module_probe_all();
+    err = aura_module_probe_all();
+    if (err)
+        aura_module_release_all();
 
-    return 0;
+    return err;
 }
 
 static void __exit aura_module_exit (

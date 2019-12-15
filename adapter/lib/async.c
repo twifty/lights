@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/kref.h>
 #include <linux/workqueue.h>
+
+#include <adapter/debug.h>
 #include "async.h"
 
 /* Same length as internal */
@@ -40,7 +42,7 @@ struct async_queue {
 )
 
 /**
- * switch_state() - Atomic change state
+ * change_state() - Atomic change state
  *
  * @queue: Owning queue
  * @from:  Old state
@@ -52,7 +54,7 @@ struct async_queue {
  *
  * Success is evaluated by comparing @return and @old.
  */
-static inline enum async_queue_state switch_state (
+static inline enum async_queue_state change_state (
     struct async_queue *queue,
     enum async_queue_state from,
     enum async_queue_state to
@@ -152,7 +154,7 @@ static void async_job_execute (
         switch (read_state(queue)) {
             case ASYNC_STATE_IDLE:
                 /* Switch to running state */
-                if (ASYNC_STATE_IDLE == switch_state(queue, ASYNC_STATE_IDLE, ASYNC_STATE_RUNNING)) {
+                if (ASYNC_STATE_IDLE == change_state(queue, ASYNC_STATE_IDLE, ASYNC_STATE_RUNNING)) {
                     job = remove_job(queue);
                     if (job) {
                         // LIGHTS_DBG("Executing job");
@@ -163,10 +165,10 @@ static void async_job_execute (
 
                     /* Wake any pending master threads */
                     if (atomic_read(&queue->paused) > 0) {
-                        switch_state(queue, ASYNC_STATE_RUNNING, ASYNC_STATE_PAUSED);
+                        change_state(queue, ASYNC_STATE_RUNNING, ASYNC_STATE_PAUSED);
                         wake_up_interruptible_all(&queue->pause_wait);
                     } else {
-                        switch_state(queue, ASYNC_STATE_RUNNING, ASYNC_STATE_IDLE);
+                        change_state(queue, ASYNC_STATE_RUNNING, ASYNC_STATE_IDLE);
                         // wake_up(&queue->master_wait);
                     }
 
@@ -241,15 +243,16 @@ async_queue_t async_queue_create (
     queue->workqueue = create_singlethread_workqueue(queue->name);
 
     if (!queue->workqueue) {
-        LIGHTS_ERR("Failed to create (%s) workqueue", queue->name);
+        LIGHTS_ERR("Failed to create '%s' workqueue", queue->name);
         kfree(queue);
-        return NULL;
+        return ERR_PTR(-EFAULT);
     }
 
     LIGHTS_DBG("Created queue '%s'", queue->name);
 
     return queue;
 }
+EXPORT_SYMBOL_NS_GPL(async_queue_create, LIGHTS);
 
 /**
  * async_queue_destroy() - Releases the queue
@@ -271,6 +274,7 @@ void async_queue_destroy (
     if (!kref_put(&queue->refs, async_context_release))
         LIGHTS_DBG("Queue has %d open handles", kref_read(&queue->refs));
 }
+EXPORT_SYMBOL_NS_GPL(async_queue_destroy, LIGHTS);
 
 /**
  * async_queue_pause() - Pauses the queue
@@ -290,11 +294,13 @@ void async_queue_pause (
     /* Signal all running threads that a pause is required */
     atomic_inc(&queue->paused);
 
+    /* Presume a thread is running, it will set the paused state */
     wait_event_interruptible(
         queue->pause_wait,
-        has_state(queue, ASYNC_STATE_PAUSED | ASYNC_STATE_CANCELLED)
+        ASYNC_STATE_RUNNING != change_state(queue, ASYNC_STATE_IDLE, ASYNC_STATE_PAUSED)
     );
 }
+EXPORT_SYMBOL_NS_GPL(async_queue_pause, LIGHTS);
 
 /**
  * async_queue_resume() - Resumes the queue
@@ -308,12 +314,13 @@ void async_queue_resume (
         return;
 
     if (atomic_dec_and_test(&queue->paused)) {
-        if (switch_state(queue, ASYNC_STATE_PAUSED, ASYNC_STATE_IDLE)) {
+        if (change_state(queue, ASYNC_STATE_PAUSED, ASYNC_STATE_IDLE)) {
             // wake_up(&queue->master_wait);
             wake_up_interruptible(&queue->thread_wait);
         }
     }
 }
+EXPORT_SYMBOL_NS_GPL(async_queue_resume, LIGHTS);
 
 /**
  * async_queue_add() - Adds a job to the queue
@@ -325,7 +332,7 @@ void async_queue_resume (
  */
 error_t async_queue_add (
     async_queue_t queue,
-    async_job_t job
+    async_job_t const job
 ){
     if (IS_NULL(queue, job, job->execute))
         return -EINVAL;
@@ -345,3 +352,4 @@ error_t async_queue_add (
 
     return 0;
 }
+EXPORT_SYMBOL_NS_GPL(async_queue_add, LIGHTS);

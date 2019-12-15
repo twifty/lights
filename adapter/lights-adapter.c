@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <adapter/debug.h>
+
 #include "lights-adapter.h"
 #include "lib/reserve.h"
 #include "lib/async.h"
@@ -14,26 +16,26 @@
 
 /* Forward declare for the vtable */
 static error_t lights_adapter_smbus_read (
-    const struct lights_adapter_client * client,
-    struct lights_adapter_msg * msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg *msg
 );
 static error_t lights_adapter_smbus_write (
-    const struct lights_adapter_client * client,
-    const struct lights_adapter_msg * msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg const *msg
 );
 static error_t lights_adapter_usb_read (
-    const struct lights_adapter_client * client,
-    struct lights_adapter_msg * msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg *msg
 );
 static error_t lights_adapter_usb_write (
-    const struct lights_adapter_client * client,
-    const struct lights_adapter_msg * msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg const *msg
 );
 
 struct lights_adapter_vtable {
     enum lights_adapter_protocol proto;
-    error_t (*read)(const struct lights_adapter_client *, struct lights_adapter_msg *);
-    error_t (*write)(const struct lights_adapter_client *, const struct lights_adapter_msg *);
+    error_t (*read)(struct lights_adapter_client const *, struct lights_adapter_msg *);
+    error_t (*write)(struct lights_adapter_client const *, struct lights_adapter_msg const *);
 } lights_adapter_vtables[] = {{
     .proto = LIGHTS_PROTOCOL_SMBUS,
     .read  = lights_adapter_smbus_read,
@@ -48,7 +50,7 @@ struct lights_adapter_vtable {
     .write = lights_adapter_usb_write,
 }};
 
-static inline const struct lights_adapter_vtable *lights_adapter_vtable_get (
+static inline struct lights_adapter_vtable const *lights_adapter_vtable_get (
     enum lights_adapter_protocol proto
 ){
     switch (proto) {
@@ -76,7 +78,7 @@ static inline const struct lights_adapter_vtable *lights_adapter_vtable_get (
  * @i2c_adapter: The adapter being wrapped
  */
 struct lights_adapter_context {
-    const struct lights_adapter_vtable  *vtable;
+    struct lights_adapter_vtable  const *vtable;
     struct list_head                    siblings;
     struct kref                         refs;
     struct mutex                        lock;
@@ -110,7 +112,7 @@ static DEFINE_SPINLOCK(lights_adapter_lock);
  * have been one created for the underlying device.
  */
 static struct lights_adapter_context *lights_adapter_find (
-    const struct lights_adapter_client *client
+    struct lights_adapter_client const *client
 ){
     struct lights_adapter_context *context;
 
@@ -156,8 +158,8 @@ static struct lights_adapter_context *lights_adapter_find (
  * @async:      Required by async
  * @msg:        Linked list of messaged
  * @client:     Adapter and address
+ * @thunk:      Callers suplemental completion data
  * @completion: Callers completion handler
- * @priv_data:  Callers suplemental completion data
  *
  * The objects are memory pool managed. A linked list of messages
  * consists of one fully initialized job head, followed by zero
@@ -167,8 +169,8 @@ struct lights_adapter_job {
     struct async_job                async;
     struct lights_adapter_msg       msg;
     struct lights_adapter_client    client;
+    struct lights_thunk             *thunk;
     lights_adapter_done_t           completion;
-    void                            *priv_data;
 };
 #define job_from_async(ptr)( \
     container_of(ptr, struct lights_adapter_job, async) \
@@ -204,8 +206,8 @@ static inline struct lights_adapter_job *reserve_alloc_job (
  * @job:     Previously created with @reserve_alloc_job
  */
 static inline void reserve_free_job (
-    struct lights_adapter_context * context,
-    struct lights_adapter_job const * job
+    struct lights_adapter_context *context,
+    struct lights_adapter_job const *job
 ){
     if (IS_NULL(context, job))
         return;
@@ -245,6 +247,8 @@ static void lights_adapter_destroy (
     kfree(context);
 }
 
+#define MSG_ACTION  (MSG_QUICK|MSG_BYTE|MSG_BYTE_DATA|MSG_WORD_DATA|MSG_BLOCK_DATA)
+
 /**
  * lights_adapter_smbus_read() - Processes a single read
  *
@@ -256,14 +260,13 @@ static void lights_adapter_destroy (
  * Read values are stored in the given @msg.
  */
 static error_t lights_adapter_smbus_read (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msg
 ){
     union i2c_smbus_data data;
-    // int status;
     s32 result = -EIO;
 
-    switch (msg->type) {
+    switch (msg->flags & MSG_ACTION) {
         case MSG_BYTE:
             result = i2c_smbus_xfer(
                 client->i2c_client.adapter,
@@ -272,8 +275,7 @@ static error_t lights_adapter_smbus_read (
                 I2C_SMBUS_READ, 0,
                 I2C_SMBUS_BYTE, &data
             );
-            // result = i2c_smbus_read_byte(&client->i2c_client);
-            msg->data.byte = (u8)result;
+            msg->data.byte = data.byte;
             msg->length = 1;
             break;
         case MSG_BYTE_DATA:
@@ -281,11 +283,10 @@ static error_t lights_adapter_smbus_read (
                 client->i2c_client.adapter,
                 client->i2c_client.addr,
                 client->i2c_client.flags,
-                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_READ, msg->command,
                 I2C_SMBUS_BYTE_DATA, &data
             );
-            // result = i2c_smbus_read_byte_data(&client->i2c_client, msg->command);
-            msg->data.byte = (u8)result;
+            msg->data.byte = data.byte;
             msg->length = 1;
             break;
         case MSG_WORD_DATA:
@@ -293,15 +294,15 @@ static error_t lights_adapter_smbus_read (
                 client->i2c_client.adapter,
                 client->i2c_client.addr,
                 client->i2c_client.flags,
-                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_READ, msg->command,
                 I2C_SMBUS_WORD_DATA, &data
             );
-            if (msg->swapped)
-                // result = i2c_smbus_read_word_swapped(&client->i2c_client, msg->command);
-                msg->data.word = swab16(result);
+
+            if (msg->flags & MSG_SWAPPED)
+                msg->data.word = swab16(data.word);
             else
-                // result = i2c_smbus_read_word_data(&client->i2c_client, msg->command);
-                msg->data.word = (u16)result;
+                msg->data.word = data.word;
+
             msg->length = 2;
             break;
         case MSG_BLOCK_DATA:
@@ -309,16 +310,14 @@ static error_t lights_adapter_smbus_read (
                 client->i2c_client.adapter,
                 client->i2c_client.addr,
                 client->i2c_client.flags,
-                I2C_SMBUS_READ, 0,
+                I2C_SMBUS_READ, msg->command,
                 I2C_SMBUS_BLOCK_DATA, &data
             );
+
         	if (!result) {
                 memcpy(msg->data.block, &data.block[1], data.block[0]);
                 msg->length = data.block[0];
             }
-            // return data.block[0];
-            // result = i2c_smbus_read_block_data(&client->i2c_client, msg->command, msg->data.block);
-            // msg->length = (u8)result;
             break;
         default:
             return -EINVAL;
@@ -336,13 +335,13 @@ static error_t lights_adapter_smbus_read (
  * @return: Zero or negative error number
  */
 static error_t lights_adapter_smbus_write (
-    const struct lights_adapter_client * client,
-    const struct lights_adapter_msg * msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg const *msg
 ){
     union i2c_smbus_data data;
     int result = -EIO;
 
-    switch (msg->type) {
+    switch (msg->flags & MSG_ACTION) {
         case MSG_BYTE:
             result = i2c_smbus_xfer(
                 client->i2c_client.adapter,
@@ -351,7 +350,6 @@ static error_t lights_adapter_smbus_write (
                 I2C_SMBUS_WRITE, msg->data.byte,
                 I2C_SMBUS_BYTE, NULL
             );
-            // result = i2c_smbus_write_byte(&client->i2c_client, msg->data.byte);
             break;
         case MSG_BYTE_DATA:
             data.byte = msg->data.byte;
@@ -362,14 +360,11 @@ static error_t lights_adapter_smbus_write (
                 I2C_SMBUS_WRITE, msg->command,
                 I2C_SMBUS_BYTE_DATA, &data
             );
-            // result = i2c_smbus_write_byte_data(&client->i2c_client, msg->command, msg->data.byte);
             break;
         case MSG_WORD_DATA:
-            if (msg->swapped)
+            if (msg->flags & MSG_SWAPPED)
                 data.word = swab16(msg->data.word);
-                // result = i2c_smbus_write_word_swapped(&client->i2c_client, msg->command, msg->data.word);
             else
-                // result = i2c_smbus_write_word_data(&client->i2c_client, msg->command, msg->data.word);
                 data.word = msg->data.word;
 
             result = i2c_smbus_xfer(
@@ -394,7 +389,6 @@ static error_t lights_adapter_smbus_write (
                 I2C_SMBUS_WRITE, msg->command,
                 I2C_SMBUS_BLOCK_DATA, &data
             );
-            // result = i2c_smbus_write_block_data(&client->i2c_client, msg->command, msg->length, msg->data.block);
             break;
         default:
             return -EINVAL;
@@ -412,15 +406,13 @@ static error_t lights_adapter_smbus_write (
  * @return: Zero or negative error number
  */
 static error_t lights_adapter_usb_read (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msg
 ){
     struct usb_packet pkt = {
         .length = msg->length,
         .data = msg->data.block
     };
-
-    // dump_msg("lights_adapter_usb_read(): ", &pkt, sizeof(pkt));
 
     return usb_read_packet(&client->usb_client, &pkt);
 }
@@ -434,8 +426,8 @@ static error_t lights_adapter_usb_read (
  * @return: Zero or negative error number
  */
 static error_t lights_adapter_usb_write (
-    const struct lights_adapter_client *client,
-    const struct lights_adapter_msg *msg
+    struct lights_adapter_client const *client,
+    struct lights_adapter_msg const *msg
 ){
     struct usb_packet pkt = {
         .length = msg->length,
@@ -454,10 +446,10 @@ static error_t lights_adapter_usb_write (
  * siblings only contain a msg.
  */
 static int lights_adapter_job_free (
-    const struct lights_adapter_job * job
+    struct lights_adapter_job const *job
 ){
-    struct lights_adapter_context * context;
-    struct lights_adapter_job const * next;
+    struct lights_adapter_context *context;
+    struct lights_adapter_job const *next;
     int sanity = LIGHTS_ADAPTER_MAX_MSGS;
     int count = 0;
 
@@ -492,8 +484,8 @@ static void lights_adapter_job_execute (
     enum async_queue_state state
 ){
     struct lights_adapter_job * const job = job_from_async(async_job);
-    struct lights_adapter_context * context;
-    struct lights_adapter_msg * msg;
+    struct lights_adapter_context *context;
+    struct lights_adapter_msg *msg;
     int sanity = LIGHTS_ADAPTER_MAX_MSGS;
     int count = 0;
     error_t err = 0;
@@ -514,7 +506,7 @@ static void lights_adapter_job_execute (
 
         /* Process each message in the job */
         while (msg && --sanity) {
-            if (msg->read)
+            if (msg->flags & MSG_READ)
                 err = context->vtable->read(&job->client, msg);
             else
                 err = context->vtable->write(&job->client, msg);
@@ -532,9 +524,9 @@ static void lights_adapter_job_execute (
             LIGHTS_ERR("Message count exceeded LIGHTS_ADAPTER_MAX_MSGS");
 
         /* Notify caller, pass the erroring message, or first */
-        job->completion(err ? msg : &job->msg, job->priv_data, err);
+        job->completion(err ? msg : &job->msg, job->thunk, err);
     } else {
-        job->completion(&job->msg, job->priv_data, -ECANCELED);
+        job->completion(&job->msg, job->thunk, -ECANCELED);
     }
 
     if (count != lights_adapter_job_free(job) && !err)
@@ -633,12 +625,12 @@ error:
  * @return: Zero or a negative error code
  */
 error_t lights_adapter_xfer (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msgs,
     size_t count
 ){
-    struct lights_adapter_context * context;
-    const struct lights_adapter_vtable * vtable;
+    struct lights_adapter_context *context;
+    struct lights_adapter_vtable const *vtable;
     error_t err = 0;
     int i;
 
@@ -660,7 +652,7 @@ error_t lights_adapter_xfer (
     }
 
     for (i = 0; i < count && !err; i++) {
-        if (msgs[i].read)
+        if (msgs[i].flags & MSG_READ)
             err = vtable->read(client, &msgs[i]);
         else
             err = vtable->write(client, &msgs[i]);
@@ -684,19 +676,19 @@ EXPORT_SYMBOL_NS_GPL(lights_adapter_xfer, LIGHTS);
  * @client:    Hardware parameters
  * @msgs:      One or more messages to send
  * @msg_count: Number of messages to send
- * @cb_data:   Second parameter of @callback
+ * @thunk:     Second parameter of @callback
  * @callback:  Completion function
  *
  * @return: Zero or a negative error code
  */
 error_t lights_adapter_xfer_async (
-    const struct lights_adapter_client *client,
+    struct lights_adapter_client const *client,
     struct lights_adapter_msg *msgs,
     size_t count,
-    void *cb_data,
+    struct lights_thunk *thunk,
     lights_adapter_done_t callback
 ){
-    struct lights_adapter_context * context;
+    struct lights_adapter_context *context;
     struct lights_adapter_job *job;
     error_t err = 0;
 
@@ -705,18 +697,11 @@ error_t lights_adapter_xfer_async (
 
     context = client->adapter;
 
-    err = lights_adapter_init(context);
-    if (err) {
-        LIGHTS_ERR("Failed to initialize adapter async: %d", err);
-        kref_put(&context->refs, lights_adapter_destroy);
-        return err;
-    }
-
     /* Create a linked list of jobs, one for each message */
     job = lights_adapter_job_create(context, count, msgs);
     job->client     = *client;
     job->completion = callback;
-    job->priv_data  = cb_data;
+    job->thunk      = thunk;
 
     err = async_queue_add(context->async_queue, &job->async);
     if (err) {
@@ -763,7 +748,8 @@ error_t lights_adapter_register (
     size_t max_async
 ){
     struct lights_adapter_context *context;
-    const struct lights_adapter_vtable *vtable;
+    struct lights_adapter_vtable const *vtable;
+    bool usb_registered = false;
     error_t err = 0;
 
     if (IS_NULL(client))
@@ -805,14 +791,30 @@ error_t lights_adapter_register (
                 LIGHTS_DBG("Created I2C adapter '%s'", context->name);
                 break;
             case LIGHTS_PROTOCOL_USB:
+                /*
+                 * NOTE
+                 * The clients onConnect handler is not able to make
+                 * async calls until this function has returned.
+                 */
                 err = usb_controller_register(&client->usb_client);
                 if (err)
                     goto error_free;
 
+                usb_registered = true;
                 context->name = client->usb_client.name;
                 context->usb_controller = client->usb_client.controller;
                 LIGHTS_DBG("Created USB adapter '%s'", context->name);
                 break;
+            default:
+                LIGHTS_ERR("Unsupported protocol");
+                err = -EINVAL;
+                goto error_free;
+        }
+
+        err = lights_adapter_init(context);
+        if (err) {
+            LIGHTS_ERR("Failed to initialize adapter async: %d", err);
+            goto error_free;
         }
 
         spin_lock(&lights_adapter_lock);
@@ -825,6 +827,9 @@ error_t lights_adapter_register (
     return err;
 
 error_free:
+    if (usb_registered)
+        usb_controller_unregister(&client->usb_client);
+
     kfree(context);
 
     client->adapter = NULL;

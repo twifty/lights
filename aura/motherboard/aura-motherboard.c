@@ -33,9 +33,9 @@ struct aura_smbus_adapter {
  * @aura_ctrl: AURA controller for all zones
  */
 struct aura_motherboard_ctrl {
-    struct list_head            siblings;
-    struct list_head            zone_list;
-    struct aura_controller      *aura_ctrl;
+    struct list_head                siblings;
+    struct list_head                zone_list;
+    struct aura_controller const    *aura;
 };
 
 /**
@@ -45,170 +45,11 @@ struct aura_motherboard_ctrl {
  * @lights:   Userland access to the zone
  */
 struct aura_motherboard_zone {
-    struct list_head    siblings;
-    struct lights_dev   lights;
+    struct list_head        siblings;
+    struct lights_dev       lights;
+    struct aura_zone const  *aura;
 };
 
-struct callback_data {
-    int     count;
-    error_t error;
-};
-
-/**
- * aura_motherboard_color_read() - Reads the color of a single zone
- *
- * @data:  A struct aura_zone
- * @state: Buffer to read into
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_color_read (
-    void *data,
-    struct lights_state *state
-){
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_controller_get_zone_color(data, &state->color);
-}
-
-/**
- * aura_motherboard_color_write() - Writes a single zone color
- *
- * @data:  A struct aura_zone
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_color_write (
-    void *data,
-    const struct lights_state *state
-){
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_COLOR))
-        return -EINVAL;
-
-    return aura_controller_set_zone_color(data, &state->color);
-}
-
-/**
- * aura_motherboard_color_read() - Reads the mode of a single zone
- *
- * @data:  A struct aura_zone
- * @state: Buffer to read into
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_mode_read (
-    void *data,
-    struct lights_state *state
-){
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_controller_get_mode(data, &state->mode);
-}
-
-/**
- * aura_motherboard_color_write() - Writes a single zone mode
- *
- * @data:  A struct aura_zone
- * @state: Buffer to read from
- *
- * @return: Zero or a negative error code
- */
-static error_t aura_motherboard_mode_write (
-    void *data,
-    const struct lights_state *state
-){
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    return aura_controller_set_mode(data, &state->mode);
-}
-
-static error_t aura_motherboard_update (
-    void *data,
-    const struct lights_state *state
-){
-    error_t err;
-
-    if (IS_NULL(data, state) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
-        return -EINVAL;
-
-    if (state->type & LIGHTS_TYPE_MODE) {
-        err = aura_controller_set_mode(data, &state->mode);
-        if (err)
-            return err;
-    }
-
-    if (state->type & LIGHTS_TYPE_COLOR) {
-        err = aura_controller_set_color(data, &state->color);
-        if (err)
-            return err;
-    }
-
-    return 0;
-}
-
-
-/**
- * aura_motherboard_zone_create() - Sets up the Userland files for the zone
- *
- * @ctrl:  Owning controller
- * @index: Zero based index of the zone
- *
- * @return: Zero or a negative error number
- */
-static error_t aura_motherboard_zone_create (
-    struct aura_motherboard_ctrl *ctrl,
-    uint8_t index
-){
-    struct aura_zone *aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, index);
-    struct lights_io_attribute attrs[] = {
-        LIGHTS_MODE_ATTR(
-            aura_zone,
-            aura_motherboard_mode_read,
-            aura_motherboard_mode_write
-        ),
-        LIGHTS_COLOR_ATTR(
-            aura_zone,
-            aura_motherboard_color_read,
-            aura_motherboard_color_write
-        )
-    };
-    struct aura_motherboard_zone *ctrl_zone;
-    error_t err;
-
-    aura_zone = aura_controller_get_zone(ctrl->aura_ctrl, index);
-    if (IS_ERR(aura_zone))
-        return PTR_ERR(aura_zone);
-
-    ctrl_zone = kzalloc(sizeof(*ctrl_zone), GFP_KERNEL);
-    if (!ctrl_zone)
-        return -ENOMEM;
-
-    ctrl_zone->lights.name = aura_zone->name;
-    ctrl_zone->lights.caps = aura_controller_get_caps();
-
-    err = lights_device_register(&ctrl_zone->lights);
-    if (err)
-        goto error_free_zone;
-
-    err = lights_create_files(&ctrl_zone->lights, attrs, ARRAY_SIZE(attrs));
-    if (err) {
-        lights_device_unregister(&ctrl_zone->lights);
-        goto error_free_zone;
-    }
-
-    list_add_tail(&ctrl_zone->siblings, &ctrl->zone_list);
-
-    return 0;
-
-error_free_zone:
-    kfree(ctrl_zone);
-
-    return err;
-}
 
 /**
  * aura_motherboard_zone_destroy() - Removes all Userland access
@@ -220,6 +61,36 @@ static void aura_motherboard_zone_destroy (
 ){
     lights_device_unregister(&zone->lights);
     kfree(zone);
+}
+
+/**
+ * aura_motherboard_zone_create() - Sets up the Userland files for the zone
+ *
+ * @ctrl:  Owning controller
+ * @index: Zero based index of the zone
+ *
+ * @return: Zero or a negative error number
+ */
+static error_t aura_motherboard_zone_create (
+    struct aura_motherboard_ctrl *ctrl,
+    struct aura_zone const *aura_zone
+){
+    struct aura_motherboard_zone *ctrl_zone;
+    error_t err;
+
+    ctrl_zone = kzalloc(sizeof(*ctrl_zone), GFP_KERNEL);
+    if (!ctrl_zone)
+        return -ENOMEM;
+
+    ctrl_zone->aura = aura_zone;
+
+    err = aura_controller_register_zone(aura_zone, &ctrl_zone->lights, NULL);
+    if (err)
+        return err;
+
+    list_add_tail(&ctrl_zone->siblings, &ctrl->zone_list);
+
+    return 0;
 }
 
 /**
@@ -237,7 +108,7 @@ static void aura_motherboard_ctrl_destroy (
         aura_motherboard_zone_destroy(zone);
     }
 
-    aura_controller_destroy(ctrl->aura_ctrl);
+    aura_controller_destroy(ctrl->aura);
     kfree(ctrl);
 }
 
@@ -249,9 +120,10 @@ static void aura_motherboard_ctrl_destroy (
  * @return: Zero or a negative error code
  */
 static error_t aura_motherboard_ctrl_create (
-    struct aura_controller *aura
+    struct aura_controller const *aura
 ){
     struct aura_motherboard_ctrl *ctrl;
+    struct aura_zone const *zone;
     error_t err;
     uint8_t i;
 
@@ -261,11 +133,18 @@ static error_t aura_motherboard_ctrl_create (
         goto error_free_ctrl;
     }
 
-    ctrl->aura_ctrl = aura;
+    // ctrl->thunk.value = CTRL_HASH;
+    ctrl->aura = aura;
     INIT_LIST_HEAD(&ctrl->zone_list);
 
     for (i = 0; i < aura->zone_count; i++) {
-        err = aura_motherboard_zone_create(ctrl, i);
+        zone = aura_controller_get_zone(aura, i);
+        if (IS_ERR(zone)) {
+            err = CLEAR_ERR(zone);
+            goto error_free_ctrl;
+        }
+
+        err = aura_motherboard_zone_create(ctrl, zone);
         if (err)
             goto error_free_ctrl;
     }
@@ -340,14 +219,14 @@ static void aura_motherboard_adapter_destroy (
  * controller will have all zones and uerland access. Although an async device
  * is given, the actual probing of the device is done synchronously.
  */
-static struct aura_controller *aura_motherboard_probe_address (
+static struct aura_controller const *aura_motherboard_probe_address (
     struct i2c_adapter *i2c_adapter,
     uint8_t address
 ){
-    struct aura_controller *aura;
+    struct aura_controller const *aura;
     error_t err;
 
-    aura = aura_controller_create(&LIGHTS_SMBUS_CLIENT(i2c_adapter, address, 0));
+    aura = aura_controller_create(&LIGHTS_SMBUS_CLIENT(i2c_adapter, address, 0), "motherboard");
     if (IS_ERR(aura))
         return aura;
 
@@ -383,9 +262,9 @@ error_free_aura:
 static int aura_motherboard_probe_adapter (
     struct i2c_adapter *i2c_adapter
 ){
-    struct aura_controller *ctrl;
-    struct aura_controller *slaves[4] = {0};
-    const unsigned char ctrl_addresses[] = { 0x40, 0x4E };
+    struct aura_controller const *ctrl;
+    struct aura_controller const *slaves[4] = {0};
+    const uint8_t ctrl_addresses[] = { 0x40, 0x4E };
     uint32_t i, j;
     int created = 0;
     int found = 0;
@@ -433,34 +312,21 @@ static int aura_motherboard_probe_adapter (
  */
 static int aura_motherboard_probe_device (
     struct device *dev,
-    void *data
+    void *found
 ){
-    struct callback_data *cb_data = data;
-    // struct aura_smbus_adapter *smbus_adapter;
-    error_t found;
+    int err;
 
-    if (dev->type != &i2c_adapter_type || cb_data->count)
-        return cb_data->count;
-    if (cb_data->error)
-        return cb_data->error;
+    if (dev->type != &i2c_adapter_type || *(int*)found)
+        return 0;
 
-    // smbus_adapter = aura_motherboard_adapter_create(to_i2c_adapter(dev), NULL);
-    // if (IS_ERR_OR_NULL(smbus_adapter)) {
-    //     cb_data->error = CLEAR_ERR(smbus_adapter);
-    //     return cb_data->error;
-    // }
+    err = aura_motherboard_probe_adapter(to_i2c_adapter(dev));
 
-    found = aura_motherboard_probe_adapter(to_i2c_adapter(dev));
-
-    if (found > 0) {
-        cb_data->count += found;
-        return cb_data->count;
-    } else {
-        // aura_motherboard_adapter_destroy(smbus_adapter);
-        if (found < 0)
-            cb_data->error = found;
-        return found;
+    if (err > 0) {
+        *(int*)found += err;
+        return 0;
     }
+
+    return err;
 }
 
 /**
@@ -490,39 +356,38 @@ void aura_motherboard_release (
  * @return: Zero or a negative error number
  */
 error_t aura_motherboard_probe (
-    const struct lights_state *state
+    struct lights_state const *state
 ){
     struct i2c_adapter *i2c_adapter;
     struct aura_smbus_adapter *smbus_adapter;
     struct aura_motherboard_ctrl *ctrl;
-    struct callback_data data = {0};
-    int i, found;
+    int i, found = 0;
     error_t err;
 
-    // TODO: This should not return an error for not found
-    i2c_for_each_dev(&data, aura_motherboard_probe_device);
-    err = data.error;
+    err = i2c_for_each_dev(&found, aura_motherboard_probe_device);
 
-    for (i = 0; i < ARRAY_SIZE(smbus_factory) && !err; i++) {
-        AURA_DBG("Attempting to create I2C adapter '%s'", smbus_factory[i].name);
+    if (!found) {
+        for (i = 0; i < ARRAY_SIZE(smbus_factory) && !err; i++) {
+            AURA_DBG("Attempting to create I2C adapter '%s'", smbus_factory[i].name);
 
-        i2c_adapter = smbus_factory[i].create();
-        if (!IS_ERR_OR_NULL(i2c_adapter)) {
-            found = aura_motherboard_probe_adapter(i2c_adapter);
-            if (found > 0) {
-                smbus_adapter = aura_motherboard_adapter_create(i2c_adapter, smbus_factory[i].destroy);
-                if (IS_ERR_OR_NULL(smbus_adapter)) {
+            i2c_adapter = smbus_factory[i].create();
+            if (!IS_ERR_OR_NULL(i2c_adapter)) {
+                found = aura_motherboard_probe_adapter(i2c_adapter);
+                if (found > 0) {
+                    smbus_adapter = aura_motherboard_adapter_create(i2c_adapter, smbus_factory[i].destroy);
+                    if (IS_ERR_OR_NULL(smbus_adapter)) {
+                        smbus_factory[i].destroy(i2c_adapter);
+                        err = CLEAR_ERR(smbus_adapter);
+                        break;
+                    }
+                } else {
                     smbus_factory[i].destroy(i2c_adapter);
-                    err = CLEAR_ERR(smbus_adapter);
+                    err = found;
                     break;
                 }
             } else {
-                smbus_factory[i].destroy(i2c_adapter);
-                err = found;
-                break;
+                AURA_DBG("Failed to create I2C adapter '%s'", smbus_factory[i].name);
             }
-        } else {
-            AURA_DBG("Failed to create I2C adapter '%s'", smbus_factory[i].name);
         }
     }
 
@@ -530,7 +395,7 @@ error_t aura_motherboard_probe (
         aura_motherboard_release();
     } else {
         list_for_each_entry(ctrl, &aura_motherboard_ctrl_list, siblings)
-            aura_motherboard_update(ctrl, state);
+            aura_controller_update(ctrl->aura, &state->mode, &state->color);
     }
 
     return 0;

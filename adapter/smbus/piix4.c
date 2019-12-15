@@ -38,7 +38,7 @@
  * register a pci_driver, because someone else might
  * want to register another driver on the same PCI id.
  */
-static const struct pci_device_id smbus_piix4_tbl[] = {
+static struct pci_device_id const smbus_piix4_tbl[] = {
     { PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_KERNCZ_SMBUS) }, // 0x1022 0x790b
     { 0, },            /* End of list */
 };
@@ -225,7 +225,7 @@ static uint32_t smbus_piix4_func (
         I2C_FUNC_SMBUS_BLOCK_DATA;
 }
 
-static const struct i2c_algorithm smbus_piix4_algorithm = {
+static struct i2c_algorithm const smbus_piix4_algorithm = {
     .smbus_xfer    = smbus_piix4_transfer,
     .functionality = smbus_piix4_func,
 };

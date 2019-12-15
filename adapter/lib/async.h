@@ -7,7 +7,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-#include <adapter/debug.h>
+// #include <adapter/debug.h>
 #include <include/types.h>
 
 /* Forward declaration */

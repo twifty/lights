@@ -34,7 +34,7 @@ void reg_write (
 );
 
 uint32_t reg_get_field_value(
-    const struct reg_fields *field
+    struct reg_fields const *field
 );
 uint32_t reg_set_field_value(
     uint32_t value,
@@ -56,20 +56,20 @@ uint32_t reg_set_field_value(
 uint32_t reg_update_ex(
     struct aura_reg_service *service,
     uint32_t addr,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 );
 uint32_t reg_update_seq_ex(
     struct aura_reg_service *service,
     uint32_t addr,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 );
 uint32_t reg_set_ex(
     struct aura_reg_service *service,
     uint32_t addr,
     uint32_t init,
-    const struct reg_fields *fields,
+    struct reg_fields const *fields,
     ssize_t cnt
 );
 uint32_t reg_get_ex(

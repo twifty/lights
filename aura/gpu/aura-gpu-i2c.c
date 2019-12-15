@@ -59,9 +59,9 @@ struct aura_i2c_context {
     uint32_t                    timeout_delay;
     uint32_t                    timeout_interval;
 
-    const struct i2c_registers  *registers;
-    const struct i2c_shift      *shifts;
-    const struct i2c_mask       *masks;
+    struct i2c_registers const  *registers;
+    struct i2c_shift const      *shifts;
+    struct i2c_mask const       *masks;
 
     struct i2c_adapter          i2c_adapter;
     struct mutex                mutex;
@@ -189,7 +189,7 @@ static void close_engine (
 
 
 static bool process_transaction (
-    const struct aura_i2c_context *context,
+    struct aura_i2c_context const *context,
     struct aura_i2c_transaction *request
 ){
     struct aura_reg_service *reg = context->reg_service;
@@ -310,7 +310,7 @@ static bool process_transaction (
 }
 
 static void execute_transaction (
-    const struct aura_i2c_context *context
+    struct aura_i2c_context const *context
 ){
     struct aura_reg_service *reg = context->reg_service;
 
@@ -386,7 +386,7 @@ static void process_reply (
 }
 
 static enum aura_i2c_result get_channel_status (
-    const struct aura_i2c_context *context
+    struct aura_i2c_context const *context
 ){
     struct aura_reg_service *reg = context->reg_service;
     struct reg_fields status = PIN_FIELDS(context, GENERIC_I2C_STATUS, 0);
@@ -566,13 +566,13 @@ static u32 aura_gpu_i2c_func (
     return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
 
-static const struct i2c_algorithm aura_gpu_i2c_algo = {
+static struct i2c_algorithm const aura_gpu_i2c_algo = {
     .master_xfer   = aura_gpu_i2c_xfer,
     .functionality = aura_gpu_i2c_func,
 };
 
 
-static const struct asic_context* aura_gpu_i2c_get_ddc_context (
+static struct asic_context const *aura_gpu_i2c_get_ddc_context (
     enum aura_asic_type asic_type
 ){
     switch (asic_type) {
@@ -608,7 +608,7 @@ static struct aura_i2c_context* aura_gpu_i2c_context_create (
 ){
     struct aura_reg_service *registry;
     struct aura_i2c_context *context;
-    const struct asic_context *ddc_context;
+    struct asic_context const *ddc_context;
     error_t err;
 
     ddc_context = aura_gpu_i2c_get_ddc_context(asic_type);
@@ -681,7 +681,7 @@ struct i2c_adapter *gpu_adapter_create (
     void
 ){
     struct pci_dev *pci_dev;
-    const struct pci_device_id *match;
+    struct pci_device_id const *match;
     struct aura_i2c_context *context = NULL;
 
     /* Handle the case of mixed GPU types */
@@ -708,7 +708,7 @@ int gpu_adapters_create (
     uint8_t count
 ){
     struct pci_dev *pci_dev;
-    const struct pci_device_id *match;
+    struct pci_device_id const *match;
     struct aura_i2c_context *context = NULL;
     error_t err;
     int found;
