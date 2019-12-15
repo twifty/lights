@@ -328,6 +328,8 @@ static error_t aura_gpu_discover (
     int i, j;
 
     for (j = 0; j < ARRAY_SIZE(chipset_addresses); j++) {
+        AURA_DBG("Scanning '%s' 0x%02x", i2c_adapter->name, chipset_addresses[j]);
+
         *client = LIGHTS_I2C_CLIENT(i2c_adapter, chipset_addresses[j], 0);
 
         for (i = 0; i < 2; i++) {
@@ -944,10 +946,11 @@ error_t aura_gpu_probe (
     int i = 0, found = 0;
     error_t err;
 
+    AURA_DBG("Trying built-in drivers");
     err = i2c_for_each_dev(&found, aura_gpu_probe_device);
 
     if (!err && found < MAX_SUPPORTED_GPUS) {
-        AURA_DBG("Trying built-in drivers");
+        AURA_DBG("Trying custom drivers");
 
         adapter_count = gpu_adapters_create(adapters, ARRAY_SIZE(adapters));
         if (adapter_count < 0) {
