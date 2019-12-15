@@ -9,6 +9,7 @@
 
 // #include <adapter/debug.h>
 #include <include/types.h>
+#include <include/quirks.h>
 
 /* Forward declaration */
 struct async_job;
