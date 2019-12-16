@@ -94,7 +94,7 @@ struct lights_file {
     struct cdev                         cdev;
     struct device                       *dev;
     struct list_head                    siblings;
-    struct lights_io_attribute const    attr;
+    struct lights_io_attribute     attr;
     struct lights_interface             *intf;
     struct file_operations              fops;
 };
@@ -118,11 +118,17 @@ struct lights_interface {
     struct device           kdev;
     struct kref             refs;
     struct lights_color     *led_buffer;
+    struct lights_file      update;
+    struct lights_thunk     thunk;
     struct list_head        file_list;
     spinlock_t              file_lock;
     uint16_t                id;
     char                    name[LIGHTS_MAX_FILENAME_LENGTH];
 };
+#define INTERFACE_MAGIC 'INTF'
+#define interface_from_thunk(ptr) ( \
+    lights_thunk_container(ptr, struct lights_interface, thunk, INTERFACE_MAGIC) \
+)
 #define interface_from_dev(dev)( \
     container_of(dev, struct lights_interface, kdev) \
 )
@@ -775,7 +781,7 @@ found:
  */
 static struct lights_file *find_attribute_for_type (
     struct lights_interface *intf,
-    enum lights_io_type type
+    enum lights_state_type type
 ){
     struct lights_file *iter;
 
@@ -1550,8 +1556,8 @@ static ssize_t lights_update_attribute_write (
     loff_t *off
 ){
     struct lights_file const *file;
-    enum lights_io_type allowed = (
-        LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION
+    enum lights_state_type allowed = (
+        LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION | LIGHTS_TYPE_SYNC
     );
     struct lights_state state;
     error_t err;
@@ -1737,44 +1743,66 @@ static error_t file_operations_create (
     }
 
     file->fops.owner = attr->owner;
-    memcpy((void*)&file->attr, attr, sizeof(file->attr));
+    file->attr = *attr;
+    // memcpy((void*)&file->attr, attr, sizeof(file->attr));
 
     return 0;
 }
 
-/**
- * lights_file_create() - Character device creation
- *
- * @intf: Owning interface
- * @attr: Attributes of the file
- *
- * @return: Character device wrapper or negative error code
- */
-static struct lights_file *lights_file_create (
+static error_t lights_update_attribute_default(
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct lights_interface *intf = interface_from_thunk(thunk);
+    struct lights_file *file;
+    enum lights_state_type accepted[] = {
+        LIGHTS_TYPE_MODE,
+        LIGHTS_TYPE_COLOR,
+        LIGHTS_TYPE_SPEED,
+        LIGHTS_TYPE_DIRECTION,
+        LIGHTS_TYPE_SYNC,
+    };
+    int i;
+    error_t err = 0;
+
+    if (IS_NULL(thunk, state, intf))
+        return -EINVAL;
+
+    for (i = 0; i < ARRAY_SIZE(accepted) && !err; i++) {
+        if (state->type & accepted[i]) {
+            if ((file = find_attribute_for_type(intf, accepted[i]))) {
+                if (file->attr.write)
+                    err = file->attr.write(file->attr.thunk, state);
+
+                kref_put(&file->intf->refs, lights_interface_put);
+            }
+        }
+    }
+
+    return err;
+}
+
+static error_t lights_file_init (
+    struct lights_file *file,
     struct lights_interface *intf,
     struct lights_io_attribute const *attr
 ){
-    struct lights_file *file;
     dev_t ver;
     error_t err;
 
-    if (IS_NULL(attr, intf, attr->attr.name) || IS_TRUE(attr->attr.name[0] == 0))
-        return ERR_PTR(-EINVAL);
-
-    file = kzalloc(sizeof(*file), GFP_KERNEL);
-    if (!file)
-        return ERR_PTR(-ENOMEM);
+    if (IS_NULL(file, attr, intf, attr->attr.name) || IS_TRUE(attr->attr.name[0] == 0))
+        return -EINVAL;
 
     err = lights_minor_get(&file->minor);
     if (err) {
         LIGHTS_ERR("Failed to allocate minor number");
-        goto error_free_file;
+        goto error_exit;
     }
 
     err = file_operations_create(file, attr);
     if (err) {
-        LIGHTS_ERR("Failed to file operations: %s", ERR_NAME(err));
-        goto error_free_file;
+        LIGHTS_ERR("Failed to create file operations: %s", ERR_NAME(err));
+        goto error_exit;
     }
 
     file->intf = intf;
@@ -1786,7 +1814,7 @@ static struct lights_file *lights_file_create (
     err = cdev_add(&file->cdev, ver, 1);
     if (err) {
         LIGHTS_ERR("Failed to add character device: %s", ERR_NAME(err));
-        goto error_free_file;
+        goto error_exit;
     }
 
     /*
@@ -1812,13 +1840,56 @@ static struct lights_file *lights_file_create (
 
     LIGHTS_DBG("created device '/dev/lights/%s/%s'", intf->name, attr->attr.name);
 
-    return file;
+    return 0;
 
 error_free_cdev:
     cdev_del(&file->cdev);
 
-error_free_file:
+error_exit:
     lights_minor_put(file->minor);
+
+    return err;
+}
+
+/**
+ * lights_file_create() - Character device creation
+ *
+ * @intf: Owning interface
+ * @attr: Attributes of the file
+ *
+ * @return: Character device wrapper or negative error code
+ *
+ * sysfs will not allow a same named file to be created, so error codes
+ * will be returned.
+ */
+static struct lights_file *lights_file_create (
+    struct lights_interface *intf,
+    struct lights_io_attribute const *attr
+){
+    struct lights_file *file;
+    error_t err;
+
+    if (IS_NULL(attr, intf, attr->attr.name) || IS_TRUE(attr->attr.name[0] == 0))
+        return ERR_PTR(-EINVAL);
+
+    /* Special handling of update file */
+    if (0 == strcmp(attr->attr.name, LIGHTS_IO_UPDATE)) {
+        if (intf->update.attr.write == lights_update_attribute_default) {
+            /* Does it need validating? */
+            intf->update.attr = *attr;
+            return &intf->update;
+        }
+        return ERR_PTR(-EEXIST);
+    }
+
+    file = kzalloc(sizeof(*file), GFP_KERNEL);
+    if (!file)
+        return ERR_PTR(-ENOMEM);
+
+    err = lights_file_init(file, intf, attr);
+    if (!err)
+        return file;
+
     kfree(file);
 
     return ERR_PTR(err);
@@ -1840,7 +1911,11 @@ static void lights_file_destroy (
     lights_minor_put(file->minor);
 
     LIGHTS_DBG("removed device '/dev/lights/%s/%s'", file->intf->name, file->attr.attr.name);
-    kfree(file);
+
+    if (file == &file->intf->update)
+        memset(file, 0, sizeof(*file));
+    else
+        kfree(file);
 }
 
 /**
@@ -1892,6 +1967,10 @@ static void lights_interface_destroy (
 
     if (IS_NULL(intf))
         return;
+
+    /* Possible when owner didn't create an update attr */
+    if (intf->update.siblings.next == 0)
+        list_add_tail(&intf->update.siblings, &intf->file_list);
 
     if (!list_empty(&intf->file_list)) {
         list_for_each_entry_safe(file, safe, &intf->file_list, siblings) {
@@ -1947,6 +2026,17 @@ static struct lights_interface *lights_interface_create (
     intf->kdev.groups = lights_class_groups;
 
     device_register(&intf->kdev);
+
+    /* Register the only default attribute */
+    err = lights_file_init(
+        &intf->update,
+        intf,
+        &LIGHTS_UPDATE_ATTR(&intf->thunk, lights_update_attribute_default)
+    );
+    if (err) {
+        LIGHTS_ERR("Failed to initialize master update: %s", ERR_NAME(err));
+        goto error;
+    }
 
     if (lights->attrs) {
         for (attr = lights->attrs; *attr; attr++) {
@@ -2181,6 +2271,7 @@ static error_t init_default_attributes (
         LIGHTS_COLOR_ATTR(NULL, io_read, io_write),
         LIGHTS_SPEED_ATTR(NULL, io_read, io_write),
         LIGHTS_DIRECTION_ATTR(NULL, io_read, io_write),
+        LIGHTS_UPDATE_ATTR(NULL, io_write),
         LIGHTS_SYNC_ATTR(NULL, io_write),
     };
 

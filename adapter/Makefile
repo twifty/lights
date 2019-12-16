@@ -10,7 +10,6 @@ SRCS = \
 	smbus/piix4.c \
 	smbus/nuvoton.c
 
-# KERNELDIR = /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
 OBJS = $(SRCS:.c=.o)
 
@@ -18,7 +17,6 @@ ifeq ($(KERNELRELEASE),)
 
 all:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -Wall -DDEBUG -I$(PWD)/../"
-	# rm -rf *.o .*.o.d *~ core .depend .*.cmd *.mod *.mod.c .tmp_versions *.order
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean

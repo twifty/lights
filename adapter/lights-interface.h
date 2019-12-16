@@ -162,15 +162,19 @@ struct lights_buffer {
 };
 
 /**
- * enum lights_io_type - @lights_io data type flag
+ * enum lights_state_type - @lights_io data type flag
  *
- * @LIGHTS_TYPE_CUSTOM: @lights_buffer is used (For future use)
- * @LIGHTS_TYPE_MODE:   @lights_mode is used
- * @LIGHTS_TYPE_COLOR:  @lights_color is used
- * @LIGHTS_TYPE_SPEED:  uint8_t is used
- * @LIGHTS_TYPE_LEDS:   @lights_buffer is used
+ * These types are intended to be used in a bitmap. Each bit signifies
+ * which member of struct lights_state has been initialized.
+ *
+ * During file IO operations, a combination of these values will be passed
+ * to callback function. With a few exceptions:
+ *    LIGHTS_TYPE_LEDS can never be combined with LIGHTS_TYPE_CUSTOM
+ *    LIGHTS_TYPE_UPDATE is replaced with all except LEDS and CUSTOM
+ *
+ * TODO - remove UPDATE, the file should be default for all
  */
-enum lights_io_type {
+enum lights_state_type {
     LIGHTS_TYPE_MODE        = 0x01,
     LIGHTS_TYPE_COLOR       = 0x02,
     LIGHTS_TYPE_SPEED       = 0x04,
@@ -184,23 +188,31 @@ enum lights_io_type {
 /**
  * struct lights_state
  *
- * @color:     The global color value
- * @mode:      The global mode value
- * @speed:     The global speed value. This value ranges from 0 to 5 each
- *             representing how a second is to be divided
- * @direction: 0 or 1 to indicate clockwise or anti-clockwise.
+ * @mode:      The global mode value (requires LIGHTS_TYPE_MODE)
+ * @color:     The global color value (requires LIGHTS_TYPE_COLOR)
+ * @raw:       Custom or LED data (requires LIGHTS_TYPE_LEDS or LIGHTS_TYPE_CUSTOM
+ *             it's an error for these two values to appear together)
+ * @speed:     The global speed value. (requires LIGHTS_TYPE_SPEED) This value
+ *             ranges from 0 to 5 each representing how a second is to be divided
+ * @direction: 0 or 1 to indicate clockwise or anti-clockwise. (requires LIGHTS_TYPE_DIRECTION)
+ * @sync:      A value between 0 and 256, set to multiple devices simultaniously.
+ *             The value indicates at which step a particular mode cycle should
+ *             be in. The device should adjust accordingly.
+ *                 Not all devices run at the same speed and not all same-named
+ *             effects run for the same duration. The helps keep those devices
+ *             on different busses in sync with each other.
+ * @type:      One or more type values.
  */
 struct lights_state {
-    struct lights_color     color;
     struct lights_mode      mode;
+    struct lights_color     color;
     struct lights_buffer    raw;
     uint8_t                 speed;
     uint8_t                 direction;
     uint8_t                 sync;
-    enum lights_io_type     type;
+    enum lights_state_type  type;
 };
 
-// typedef error_t (*lights_update_t)(const struct lights_state *);
 typedef error_t (*lights_read_t)(struct lights_thunk *, struct lights_state *);
 typedef error_t (*lights_write_t)(struct lights_thunk *, struct lights_state const *);
 
@@ -220,7 +232,7 @@ typedef error_t (*lights_write_t)(struct lights_thunk *, struct lights_state con
 struct lights_io_attribute {
     struct module           *owner;
     struct attribute        attr;
-    enum lights_io_type     type;
+    enum lights_state_type  type;
     struct lights_thunk     *thunk;
 
     lights_read_t           read;
@@ -238,7 +250,7 @@ struct lights_io_attribute {
  *
  * The modes listed here are available to userland in the 'caps' file. This
  * file is created for each device when modes are given. Each mode is also
- * added to a global list, available at /dev/lights/all/caps. The modes listed
+ * added to a global list, available at /sys/class/lights/all/caps. The modes listed
  * in this file are those which are defined by THIS module AND which are common
  * to each extension.
  */
@@ -249,13 +261,19 @@ struct lights_dev {
     struct lights_io_attribute const * const    *attrs;
 };
 
-#define LIGHTS_ATTR(_name, _mode, _type, _thunk, _read, _write)      \
+#define VERIFY_LIGHTS_TYPE(_type) ( \
+    BUILD_BUG_ON_ZERO(((_type) & ((_type) - 1)) != 0) + \
+    BUILD_BUG_ON_ZERO((_type) > LIGHTS_TYPE_UPDATE) + \
+    (_type) \
+)
+
+#define LIGHTS_ATTR(_name, _mode, _type, _thunk, _read, _write)     \
 (struct lights_io_attribute) {                                      \
     .owner = THIS_MODULE,                                           \
     .attr = {.name = _name,                                         \
              .mode = VERIFY_OCTAL_PERMISSIONS(_mode) },             \
-    .type          = _type,                                         \
-    .thunk         = _thunk,                                         \
+    .type          = VERIFY_LIGHTS_TYPE(_type),                     \
+    .thunk         = _thunk,                                        \
     .read          = _read,                                         \
     .write         = _write,                                        \
 }
@@ -263,7 +281,7 @@ struct lights_dev {
 /**
  * Helper macros for creating lights_io_attribute instances.
  */
-#define LIGHTS_ATTR_RO(_name, _type, _thunk, _read) (    \
+#define LIGHTS_ATTR_RO(_name, _type, _thunk, _read) ( \
     LIGHTS_ATTR(_name, 0444, _type, _thunk, _read, NULL) \
 )
 
@@ -272,7 +290,7 @@ struct lights_dev {
 )
 
 #define LIGHTS_ATTR_RW(_name, _type, _thunk, _read, _write) ( \
-    LIGHTS_ATTR(_name, 0644, _type, _thunk, _read, _write)    \
+    LIGHTS_ATTR(_name, 0644, _type, _thunk, _read, _write) \
 )
 
 #define LIGHTS_CUSTOM_ATTR(_name, _thunk, _read, _write) ( \
