@@ -1749,6 +1749,21 @@ static error_t file_operations_create (
     return 0;
 }
 
+/**
+ * lights_update_attribute_default() - Generic update handler
+ *
+ * @thunk: The interface
+ * @state: New state
+ *
+ * @return: Error code
+ *
+ * The default implementation is for each file in the interface
+ * to be iterated and tested if it accepts the state type. Any
+ * error in the chain will abort the searching.
+ *
+ * Ideally, each interface would have one update handler as a catch
+ * all for the possible types.
+ */
 static error_t lights_update_attribute_default(
     struct lights_thunk *thunk,
     struct lights_state const *state
@@ -1782,6 +1797,15 @@ static error_t lights_update_attribute_default(
     return err;
 }
 
+/**
+ * lights_file_init() - Character device creation
+ *
+ * @file: Pre created file
+ * @intf: Owning interface
+ * @attr: Attributes of the file
+ *
+ * @return: Error code
+ */
 static error_t lights_file_init (
     struct lights_file *file,
     struct lights_interface *intf,
@@ -2015,6 +2039,7 @@ static struct lights_interface *lights_interface_create (
     intf->ldev = lights;
     intf->id = atomic_fetch_inc(&lights_global.next_id);
 
+    lights_thunk_init(&intf->thunk, INTERFACE_MAGIC);
     spin_lock_init(&intf->file_lock);
     INIT_LIST_HEAD(&intf->file_list);
     kref_init(&intf->refs);
