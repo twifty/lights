@@ -17,7 +17,7 @@ OBJS = $(SRCS:.c=.o)
 ifeq ($(KERNELRELEASE),)
 
 all:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -DDEBUG -I$(PWD)/../"
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules EXTRA_CFLAGS="-g -Wall -DDEBUG -I$(PWD)/../"
 	# rm -rf *.o .*.o.d *~ core .depend .*.cmd *.mod *.mod.c .tmp_versions *.order
 
 clean:

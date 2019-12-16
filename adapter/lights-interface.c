@@ -688,8 +688,8 @@ ssize_t lights_read_sync (
     if (len < 4)
         return -EINVAL;
 
-    if (is_user_memory(buffer, len)) {
-        copy_from_user(kern_buf, buffer, len);
+    if (is_user_memory(buffer, ARRAY_SIZE(kern_buf))) {
+        copy_from_user(kern_buf, buffer, ARRAY_SIZE(kern_buf));
         buffer = kern_buf;
     }
 

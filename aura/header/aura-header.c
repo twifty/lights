@@ -155,8 +155,8 @@ enum HEADER_CONSTS {
 };
 
 enum HEADER_CONTROL {
-    MSG_CMD_ENABLE          = 0x00,
-    MSG_CMD_DISABLE         = 0x01,
+    MSG_FLAG_ENABLE         = 0x00,
+    MSG_FLAG_DISABLE        = 0x01,
 
     PACKET_CONTROL          = 0xEC,
     PACKET_CMD_READ         = 0x80,
@@ -165,6 +165,7 @@ enum HEADER_CONTROL {
     PACKET_CMD_CAPS         = 0x30,
     PACKET_CMD_ENABLE       = 0x35,
     PACKET_CMD_EFFECT       = 0x3B,
+    PACKET_CMD_SYNC         = 0x3C,
     PACKET_CMD_RESET        = 0x3F,
     PACKET_CMD_DIRECT       = 0x40,
     PACKET_CMD_OLED_CAPS    = 0x50,
@@ -377,7 +378,7 @@ static int usb_get_zone_count (
         05, 05, 05, 05, 03, 05, 05, 05, 05, 05,
         05, 05, 05, 05, 05, 05, 05, 05, 05, 05//, 04
     };
-    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     struct packet_data *packet;
     int count;
     error_t err = -EIO;
@@ -430,7 +431,7 @@ static error_t usb_get_name (
     char *name,
     size_t len
 ){
-    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     struct packet_data *packet;
     error_t err;
 
@@ -470,7 +471,7 @@ static error_t usb_detect_oled (
     bool *oled_capable,
     uint8_t *oled_type
 ){
-    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    struct lights_adapter_msg msg = ADAPTER_READ_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     struct packet_data *packet;
     error_t err;
 
@@ -516,7 +517,7 @@ static error_t usb_detect_oled (
 static error_t usb_device_reset (
     struct aura_header_controller *ctrl
 ){
-    struct lights_adapter_msg msg = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    struct lights_adapter_msg msg = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     struct packet_data *packet;
     error_t err;
     int i;
@@ -526,7 +527,7 @@ static error_t usb_device_reset (
 
     err = lights_adapter_xfer(&global.client, &msg, 1);
     if (err) {
-        AURA_DBG("usb_write_packet() failed with %s", ERR_NAME(err));
+        AURA_DBG("lights_adapter_xfer() failed with %s", ERR_NAME(err));
         return err;
     }
 
@@ -563,7 +564,7 @@ static int transfer_add_effect (
      */
     struct packet_data *packet;
 
-    *msg = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    *msg = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     packet = packet_init(msg, PACKET_CMD_EFFECT);
 
     packet->data.effect.header       = zone->id;
@@ -615,7 +616,7 @@ static int _transfer_add_direct (
     max_items_per_packet = PACKET_DIRECT_SIZE / data_size;
 
     for (curr_loop = 0; curr_loop < max_loops; curr_loop++) {
-        msg[curr_loop] = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+        msg[curr_loop] = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
         packet = packet_init(&msg[curr_loop], command);
 
         direct = &packet->data.direct;
@@ -660,7 +661,7 @@ static int transfer_add_direct (
    max_items_per_packet = PACKET_DIRECT_SIZE / 3;
 
    for (curr_loop = 0; curr_loop < max_loops; curr_loop++) {
-       msg[curr_loop] = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+       msg[curr_loop] = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
        packet = packet_init(&msg[curr_loop], command);
 
        direct = &packet->data.direct;
@@ -709,11 +710,38 @@ static int transfer_add_enable (
      */
     struct packet_data *packet;
 
-    *msg = ADAPTER_WRITE_BLOCK_DATA(MSG_CMD_ENABLE, PACKET_SIZE);
+    *msg = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
     packet = packet_init(msg, PACKET_CMD_ENABLE);
 
     packet->data.raw[0] = zone->id;
     packet->data.raw[1] = (uint8_t)enable;
+
+    return 1;
+}
+
+/**
+ * transfer_add_sync() - Creates a packet to synchronize a mode with a global
+ *                       stepping value.
+ *
+ * @msg:    Target message
+ * @zone:   Zone being synced
+ * @enable: The stepping value
+ *
+ * @return: Number of packets created
+ */
+static int transfer_add_sync (
+    struct lights_adapter_msg *msg,
+    struct aura_header_zone *zone,
+    uint8_t byte
+){
+    struct packet_data *packet;
+
+    *msg = ADAPTER_WRITE_BLOCK_DATA(MSG_FLAG_ENABLE, PACKET_SIZE);
+    packet = packet_init(msg, PACKET_CMD_SYNC);
+
+    packet->data.raw[0] = zone->id;
+    packet->data.raw[2] = get_aura_mode(&zone->pending.mode);
+    packet->data.raw[3] = byte;
 
     return 1;
 }
@@ -750,7 +778,7 @@ static void aura_header_zone_update_callback (
     }
 
     packet = packet_cast(iter);
-    if (MSG_CMD_DISABLE == lights_adapter_msg_read_flags(iter))
+    if (MSG_FLAG_DISABLE == lights_adapter_msg_read_flags(iter))
         disable = true;
 
     if (PACKET_CMD_ENABLE == packet->command) {
@@ -763,34 +791,40 @@ static void aura_header_zone_update_callback (
     }
 
     if (PACKET_CMD_EFFECT == packet->command) {
-        if (disable)
-            mode = get_lights_mode(AURA_MODE_OFF);
-        else
+        mode = get_lights_mode(disable ? AURA_MODE_OFF : packet->data.effect.mode);
+
+        if (disable || AURA_MODE_DIRECT == get_aura_mode(mode)) {
+            AURA_DBG("Applying mode only: %s", mode->name);
+
+            spin_lock(&zone->lock);
+            zone->active.mode = *mode;
+            spin_unlock(&zone->lock);
+        } else {
             mode = get_lights_mode(packet->data.effect.mode);
-
-        if (!mode) {
-            AURA_ERR("Message contains an invalid mode: 0x%02x", packet->data.effect.mode);
-            return;
-        }
-
-        for (i = 0; i < ARRAY_SIZE(aura_speeds); i++) {
-            if (packet->data.effect.speed + 0x1A > aura_speeds[i]) {
-                effect.speed = i;
-                break;
+            if (!mode) {
+                AURA_ERR("Message contains an invalid mode: 0x%02x", packet->data.effect.mode);
+                return;
             }
+
+            for (i = 0; i < ARRAY_SIZE(aura_speeds); i++) {
+                if (packet->data.effect.speed + 0x1A > aura_speeds[i]) {
+                    effect.speed = i;
+                    break;
+                }
+            }
+
+            effect.mode      = *mode;
+            effect.direction = packet->data.effect.direction;
+            effect.color.r   = packet->data.effect.red;
+            effect.color.g   = packet->data.effect.green;
+            effect.color.b   = packet->data.effect.blue;
+
+            effect_dump("Applying effect: ", &effect);
+
+            spin_lock(&zone->lock);
+            zone->active = effect;
+            spin_unlock(&zone->lock);
         }
-
-        effect.mode      = *mode;
-        effect.direction = packet->data.effect.direction;
-        effect.color.r   = packet->data.effect.red;
-        effect.color.g   = packet->data.effect.green;
-        effect.color.b   = packet->data.effect.blue;
-
-        effect_dump("Applying effect: ", &effect);
-
-        spin_lock(&zone->lock);
-        zone->active = effect;
-        spin_unlock(&zone->lock);
     } else {
         AURA_ERR("Unexpected packet type: %x", packet->command);
         packet_dump("packet 2 post:", packet);
@@ -833,21 +867,31 @@ static error_t aura_header_zone_update (
             );
         }
 
-        count += transfer_add_effect(
-            &zone->msg_buffer[count],
-            zone,
-            effect
-        );
-
+        /*
+         * If new mode is off, A special packet needs to be sent which applies
+         * direct mode with no colors set. But, it's important that the callback
+         * only updates the mode. When a direct mode is being applied, only
+         * the mode should update (all other values remain as a cache).
+         */
         switch (get_aura_mode(&effect->mode)) {
             case AURA_MODE_OFF:
-                lights_adapter_msg_write_flags(&zone->msg_buffer[0], MSG_CMD_DISABLE);
-                update_colors = true;
-                break;
+                lights_adapter_msg_write_flags(&zone->msg_buffer[0], MSG_FLAG_DISABLE);
+                // Fall-through
             case AURA_MODE_DIRECT:
+                count += transfer_add_effect(
+                    &zone->msg_buffer[count],
+                    zone,
+                    &effect_direct
+                );
+
                 update_colors = true;
                 break;
             default:
+                count += transfer_add_effect(
+                    &zone->msg_buffer[count],
+                    zone,
+                    effect
+                );
                 break;
         }
     }
@@ -892,6 +936,9 @@ static error_t aura_header_zone_update (
  * @state: New state to apply to the zone
  *
  * @return: Error code
+ *
+ * This function simply validates and sometimes fixes incorrect values
+ * before calling aura_header_zone_update().
  */
 static error_t aura_header_zone_write (
     struct lights_thunk *thunk,
@@ -921,8 +968,9 @@ static error_t aura_header_zone_write (
     }
 
     if (state->type & LIGHTS_TYPE_SPEED) {
-        speed = max_t(uint8_t, state->speed, 5);
+        speed = min_t(uint8_t, state->speed, 5);
 
+        AURA_DBG("LIGHTS_TYPE_SPEED detected: new %x old %x", speed, effect.speed);
         if (speed != effect.speed) {
             effect.speed = speed;
             update_effect = true;
@@ -947,23 +995,8 @@ static error_t aura_header_zone_write (
 
         /* Return early if mode isn't changing */
         if (header_mode != get_aura_mode(&zone->pending.mode)) {
-            switch (header_mode) {
-                case AURA_MODE_OFF:
-                    /* Overwrite above changes */
-                    effect = effect_off;
-                    update_colors = true;
-                    break;
-
-                case AURA_MODE_DIRECT:
-                    /* Overwrite above changes */
-                    effect = effect_direct;
-                    update_colors = true;
-                    break;
-
-                default:
-                    effect.mode = state->mode;
-                    break;
-            }
+            /* The given mode contains a pointer which may not be ours */
+            effect.mode = *get_lights_mode(header_mode);
             update_effect = true;
         }
     }
@@ -986,11 +1019,16 @@ static error_t aura_header_zone_write (
         update_colors = true;
     }
 
-    err = aura_header_zone_update(
-        zone,
-        update_effect ? &effect : NULL,
-        update_colors ? colors : NULL
-    );
+    if (update_effect || update_colors) {
+        err = aura_header_zone_update(
+            zone,
+            update_effect ? &effect : NULL,
+            update_colors ? colors : NULL
+        );
+    } else {
+        /* Nothing to update is not an error */
+        err = 0;
+    }
 
 exit:
     spin_unlock(&zone->lock);
@@ -1034,6 +1072,33 @@ static error_t aura_header_zone_read (
     return 0;
 }
 
+/**
+ * aura_header_zone_sync() - Userland write handler
+ *
+ * @thunk: Zone being updated
+ * @state: Container of the new sync value
+ *
+ * @return: Error code
+ *
+ * This function is blocking.
+ */
+static error_t aura_header_zone_sync (
+    struct lights_thunk *thunk,
+    struct lights_state const *state
+){
+    struct aura_header_zone *zone = zone_from_thunk(thunk);
+    struct lights_adapter_msg msg;
+
+    if (IS_NULL(thunk, state, zone) || IS_FALSE(state->type & LIGHTS_TYPE_SYNC))
+        return -EINVAL;
+
+    /* Do we need to check if pending mode supports sync? */
+
+    transfer_add_sync(&msg, zone, state->sync);
+
+    /* Should we send this as a blocking call */
+    return lights_adapter_xfer(&global.client, &msg, 1);
+}
 
 /**
  * aura_header_controller_update() - Applies global state to all zones
@@ -1114,6 +1179,7 @@ static error_t aura_header_controller_update (
     return 0;
 }
 
+
 /**
  * aura_header_zone_release() - Releases memory contained within a zone
  *
@@ -1169,6 +1235,10 @@ static error_t aura_header_zone_init (
         LIGHTS_UPDATE_ATTR(
             &zone->thunk,
             aura_header_zone_write
+        ),
+        LIGHTS_SYNC_ATTR(
+            &zone->thunk,
+            aura_header_zone_sync
         )
     };
     error_t err;
