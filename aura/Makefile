@@ -15,7 +15,7 @@ SRCS = \
 	gpu/aura-gpu.c \
 	header/aura-header.c
 
-KERNELDIR = /lib/modules/$(shell uname -r)/build
+# KERNELDIR = /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
 KBUILD_EXTRA_SYMBOLS := $(ADAPTERDIR)/Module.symvers
 OBJS = $(SRCS:.c=.o)

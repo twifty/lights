@@ -1,5 +1,10 @@
 ADAPTERDIR = $(shell pwd)/adapter
+KERNEL ?= $(shell uname -r)
+_KERNELDIRS = $(wildcard /lib/modules/${KERNEL}*/build)
+KERNELDIR = $(shell echo $(_KERNELDIRS) | cut -d' ' -f1)
+
 export ADAPTERDIR
+export KERNELDIR
 
 MODULES = \
 	aura

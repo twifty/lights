@@ -10,7 +10,7 @@ SRCS = \
 	smbus/piix4.c \
 	smbus/nuvoton.c
 
-KERNELDIR = /lib/modules/$(shell uname -r)/build
+# KERNELDIR = /lib/modules/$(shell uname -r)/build
 PWD = $(shell pwd)
 OBJS = $(SRCS:.c=.o)
 

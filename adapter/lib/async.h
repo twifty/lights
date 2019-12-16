@@ -7,9 +7,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-// #include <adapter/debug.h>
 #include <include/types.h>
-#include <include/quirks.h>
 
 /* Forward declaration */
 struct async_job;

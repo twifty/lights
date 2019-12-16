@@ -2,6 +2,7 @@
 #include <linux/kref.h>
 #include <linux/workqueue.h>
 
+#include <include/quirks.h>
 #include <adapter/debug.h>
 #include "async.h"
 
