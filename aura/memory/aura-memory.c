@@ -410,12 +410,13 @@ static error_t aura_memory_probe_adapter (
         err = smbus_write_byte(smbus, 0x36, 0x00, 0x00);
         if (err) {
             /* No pager on this bus indicates no DIMMs */
-            break;
+            return 0;
         }
 
         // Read SPD type
         err = smbus_read_byte(smbus, addr, 0x02, &spd[count].type);
         if (err) {
+            err = 0;
             AURA_DBG("Failed to read SPD type");
             continue;
         }
@@ -423,6 +424,7 @@ static error_t aura_memory_probe_adapter (
         // Read SPD size
         err = smbus_read_byte(smbus, addr, 0x00, &size);
         if (err) {
+            err = 0;
             AURA_DBG("Failed to read SPD size");
             continue;
         }
@@ -453,6 +455,9 @@ static error_t aura_memory_probe_adapter (
 
         count += 1;
     }
+
+    if (count == 0)
+        return 0;
 
     for (i = 0; i < count; i++) {
         // Select page according to size
