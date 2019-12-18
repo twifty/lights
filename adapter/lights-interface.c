@@ -51,31 +51,31 @@ static struct {
 };
 
 static char *default_color      = "#FF0000";
-static char *default_mode       = "static";
+static char *default_effect     = "static";
 static char *default_speed      = "2";
 static char *default_direction  = "0";
 
-static struct lights_mode lights_available_modes[] = {
-    { LIGHTS_MODE_OFF,       LIGHTS_MODE_LABEL_OFF,      },
-    { LIGHTS_MODE_STATIC,    LIGHTS_MODE_LABEL_STATIC,   },
-    { LIGHTS_MODE_BREATHING, LIGHTS_MODE_LABEL_BREATHING },
-    { LIGHTS_MODE_FLASHING,  LIGHTS_MODE_LABEL_FLASHING  },
-    { LIGHTS_MODE_CYCLE,     LIGHTS_MODE_LABEL_CYCLE     },
-    { LIGHTS_MODE_RAINBOW,   LIGHTS_MODE_LABEL_RAINBOW   },
-    { LIGHTS_MODE_ENDOFARRAY }
+static struct lights_effect lights_available_effects[] = {
+    LIGHTS_EFFECT_NAMED(OFF),
+    LIGHTS_EFFECT_NAMED(STATIC),
+    LIGHTS_EFFECT_NAMED(BREATHING),
+    LIGHTS_EFFECT_NAMED(FLASHING),
+    LIGHTS_EFFECT_NAMED(CYCLE),
+    LIGHTS_EFFECT_NAMED(RAINBOW),
+    {},
 };
 
 /**
- * struct lights_caps - Tracker for accumulated modes
+ * struct lights_caps - Tracker for accumulated effects
  *
  * @siblings:  Next and prev pointers
- * @mode:      Copy of mode
- * @ref_count: Number of interfaces using this mode
+ * @effect:      Copy of effect
+ * @ref_count: Number of interfaces using this effect
  */
 struct lights_caps {
-    struct list_head    siblings;
-    struct lights_mode  mode;
-    uint32_t            ref_count;
+    struct list_head        siblings;
+    struct lights_effect    effect;
+    uint32_t                ref_count;
 };
 
 /**
@@ -146,45 +146,51 @@ static void lights_interface_put (
 }
 
 /**
- * lights_add_caps() - Adds a mode to accumulated list
+ * lights_add_caps() - Adds a effect to accumulated list
  *
- * @mode: Mode to add
+ * @effect: Mode to add
  *
  * @return: Zero or a negative error number
  *
- * The given @mode is copied and if it already exists it
+ * The given @effect is copied and if it already exists it
  * reference count is increased.
+ *
+ * We keep this list in order to determine which effects are shared
+ * by all interfaces, output in /sys/class/lights/all/caps
+ *
+ * This function also ensures that all name-id pairs are unique.
  */
 static error_t lights_add_caps (
-    struct lights_mode const *mode
+    struct lights_effect const *effect
 ){
     struct lights_caps *iter, *entry;
     error_t err = 0;
 
-    if (IS_NULL(mode, mode->name))
+    if (IS_NULL(effect, effect->name))
         return -EINVAL;
 
-    if (lights_is_custom_mode(mode))
+
+    if (lights_effect_is_custom(effect))
         return 0;
 
     entry = kzalloc(sizeof(*entry), GFP_KERNEL);
     if (!entry)
         return -ENOMEM;
 
-    entry->mode = *mode;
+    entry->effect = *effect;
     entry->ref_count = 2;
 
     spin_lock(&lights_global.caps.lock);
 
     list_for_each_entry(iter, &lights_global.caps.list, siblings) {
-        if (iter->mode.id == mode->id) {
-            if (0 == strcmp(iter->mode.name, mode->name)) {
+        if (iter->effect.id == effect->id) {
+            if (0 == strcmp(iter->effect.name, effect->name)) {
                 iter->ref_count++;
             } else {
                 LIGHTS_ERR(
-                    "mode %d:%s conflicts with known mode %d:%s",
-                    mode->id, mode->name,
-                    iter->mode.id, iter->mode.name
+                    "effect %d:%s conflicts with known effect %d:%s",
+                    effect->id, effect->name,
+                    iter->effect.id, iter->effect.name
                 );
                 err = -EINVAL;
             }
@@ -204,26 +210,26 @@ exit:
 }
 
 /**
- * lights_del_caps() - Removes a mode from the accumulated list
+ * lights_del_caps() - Removes a effect from the accumulated list
  *
- * @mode: Mode to remove
+ * @effect: Mode to remove
  *
- * If more than one interface is using the same mode its
- * reference count is decreased, otherwise the mode is
+ * If more than one interface is using the same effect its
+ * reference count is decreased, otherwise the effect is
  * removed entirely.
  */
 static void lights_del_caps (
-    struct lights_mode const *mode
+    struct lights_effect const *effect
 ){
     struct lights_caps *iter, *safe;
 
-    if (IS_NULL(mode))
+    if (IS_NULL(effect))
         return;
 
     spin_lock(&lights_global.caps.lock);
 
     list_for_each_entry_safe(iter, safe, &lights_global.caps.list, siblings) {
-        if (iter->mode.id == mode->id) {
+        if (iter->effect.id == effect->id) {
             iter->ref_count--;
             if (1 == iter->ref_count) {
                 list_del(&iter->siblings);
@@ -239,16 +245,16 @@ exit:
 }
 
 /**
- * lights_find_caps() - Searches for a named mode
+ * lights_find_caps() - Searches for a named effect
  *
- * @name: Name of mode to find
+ * @name: Name of effect to find
  *
- * @return: Found mode or a negative error number
+ * @return: Found effect or a negative error number
  */
-static struct lights_mode const *lights_find_caps (
+static struct lights_effect const *lights_find_caps (
     const char *name
 ){
-    struct lights_mode const *mode;
+    struct lights_effect const *effect;
     struct lights_caps *iter;
 
     if (IS_NULL(name))
@@ -257,45 +263,45 @@ static struct lights_mode const *lights_find_caps (
     spin_lock(&lights_global.caps.lock);
 
     list_for_each_entry(iter, &lights_global.caps.list, siblings) {
-        if (0 == strcmp(iter->mode.name, name)) {
-            mode = &iter->mode;
+        if (0 == strcmp(iter->effect.name, name)) {
+            effect = &iter->effect;
             goto exit;
         }
     }
 
-    mode = ERR_PTR(-ENOENT);
+    effect = ERR_PTR(-ENOENT);
 
 exit:
     spin_unlock(&lights_global.caps.lock);
 
-    return mode;
+    return effect;
 }
 
 /**
- * lights_find_mode() - Finds a mode from a userland buffer
+ * lights_find_effect() - Finds a effect from a userland buffer
  *
  * @intf: Interface to search within
- * @mode: Target buffer to write
+ * @effect: Target buffer to write
  * @buf:  Userland input buffer
  * @len:  Length of @buf
  *
  * @return: Error code
  */
-static error_t lights_find_mode (
+static error_t lights_find_effect (
     struct lights_interface *intf,
-    struct lights_mode *mode,
+    struct lights_effect *effect,
     const char __user *buf,
     size_t len
 ){
-    struct lights_mode const *iter;
-    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH + 1];
+    struct lights_effect const *iter;
+    char kern_buf[LIGHTS_EFFECT_MAX_NAME_LENGTH + 1];
     char *name;
     size_t count;
 
-    if (!len || len > LIGHTS_MAX_MODENAME_LENGTH)
+    if (!len || len > LIGHTS_EFFECT_MAX_NAME_LENGTH)
         return -EINVAL;
 
-    count = min_t(size_t, len, LIGHTS_MAX_MODENAME_LENGTH);
+    count = min_t(size_t, len, LIGHTS_EFFECT_MAX_NAME_LENGTH);
     copy_from_user(kern_buf, buf, count);
     kern_buf[count] = 0;
     name = strim(kern_buf);
@@ -305,20 +311,26 @@ static error_t lights_find_mode (
         if (IS_ERR(iter))
             return CLEAR_ERR(iter);
 
-        memcpy(mode, iter, sizeof(*mode));
+        memcpy(effect, iter, sizeof(*effect));
         return 0;
     }
 
-    iter = intf->ldev->caps;
+    iter = lights_effect_find_by_name(intf->ldev->caps, name);
     if (iter) {
-        while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
-            if (0 == strcmp(iter->name, name)) {
-                memcpy(mode, iter, sizeof(*mode));
-                return 0;
-            }
-            iter++;
-        }
+        memcpy(effect, iter, sizeof(*effect));
+        return 0;
     }
+
+    // iter = intf->ldev->caps;
+    // if (iter) {
+    //     while (iter->id != LIGHTS_EFFECT_ID_INVALID) {
+    //         if (0 == strcmp(iter->name, name)) {
+    //             memcpy(effect, iter, sizeof(*effect));
+    //             return 0;
+    //         }
+    //         iter++;
+    //     }
+    // }
 
     LIGHTS_ERR("Mode '%s' not found in '%s'", name, intf->name);
 
@@ -326,19 +338,19 @@ static error_t lights_find_mode (
 }
 
 /**
- * lights_dump_caps() - Writes a list of accumulated modes
+ * lights_dump_caps() - Writes a list of accumulated effects
  *
  * @buffer: Buffer to write to (PAGE_SIZE length)
  *
  * @return: Number of bytes written or a negative error code
  *
- * Only the modes sgared by ALL interfaces are written.
+ * Only the effects sgared by ALL interfaces are written.
  */
 static ssize_t lights_dump_caps (
     char *buffer
 ){
     struct lights_caps *iter;
-    size_t mode_len;
+    size_t effect_len;
     ssize_t written = 0;
 
     spin_lock(&lights_global.caps.lock);
@@ -347,19 +359,19 @@ static ssize_t lights_dump_caps (
         if (iter->ref_count != lights_global.interface.count)
             continue;
 
-        mode_len = strlen(iter->mode.name);
+        effect_len = strlen(iter->effect.name);
 
-        if (written + mode_len + 1 > PAGE_SIZE) {
+        if (written + effect_len + 1 > PAGE_SIZE) {
             written = -ENOMEM;
             goto exit;
         }
 
-        memcpy(buffer, iter->mode.name, mode_len);
-        buffer[mode_len] = '\n';
+        memcpy(buffer, iter->effect.name, effect_len);
+        buffer[effect_len] = '\n';
 
-        mode_len++;
-        buffer += mode_len;
-        written += mode_len;
+        effect_len++;
+        buffer += effect_len;
+        written += effect_len;
     }
 
 exit:
@@ -369,38 +381,38 @@ exit:
 }
 
 /**
- * lights_dump_modes() - Writes a list of modes
+ * lights_dump_effects() - Writes a list of effects
  *
- * @modes:  Zero terminated array of modes to write
+ * @effects:  Zero terminated array of effects to write
  * @buffer: Buffer to write into (PAGE_SIZE length)
  *
  * @return: Number of bytes written or a negative error code
  */
-static ssize_t lights_dump_modes (
-    struct lights_mode const *modes,
+static ssize_t lights_dump_effects (
+    struct lights_effect const *effects,
     char *buffer
 ){
-    struct lights_mode const *iter = modes;
-    size_t mode_len;
+    struct lights_effect const *iter = effects;
+    size_t effect_len;
     ssize_t written = 0;
 
-    while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
+    while (iter->id != LIGHTS_EFFECT_ID_INVALID) {
         if (!iter->name || 0 == iter->name[0])
             return -EIO;
 
-        mode_len = strlen(iter->name);
+        effect_len = strlen(iter->name);
 
-        if (written + mode_len + 1 > PAGE_SIZE) {
+        if (written + effect_len + 1 > PAGE_SIZE) {
             written = -ENOMEM;
             break;
         }
 
-        memcpy(buffer, iter->name, mode_len);
-        buffer[mode_len] = '\n';
+        memcpy(buffer, iter->name, effect_len);
+        buffer[effect_len] = '\n';
 
-        mode_len++;
-        buffer += mode_len;
-        written += mode_len;
+        effect_len++;
+        buffer += effect_len;
+        written += effect_len;
 
         iter++;
     }
@@ -409,25 +421,25 @@ static ssize_t lights_dump_modes (
 }
 
 /**
- * lights_append_caps() - Adds array of modes to accumulated list
+ * lights_append_caps() - Adds array of effects to accumulated list
  *
- * @modes: Zero terminated array of modes
+ * @effects: Zero terminated array of effects
  *
  * @return: Zero or a negative error number
  */
 static error_t lights_append_caps (
-    struct lights_mode const *modes
+    struct lights_effect const *effects
 ){
-    struct lights_mode const *iter = modes, *rem;
+    struct lights_effect const *iter = effects, *rem;
     error_t err;
 
-    if (IS_NULL(modes))
+    if (IS_NULL(effects))
         return -EINVAL;
 
-    while (iter->id != LIGHTS_MODE_ENDOFARRAY) {
+    while (iter->id != LIGHTS_EFFECT_ID_INVALID) {
         err = lights_add_caps(iter);
         if (err) {
-            rem = modes;
+            rem = effects;
             while (rem != iter) {
                 lights_del_caps(rem);
                 rem++;
@@ -441,16 +453,16 @@ static error_t lights_append_caps (
 }
 
 /**
- * lights_remove_caps() - Removes array of modes from accumulated list
+ * lights_remove_caps() - Removes array of effects from accumulated list
  *
- * @modes: Zero terminated array of modes
+ * @effects: Zero terminated array of effects
  */
 static void lights_remove_caps (
-    struct lights_mode const *modes
+    struct lights_effect const *effects
 ){
-    while (modes->id != LIGHTS_MODE_ENDOFARRAY) {
-        lights_del_caps(modes);
-        modes++;
+    while (effects->id != LIGHTS_EFFECT_ID_INVALID) {
+        lights_del_caps(effects);
+        effects++;
     }
 }
 
@@ -566,41 +578,46 @@ ssize_t lights_read_color (
 EXPORT_SYMBOL_NS_GPL(lights_read_color, LIGHTS);
 
 /**
- * lights_read_mode - Helper for reading mode value strings
+ * lights_read_effect - Helper for reading effect value strings
  *
  * @buffer:   A kernel/user buffer containing the string
  * @len:      The length of the buffer
- * @haystack: A list of valid modes to match against
- * @mode:     A mode object to populate
+ * @haystack: A list of valid effects to match against
+ * @effect:     A effect object to populate
  *
  * @Return: The number of characters read or a negative error number
  */
-ssize_t lights_read_mode (
+ssize_t lights_read_effect (
     const char *buffer,
     size_t len,
-    struct lights_mode const *haystack,
-    struct lights_mode *mode
+    struct lights_effect const *haystack,
+    struct lights_effect *effect
 ){
-    struct lights_mode const *p;
-    char kern_buf[LIGHTS_MAX_MODENAME_LENGTH];
+    struct lights_effect const *found;
+    char kern_buf[LIGHTS_EFFECT_MAX_NAME_LENGTH];
     size_t count;
 
-    count = len < LIGHTS_MAX_MODENAME_LENGTH ? len : LIGHTS_MAX_MODENAME_LENGTH;
+    count = len < LIGHTS_EFFECT_MAX_NAME_LENGTH ? len : LIGHTS_EFFECT_MAX_NAME_LENGTH;
     if (is_user_memory(buffer, count)) {
         copy_from_user(kern_buf, buffer, count);
         buffer = kern_buf;
     }
 
-    for (p = haystack; p->id != LIGHTS_MODE_ENDOFARRAY && p->name; p++) {
-        if (strcmp(buffer, p->name) == 0) {
-            *mode = *p;
-            return 0;
-        }
+    found = lights_effect_find_by_name(haystack, buffer);
+    if (found) {
+        *effect = *found;
+        return 0;
     }
+    // for (p = haystack; p->id != LIGHTS_EFFECT_ID_INVALID && p->name; p++) {
+    //     if (strcmp(buffer, p->name) == 0) {
+    //         *effect = *p;
+    //         return 0;
+    //     }
+    // }
 
     return -EINVAL;
 }
-EXPORT_SYMBOL_NS_GPL(lights_read_mode, LIGHTS);
+EXPORT_SYMBOL_NS_GPL(lights_read_effect, LIGHTS);
 
 /**
  * lights_read_speed - Helper for reading speed value strings
@@ -721,7 +738,7 @@ void lights_get_state (
     spin_lock(&lights_global.state_lock);
 
     memcpy(state, &lights_global.state, sizeof(*state));
-    state->type = LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION;
+    state->type = LIGHTS_TYPE_EFFECT | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION;
 
     spin_unlock(&lights_global.state_lock);
 }
@@ -906,8 +923,8 @@ static error_t io_write (
 
     spin_lock(&lights_global.state_lock);
 
-    if (state->type & LIGHTS_TYPE_MODE)
-        lights_global.state.mode = state->mode;
+    if (state->type & LIGHTS_TYPE_EFFECT)
+        lights_global.state.effect = state->effect;
     if (state->type & LIGHTS_TYPE_COLOR)
         lights_global.state.color = state->color;
     if (state->type & LIGHTS_TYPE_SPEED)
@@ -942,7 +959,7 @@ static ssize_t caps_show (
     if (0 == strcmp(intf->name, "all")) {
         written = lights_dump_caps(buf);
     } else if (intf->ldev->caps) {
-        written = lights_dump_modes(intf->ldev->caps, buf);
+        written = lights_dump_effects(intf->ldev->caps, buf);
     }
 
     return written;
@@ -1043,7 +1060,7 @@ static error_t lights_attribute_write (
 }
 
 /**
- * lights_mode_attribute_read() - File IO handler
+ * lights_effect_attribute_read() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Target buffer
@@ -1052,32 +1069,32 @@ static error_t lights_attribute_write (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_mode_attribute_read (
+static ssize_t lights_effect_attribute_read (
     struct file *filp,
     char __user *buf,
     size_t len,
     loff_t *off
 ){
     struct lights_state state = {
-        .type = LIGHTS_TYPE_MODE
+        .type = LIGHTS_TYPE_EFFECT
     };
-    struct lights_mode *mode = &state.mode;
-    char mode_buf[LIGHTS_MAX_MODENAME_LENGTH];
+    struct lights_effect *effect = &state.effect;
+    char effect_buf[LIGHTS_EFFECT_MAX_NAME_LENGTH];
     ssize_t count, err;
 
     err = lights_attribute_read(filp, &state);
     if (err)
         return err;
 
-    if (IS_NULL(mode->name))
+    if (IS_NULL(effect->name))
         return -EIO;
 
-    count = strlen(mode->name) + 2;
+    count = strlen(effect->name) + 2;
     if (*off >= count)
         return 0;
 
-    snprintf(mode_buf, count, "%s\n", mode->name);
-    err = copy_to_user(buf, mode_buf, len < count ? len : count);
+    snprintf(effect_buf, count, "%s\n", effect->name);
+    err = copy_to_user(buf, effect_buf, len < count ? len : count);
     if (err)
         return -EFAULT;
 
@@ -1085,7 +1102,7 @@ static ssize_t lights_mode_attribute_read (
 }
 
 /**
- * lights_mode_attribute_write() - File IO handler
+ * lights_effect_attribute_write() - File IO handler
  *
  * @filp: Character device handle
  * @buf:  Source buffer
@@ -1094,7 +1111,7 @@ static ssize_t lights_mode_attribute_read (
  *
  * @return: Number of bytes or a negative error code
  */
-static ssize_t lights_mode_attribute_write (
+static ssize_t lights_effect_attribute_write (
     struct file *filp,
     const char __user *buf,
     size_t len,
@@ -1102,7 +1119,7 @@ static ssize_t lights_mode_attribute_write (
 ){
     struct lights_file const *file;
     struct lights_state state = {
-        .type = LIGHTS_TYPE_MODE
+        .type = LIGHTS_TYPE_EFFECT
     };
     error_t err;
 
@@ -1110,7 +1127,7 @@ static ssize_t lights_mode_attribute_write (
     if (!file)
         return -ENODEV;
 
-    err = lights_find_mode(file->intf, &state.mode, buf, len);
+    err = lights_find_effect(file->intf, &state.effect, buf, len);
     if (err)
         goto exit;
 
@@ -1557,7 +1574,7 @@ static ssize_t lights_update_attribute_write (
 ){
     struct lights_file const *file;
     enum lights_state_type allowed = (
-        LIGHTS_TYPE_MODE | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION | LIGHTS_TYPE_SYNC
+        LIGHTS_TYPE_EFFECT | LIGHTS_TYPE_COLOR | LIGHTS_TYPE_SPEED | LIGHTS_TYPE_DIRECTION | LIGHTS_TYPE_SYNC
     );
     struct lights_state state;
     error_t err;
@@ -1584,15 +1601,15 @@ static ssize_t lights_update_attribute_write (
     if (!file)
         return -ENODEV;
 
-    /* Fix mode name */
-    if (state.type & LIGHTS_TYPE_MODE) {
-        if (!state.mode.name || state.mode.id > LIGHTS_MAX_MODENAME_LENGTH) {
+    /* Fix effect name */
+    if (state.type & LIGHTS_TYPE_EFFECT) {
+        if (!state.effect.name || state.effect.id > LIGHTS_EFFECT_MAX_NAME_LENGTH) {
             LIGHTS_ERR("userland buffer error");
             err = -EINVAL;
             goto exit;
         }
 
-        err = lights_find_mode(file->intf, &state.mode, state.mode.name, state.mode.id);
+        err = lights_find_effect(file->intf, &state.effect, state.effect.name, state.effect.id);
         if (err)
             goto exit;
     }
@@ -1692,10 +1709,10 @@ static error_t file_operations_create (
         private data associated with it.
      */
     switch (attr->type) {
-        case LIGHTS_TYPE_MODE:
-            file->fops.read = lights_mode_attribute_read;
+        case LIGHTS_TYPE_EFFECT:
+            file->fops.read = lights_effect_attribute_read;
             if (attr->write)
-                file->fops.write = lights_mode_attribute_write;
+                file->fops.write = lights_effect_attribute_write;
             break;
         case LIGHTS_TYPE_COLOR:
             file->fops.read = lights_color_attribute_read;
@@ -1771,7 +1788,7 @@ static error_t lights_update_attribute_default(
     struct lights_interface *intf = interface_from_thunk(thunk);
     struct lights_file *file;
     enum lights_state_type accepted[] = {
-        LIGHTS_TYPE_MODE,
+        LIGHTS_TYPE_EFFECT,
         LIGHTS_TYPE_COLOR,
         LIGHTS_TYPE_SPEED,
         LIGHTS_TYPE_DIRECTION,
@@ -2292,7 +2309,7 @@ static error_t init_default_attributes (
 ){
     error_t err;
     struct lights_io_attribute attrs[] = {
-        LIGHTS_MODE_ATTR(NULL, io_read, io_write),
+        LIGHTS_EFFECT_ATTR(NULL, io_read, io_write),
         LIGHTS_COLOR_ATTR(NULL, io_read, io_write),
         LIGHTS_SPEED_ATTR(NULL, io_read, io_write),
         LIGHTS_DIRECTION_ATTR(NULL, io_read, io_write),
@@ -2382,9 +2399,9 @@ static int __init lights_init (void)
     int err;
     dev_t dev_id;
 
-    err = lights_read_mode(default_mode, strlen(default_mode), lights_available_modes, &lights_global.state.mode);
+    err = lights_read_effect(default_effect, strlen(default_effect), lights_available_effects, &lights_global.state.effect);
     if (err < 0) {
-        LIGHTS_ERR("Invalid mode");
+        LIGHTS_ERR("Invalid effect");
         return err;
     }
 
@@ -2432,14 +2449,14 @@ static int __init lights_init (void)
 }
 
 module_param(default_color,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_mode,      charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+module_param(default_effect,      charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 module_param(default_speed,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 module_param(default_direction, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 module_init(lights_init);
 module_exit(lights_exit);
 
 MODULE_PARM_DESC(default_color,     "A hexadecimal color code, eg. #00FF00");
-MODULE_PARM_DESC(default_mode,      "The name of a color mode");
+MODULE_PARM_DESC(default_effect,      "The name of a color effect");
 MODULE_PARM_DESC(default_speed,     "The speed of the color cycle, 1-5");
 MODULE_PARM_DESC(default_direction, "The direction of rotation, 0 or 1");
 MODULE_AUTHOR("Owen Parry <twifty@zoho.com>");

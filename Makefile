@@ -14,11 +14,11 @@ MODULES = \
 adapter:
 	mkdir -p build
 	$(MAKE) -C adapter all
-	cp adapter/lights.ko build/lights.ko && sync
+	cp adapter/lights.ko build/lights.ko
 
 $(MODULES): adapter
 	$(MAKE) -C $@ all
-	cp $@/lights-$@.ko build/lights-$@.ko && sync
+	cp $@/lights-$@.ko build/lights-$@.ko
 
 .DEFAULT_GOAL :=
 build: adapter $(MODULES)
@@ -30,6 +30,7 @@ uninstall:
 	sudo rmmod lights.ko || true;
 
 install: uninstall build
+	sync
 	if [[ ! -d build ]]; \
 		then $(MAKE) build; \
 	fi

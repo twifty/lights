@@ -7,153 +7,18 @@
 #include <include/types.h>
 
 #include "lights-thunk.h"
+#include "lights-effect.h"
+#include "lights-color.h"
 
 #define LIGHTS_MAX_FILENAME_LENGTH  64
-#define LIGHTS_MAX_MODENAME_LENGTH  32
 
-#define LIGHTS_IO_MODE      "mode"
+#define LIGHTS_IO_EFFECT    "effect"
 #define LIGHTS_IO_COLOR     "color"
 #define LIGHTS_IO_SPEED     "speed"
 #define LIGHTS_IO_DIRECTION "direction"
 #define LIGHTS_IO_LEDS      "leds"
 #define LIGHTS_IO_SYNC      "sync"
 #define LIGHTS_IO_UPDATE    "update"
-
-/*
-    These ids represent common modes supported by a majority
-    of devices. A third party may extend upon these by using
-    the hi byte. Modes are considered equal if the low byte
-    id is equal (disregards string) OR hi byte id is equal
-    AND string name is equal (case sensitive).
- */
-enum lights_mode_id {
-    LIGHTS_MODE_ENDOFARRAY   = 0x0000, /* The last item of an array should be a zeroed object*/
-    LIGHTS_MODE_OFF          = 0x0001,
-    LIGHTS_MODE_STATIC       = 0x0002,
-    LIGHTS_MODE_BREATHING    = 0x0003,
-    LIGHTS_MODE_FLASHING     = 0x0004,
-    LIGHTS_MODE_CYCLE        = 0x0005,
-    LIGHTS_MODE_RAINBOW      = 0x0006,
-};
-
-#define LIGHTS_MODE_LABEL_OFF       "off"
-#define LIGHTS_MODE_LABEL_STATIC    "static"
-#define LIGHTS_MODE_LABEL_BREATHING "breathing"
-#define LIGHTS_MODE_LABEL_FLASHING  "flashing"
-#define LIGHTS_MODE_LABEL_CYCLE     "cycle"
-#define LIGHTS_MODE_LABEL_RAINBOW   "rainbow"
-
-#define LIGHTS_MODE(_name) \
-    { .id = LIGHTS_MODE_ ## _name, .name = LIGHTS_MODE_LABEL_ ## _name }
-
-#define LIGHTS_CUSTOM_MODE(_id, _name) \
-    { .id = ((_id & 0xff) << 8), .name = _name }
-
-#define LIGHTS_MODE_LAST_ENTRY() \
-    { .id = LIGHTS_MODE_ENDOFARRAY }
-
-#define lights_is_custom_mode(mode) ( \
-    ((mode)->id & 0xff00) \
-)
-
-#define lights_custom_mode_id(mode) ( \
-    (((mode)->id & 0xff00) >> 8) \
-)
-
-#define lights_mode_id(mode) ( \
-    ((mode)->id & 0xff) \
-)
-
-#define lights_for_each_mode(p, a)                      \
-    for (p = a;                                         \
-         p->id != LIGHTS_MODE_ENDOFARRAY && p->name;    \
-         p++)
-
-/**
- * struct lights_color - Storage for 3 color values
- *
- * @a: The alpha value (currently unused)
- * @r: The red value
- * @g: The green value
- * @b: The blue value
- * @value: Combine a r g b value (in that order)
- */
-struct lights_color {
-    union {
-        struct {
-#ifdef __LITTLE_ENDIAN
-            uint8_t b;
-            uint8_t g;
-            uint8_t r;
-            uint8_t a;
-#else
-            uint8_t a;
-            uint8_t r;
-            uint8_t g;
-            uint8_t b;
-#endif
-        };
-        uint32_t value;
-    };
-};
-
-#define lights_color_equal(p1, p2) ( \
-    (p1)->value == (p2)->value \
-)
-
-static inline void lights_color_read_rgb (
-    struct lights_color *color,
-    const uint8_t buf[3]
-){
-    color->r = buf[0];
-    color->g = buf[1];
-    color->b = buf[2];
-}
-
-static inline void lights_color_write_rgb (
-    struct lights_color const *color,
-    uint8_t buf[3]
-){
-    buf[0] = color->r;
-    buf[1] = color->g;
-    buf[2] = color->b;
-}
-
-static inline void lights_color_read_rbg (
-    struct lights_color *color,
-    const uint8_t buf[3]
-){
-    color->r = buf[0];
-    color->b = buf[1];
-    color->g = buf[2];
-}
-
-static inline void lights_color_write_rbg (
-    struct lights_color const *color,
-    uint8_t buf[3]
-){
-    buf[0] = color->r;
-    buf[1] = color->b;
-    buf[2] = color->g;
-}
-
-/**
- * struct lights_mode
- *
- * @id:   The numeric value of the mode
- * @name: max LIGHTS_MAX_MODENAME_LENGTH, snake_case name of the mode
- *
- * Global values (defined within this module) use the lo byte
- * All third party extensions must use the hi byte
- */
-struct lights_mode {
-    uint16_t    id;
-    const char  *name;
-};
-
-#define lights_mode_equal(p1, p2) ( \
-    ((p1)->id == (p2)->id) \
-)
 
 struct lights_buffer {
     ssize_t         length;
@@ -175,7 +40,7 @@ struct lights_buffer {
  * TODO - remove UPDATE, the file should be default for all
  */
 enum lights_state_type {
-    LIGHTS_TYPE_MODE        = 0x01,
+    LIGHTS_TYPE_EFFECT      = 0x01,
     LIGHTS_TYPE_COLOR       = 0x02,
     LIGHTS_TYPE_SPEED       = 0x04,
     LIGHTS_TYPE_DIRECTION   = 0x08,
@@ -188,7 +53,7 @@ enum lights_state_type {
 /**
  * struct lights_state
  *
- * @mode:      The global mode value (requires LIGHTS_TYPE_MODE)
+ * @effect:    The global mode value (requires LIGHTS_TYPE_MODE)
  * @color:     The global color value (requires LIGHTS_TYPE_COLOR)
  * @raw:       Custom or LED data (requires LIGHTS_TYPE_LEDS or LIGHTS_TYPE_CUSTOM
  *             it's an error for these two values to appear together)
@@ -204,7 +69,7 @@ enum lights_state_type {
  * @type:      One or more type values.
  */
 struct lights_state {
-    struct lights_mode      mode;
+    struct lights_effect    effect;
     struct lights_color     color;
     struct lights_buffer    raw;
     uint8_t                 speed;
@@ -257,7 +122,7 @@ struct lights_io_attribute {
 struct lights_dev {
     const char                                  *name;
     uint16_t                                    led_count;
-    struct lights_mode const                    *caps;
+    struct lights_effect const                  *caps;
     struct lights_io_attribute const * const    *attrs;
 };
 
@@ -297,8 +162,8 @@ struct lights_dev {
     LIGHTS_ATTR_RW(_name, LIGHTS_TYPE_CUSTOM, _thunk, _read, _write) \
 )
 
-#define LIGHTS_MODE_ATTR(_thunk, _read, _write) ( \
-    LIGHTS_ATTR_RW(LIGHTS_IO_MODE, LIGHTS_TYPE_MODE, _thunk, _read, _write) \
+#define LIGHTS_EFFECT_ATTR(_thunk, _read, _write) ( \
+    LIGHTS_ATTR_RW(LIGHTS_IO_EFFECT, LIGHTS_TYPE_EFFECT, _thunk, _read, _write) \
 )
 
 #define LIGHTS_COLOR_ATTR(_thunk, _read, _write) ( \
@@ -398,20 +263,20 @@ ssize_t lights_read_color (
 );
 
 /**
- * lights_read_mode() - Helper for reading mode value strings
+ * lights_read_effect() - Helper for reading effect value strings
  *
  * @buffer:   A kernel/user buffer containing the string
  * @len:      The length of the buffer
  * @haystack: A list of valid modes to match against
- * @mode:     A mode object to populate
+ * @effect:   An effect object to populate
  *
  * @Return: The number of characters read or a negative error number
  */
-ssize_t lights_read_mode (
+ssize_t lights_read_effect (
     const char *buffer,
     size_t len,
-    struct lights_mode const *haystack,
-    struct lights_mode *mode
+    struct lights_effect const *haystack,
+    struct lights_effect *effect
 );
 
 /**
