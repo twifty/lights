@@ -327,8 +327,9 @@ static error_t aura_gpu_discover (
     error_t err;
     int i, j;
 
+    AURA_DBG("Scanning '%s' for GPU controller", i2c_adapter->name);
+
     for (j = 0; j < ARRAY_SIZE(chipset_addresses); j++) {
-        AURA_DBG("Scanning '%s' 0x%02x", i2c_adapter->name, chipset_addresses[j]);
 
         *client = LIGHTS_I2C_CLIENT(i2c_adapter, chipset_addresses[j], 0);
 
@@ -342,7 +343,7 @@ static error_t aura_gpu_discover (
 
         if (!err && ((value[0] << 8) | value[1]) == AURA_GPU_CHIPSET_MAGIC_VALUE) {
             AURA_DBG(
-                "Discovered aura chip at address %x on %s",
+                "Discovered aura chip at address %x on '%s'",
                 chipset_addresses[j],
                 i2c_adapter->name
             );

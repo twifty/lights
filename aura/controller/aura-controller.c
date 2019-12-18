@@ -559,11 +559,11 @@ struct aura_controller const *aura_controller_create (
     zone_count = 0;
     err = aura_controller_read_byte(client, 0x80C1, &zone_count);
     if (err) {
-        AURA_DBG(
-            "Failed to read zone count from '0x%02x' with error %s",
-            client->i2c_client.addr,
-            ERR_NAME(err)
-        );
+        // AURA_DBG(
+        //     "Failed to read zone count from '0x%02x' with error %s",
+        //     client->i2c_client.addr,
+        //     ERR_NAME(err)
+        // );
         /* Return NULL rather an error code */
         return NULL;
     }

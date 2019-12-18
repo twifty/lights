@@ -403,8 +403,9 @@ static error_t aura_memory_probe_adapter (
     if (dev->type != &i2c_adapter_type || *(int*)found)
         return 0;
 
+    AURA_DBG("Probing '%s' for memory DIMMs", smbus->name);
+
     for (count = 0, addr = 0x50; addr <= 0x5F; addr++) {
-        AURA_DBG("Pinging %s address 0x%02x", smbus->name, addr);
 
         // Select page 0 on all DIMMs
         err = smbus_write_byte(smbus, 0x36, 0x00, 0x00);
@@ -417,7 +418,7 @@ static error_t aura_memory_probe_adapter (
         err = smbus_read_byte(smbus, addr, 0x02, &spd[count].type);
         if (err) {
             err = 0;
-            AURA_DBG("Failed to read SPD type");
+            // AURA_DBG("Failed to read SPD type");
             continue;
         }
 
@@ -425,11 +426,11 @@ static error_t aura_memory_probe_adapter (
         err = smbus_read_byte(smbus, addr, 0x00, &size);
         if (err) {
             err = 0;
-            AURA_DBG("Failed to read SPD size");
+            // AURA_DBG("Failed to read SPD size");
             continue;
         }
 
-        AURA_DBG("Calculating size from type=0x%02x size=0x%02x", spd[count].type, size);
+        // AURA_DBG("Calculating size from type=0x%02x size=0x%02x", spd[count].type, size);
         switch (spd[count].type) {
             case SPD_TYPE_DDR0:
             case SPD_TYPE_DDR2:
@@ -450,8 +451,11 @@ static error_t aura_memory_probe_adapter (
         spd[count].addr = addr;
         spd[count].slot = addr - 0x50;
 
-        AURA_DBG("Detected DIMM slot=%d addr=0x%02x type=0x%02x size=0x%04x",
-            spd[count].slot, spd[count].addr, spd[count].type, spd[count].size);
+        AURA_DBG(
+            "Detected DIMM slot=%d addr=0x%02x",
+            spd[count].slot,
+            spd[count].addr
+        );
 
         count += 1;
     }
@@ -462,7 +466,7 @@ static error_t aura_memory_probe_adapter (
     for (i = 0; i < count; i++) {
         // Select page according to size
         page = spd[i].size >= 0x100 ? 0x37 : 0x36;
-        AURA_DBG("Selecting page %d for all DIMMs", page == 0x36 ? 0 : 1);
+        // AURA_DBG("Selecting page %d for all DIMMs", page == 0x36 ? 0 : 1);
         err = smbus_write_byte(smbus, page, 0x00, 0x00);
         if (err)
             goto error;
@@ -473,11 +477,11 @@ static error_t aura_memory_probe_adapter (
                 goto error;
         }
 
-        AURA_DBG("Found RGB triplet: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
+        // AURA_DBG("Found RGB triplet: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
 
         // Return to page 1
         if (page == 0x37) {
-            AURA_DBG("Selecting page 0 for all DIMMs");
+            // AURA_DBG("Selecting page 0 for all DIMMs");
             smbus_write_byte(smbus, 0x36, 0x00, 0x00);
         }
 

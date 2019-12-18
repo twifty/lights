@@ -231,7 +231,7 @@ static struct aura_controller const *aura_motherboard_probe_address (
         return aura;
 
     if (aura == NULL) {
-        AURA_DBG("aura_controller_create() returned a NULL pointer");
+        // AURA_DBG("aura_controller_create() returned a NULL pointer");
         return NULL;
     }
 
@@ -270,6 +270,8 @@ static int aura_motherboard_probe_adapter (
     int found = 0;
     error_t err = 0;
 
+    AURA_DBG("Probing '%s' for motherboard controller", i2c_adapter->name);
+
     for (i = 0; i < ARRAY_SIZE(ctrl_addresses); i++) {
         ctrl = aura_motherboard_probe_address(i2c_adapter, ctrl_addresses[i]);
         if (ctrl == NULL)
@@ -281,6 +283,8 @@ static int aura_motherboard_probe_adapter (
         }
 
         created++;
+
+        AURA_DBG("Probing '%s' for motherboard slaves", i2c_adapter->name);
 
         found = aura_controller_create_slaves(ctrl, slaves, ARRAY_SIZE(slaves));
         if (found > 0) {
