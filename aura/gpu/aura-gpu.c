@@ -83,7 +83,7 @@ enum AURA_GPU_CONSTS {
 /*
     NOTE - Don't change the values, they are used as i2c values
  */
-enum aura_gpu_mode {
+enum aura_mode {
     /*
         There is no off mode, all colors are set to 0. The LightingService
         stores the previous values in its xml file.
@@ -113,18 +113,18 @@ enum aura_gpu_mode {
 };
 
 /*
-    NOTE - Don't change the order, aura_gpu_mode val used as array index
+    NOTE - Don't change the order, aura_mode val used as array index
  */
-struct lights_mode aura_gpu_modes[] = {
-    LIGHTS_MODE(OFF),
-    LIGHTS_MODE(STATIC),
-    LIGHTS_MODE(BREATHING),
-    LIGHTS_MODE(FLASHING),
-    LIGHTS_MODE(CYCLE),
+struct lights_effect aura_gpu_effects[] = {
+    LIGHTS_EFFECT_VALUE(AURA_MODE_OFF,       OFF),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_STATIC,    STATIC),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_BREATHING, BREATHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_FLASHING,  FLASHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_CYCLE,     CYCLE),
 
-    LIGHTS_CUSTOM_MODE(AURA_MODE_DIRECT, "direct"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_DIRECT,   "direct"),
 
-    LIGHTS_MODE_LAST_ENTRY()
+    {}
 };
 
 struct zone_reg {
@@ -135,17 +135,12 @@ struct zone_reg {
     uint8_t apply;
 };
 
-struct zone_effect {
-    struct lights_mode          mode;
-    struct lights_color         color;
-};
-
-#define effect_dump(_msg, _effect) ( \
+#define state_dump(_msg, _state) ( \
     AURA_DBG( \
-        "%s Mode: '%s', Color: 0x%06x", \
+        "%s Effect: '%s', Color: 0x%06x", \
         (_msg), \
-        (_effect)->mode.name, \
-        (_effect)->color.value \
+        (_state)->effect.name, \
+        (_state)->color.value \
     ) \
 )
 
@@ -162,8 +157,7 @@ struct aura_gpu_zone {
     struct aura_gpu_controller  *ctrl;
     spinlock_t                  lock;
     struct lights_thunk         thunk;
-
-    struct zone_effect          effect;
+    struct lights_state         state;
     struct zone_reg const       reg;
 };
 #define ZONE_HASH 'ZONE'
@@ -196,63 +190,77 @@ struct aura_gpu_controller {
 };
 
 /**
- * lights_mode_to_aura_gpu_mode() - Mode convertion
+ * lights_mode_to_aura_mode() - Mode convertion
  *
- * @mode:     Globally recognizable mode
+ * @effect:   Globally recognizable mode
  * @gpu_mode: GPU recognizable mode
  *
  * @return: Zero or a negative error number
  */
-static error_t lights_mode_to_aura_gpu_mode (
-    struct lights_mode const *mode,
-    enum aura_gpu_mode *gpu_mode
+static error_t lights_effect_to_aura_mode (
+    struct lights_effect const *effect,
+    enum aura_mode *gpu_mode
 ){
-    if (lights_is_custom_mode(mode)) {
-        *gpu_mode = lights_custom_mode_id(mode);
-        if (*gpu_mode <= AURA_MODE_LAST || *gpu_mode == AURA_MODE_DIRECT)
-            return 0;
-
-        return -ENODATA;
-    }
-
-    switch (lights_mode_id(mode)) {
-        case LIGHTS_MODE_OFF:
-            *gpu_mode = AURA_MODE_OFF;
-            return 0;
-        case LIGHTS_MODE_STATIC:
-            *gpu_mode = AURA_MODE_STATIC;
-            return 0;
-        case LIGHTS_MODE_BREATHING:
-            *gpu_mode = AURA_MODE_BREATHING;
-            return 0;
-        case LIGHTS_MODE_FLASHING:
-            *gpu_mode = AURA_MODE_FLASHING;
-            return 0;
-        case LIGHTS_MODE_CYCLE:
-            *gpu_mode = AURA_MODE_CYCLE;
-            return 0;
+    effect = lights_effect_find_by_id(aura_gpu_effects, effect->id);
+    if (effect) {
+        *gpu_mode = effect->value;
+        return 0;
     }
 
     return -ENODATA;
+    // if (lights_is_custom_mode(mode)) {
+    //     *gpu_mode = lights_custom_mode_id(mode);
+    //     if (*gpu_mode <= AURA_MODE_LAST || *gpu_mode == AURA_MODE_DIRECT)
+    //         return 0;
+    //
+    //     return -ENODATA;
+    // }
+    //
+    // switch (lights_mode_id(mode)) {
+    //     case LIGHTS_MODE_OFF:
+    //         *gpu_mode = AURA_MODE_OFF;
+    //         return 0;
+    //     case LIGHTS_MODE_STATIC:
+    //         *gpu_mode = AURA_MODE_STATIC;
+    //         return 0;
+    //     case LIGHTS_MODE_BREATHING:
+    //         *gpu_mode = AURA_MODE_BREATHING;
+    //         return 0;
+    //     case LIGHTS_MODE_FLASHING:
+    //         *gpu_mode = AURA_MODE_FLASHING;
+    //         return 0;
+    //     case LIGHTS_MODE_CYCLE:
+    //         *gpu_mode = AURA_MODE_CYCLE;
+    //         return 0;
+    // }
+    //
+    // return -ENODATA;
 }
 
 /**
- * aura_gpu_mode_to_lights_mode() - Mode convertion
+ * aura_mode_to_lights_mode() - Mode convertion
  *
  * @gpu_mode: GPU recognizable mode
+ * @effect:   Buffer to write result
  *
- * @return: NULL or a globally recognizable mode
+ * @return: Error code
  */
-static struct lights_mode const *aura_gpu_mode_to_lights_mode (
-    enum aura_gpu_mode gpu_mode
+static error_t aura_mode_to_lights_effect (
+    enum aura_mode gpu_mode,
+    struct lights_effect const **effect
 ){
-    if (gpu_mode == AURA_MODE_DIRECT) {
-        return &aura_gpu_modes[AURA_INDEX_DIRECT];
-    } else if (gpu_mode >= 0 && gpu_mode <= AURA_MODE_LAST) {
-        return &aura_gpu_modes[gpu_mode];
-    }
+    *effect = lights_effect_find_by_value(aura_gpu_effects, gpu_mode);
+    if (*effect)
+        return 0;
 
-    return NULL;
+    return -ENODATA;
+    // if (gpu_mode == AURA_MODE_DIRECT) {
+    //     return &aura_modes[AURA_INDEX_DIRECT];
+    // } else if (gpu_mode >= 0 && gpu_mode <= AURA_MODE_LAST) {
+    //     return &aura_modes[gpu_mode];
+    // }
+    //
+    // return NULL;
 }
 
 /**
@@ -366,8 +374,8 @@ static error_t aura_gpu_discover (
 static error_t aura_gpu_fetch_zone (
     struct aura_gpu_zone *zone
 ){
-    enum aura_gpu_mode gpu_mode;
-    struct lights_mode const *mode;
+    enum aura_mode gpu_mode;
+    struct lights_effect const *effect;
     struct lights_color color;
     struct lights_adapter_client *client = &zone->ctrl->lights_client;
     uint8_t mode_raw;
@@ -406,14 +414,13 @@ static error_t aura_gpu_fetch_zone (
     }
 
     /* Convert to lights_mode */
-    mode = aura_gpu_mode_to_lights_mode(gpu_mode);
-    if (!mode) {
+    if (aura_mode_to_lights_effect(gpu_mode, &effect)) {
         err = -EINVAL;
         goto error;
     }
 
-    zone->effect.mode = *mode;
-    zone->effect.color = color;
+    zone->state.effect = *effect;
+    zone->state.color = color;
 
 error:
     spin_unlock(&zone->lock);
@@ -438,8 +445,8 @@ static void aura_gpu_zone_update_callback (
 ){
     struct aura_gpu_zone *zone = zone_from_thunk(thunk);
     struct lights_adapter_msg const *iter = result;
-    enum aura_gpu_mode gpu_mode;
-    struct lights_mode const *mode;
+    struct lights_effect const *effect;
+    enum aura_mode gpu_mode;
     uint8_t color_bytes[3];
     bool disable = false;
     int i;
@@ -470,29 +477,26 @@ static void aura_gpu_zone_update_callback (
     }
 
     /* If the APPLY was not set, the mode is really DIRECT */
-    if (!iter->next && gpu_mode == AURA_MODE_STATIC) {
-        mode = aura_gpu_mode_to_lights_mode(disable ? AURA_MODE_OFF : AURA_MODE_DIRECT);
-    } else {
-        mode = aura_gpu_mode_to_lights_mode(gpu_mode);
-    }
+    if (!iter->next && gpu_mode == AURA_MODE_STATIC)
+        gpu_mode = disable ? AURA_MODE_OFF : AURA_MODE_DIRECT;
 
-    if (!mode) {
+    if (aura_mode_to_lights_effect(gpu_mode, &effect)) {
         AURA_DBG("Not a valid aura mode 0x%02x", gpu_mode);
         return;
     }
 
-    effect_dump("pre update:", &zone->effect);
+    state_dump("pre update:", &zone->state);
 
     spin_lock(&zone->lock);
 
     if (!disable)
-        lights_color_read_rgb(&zone->effect.color, color_bytes);
+        lights_color_read_rgb(&zone->state.color, color_bytes);
 
-    zone->effect.mode = *mode;
+    zone->state.effect = *effect;
 
     spin_unlock(&zone->lock);
 
-    effect_dump("post update:", &zone->effect);
+    state_dump("post update:", &zone->state);
 }
 
 /**
@@ -505,18 +509,18 @@ static void aura_gpu_zone_update_callback (
  */
 static error_t aura_gpu_zone_update (
     struct aura_gpu_zone *zone,
-    struct zone_effect const *effect
+    struct lights_state const *state
 ){
     uint8_t count = 4;
-    enum aura_gpu_mode gpu_mode;
+    enum aura_mode gpu_mode;
     struct lights_adapter_msg msgs[5];
     bool off = false;
     error_t err;
 
-    if (IS_NULL(zone, effect))
+    if (IS_NULL(zone, state) || IS_TRUE(state->flags == 0))
         return -EINVAL;
 
-    err = lights_mode_to_aura_gpu_mode(&effect->mode, &gpu_mode);
+    err = lights_effect_to_aura_mode(&state->effect, &gpu_mode);
     if (err)
         return err;
 
@@ -536,9 +540,9 @@ static error_t aura_gpu_zone_update (
             break;
     }
 
-    msgs[1] = ADAPTER_WRITE_BYTE_DATA(zone->reg.red,   off ? 0 : effect->color.r);
-    msgs[2] = ADAPTER_WRITE_BYTE_DATA(zone->reg.green, off ? 0 : effect->color.g);
-    msgs[3] = ADAPTER_WRITE_BYTE_DATA(zone->reg.blue,  off ? 0 : effect->color.b);
+    msgs[1] = ADAPTER_WRITE_BYTE_DATA(zone->reg.red,   off ? 0 : state->color.r);
+    msgs[2] = ADAPTER_WRITE_BYTE_DATA(zone->reg.green, off ? 0 : state->color.g);
+    msgs[3] = ADAPTER_WRITE_BYTE_DATA(zone->reg.blue,  off ? 0 : state->color.b);
     msgs[4] = ADAPTER_WRITE_BYTE_DATA(zone->reg.apply, 0x01);
 
     return lights_adapter_xfer_async(
@@ -560,16 +564,16 @@ static error_t aura_gpu_zone_update (
  */
 static error_t aura_gpu_controller_update (
     struct aura_gpu_controller *ctrl,
-    struct zone_effect const *effect
+    struct lights_state const *state
 ){
     int i;
     error_t err = 0;
 
-    if (IS_NULL(ctrl, effect))
+    if (IS_NULL(ctrl, state))
         return -EINVAL;
 
     for (i = 0; i < ctrl->zone_count && !err; i++)
-        err = aura_gpu_zone_update(&ctrl->zones[i], effect);
+        err = aura_gpu_zone_update(&ctrl->zones[i], state);
 
     return err;
 }
@@ -596,11 +600,11 @@ static error_t aura_gpu_read (
 
     spin_lock(&zone->lock);
 
-    if (state->type & LIGHTS_TYPE_MODE)
-        state->mode = zone->effect.mode;
+    if (state->type & LIGHTS_TYPE_EFFECT)
+        state->effect = zone->state.effect;
 
     if (state->type & LIGHTS_TYPE_COLOR)
-        state->color = zone->effect.color;
+        state->color = zone->state.color;
 
     spin_unlock(&zone->lock);
 
@@ -620,8 +624,7 @@ static error_t aura_gpu_write (
     struct lights_state const *state
 ){
     struct aura_gpu_zone *zone = zone_from_thunk(thunk);
-    struct zone_effect effect;
-    bool update = false;
+    struct lights_state pending;
     error_t err = 0;
 
     if (IS_NULL(thunk, state, zone))
@@ -629,25 +632,29 @@ static error_t aura_gpu_write (
 
     spin_lock(&zone->lock);
 
-    effect = zone->effect;
+    pending = zone->state;
+    pending.flags = 0;
 
     if (state->type & LIGHTS_TYPE_COLOR) {
-        effect.color = state->color;
-        update = true;
+        pending.color = state->color;
+        pending.flags |= LIGHTS_TYPE_COLOR;
     }
 
-    if (state->type & LIGHTS_TYPE_MODE) {
-        effect.mode = state->mode;
-        update = true;
+    if (state->type & LIGHTS_TYPE_EFFECT) {
+        if (!lights_effect_copy(aura_gpu_effects, &state->effect, pending.effect)) {
+            lights_effect_debug(AURA_ERR, "Unknown mode: ", &state->effect);
+            return -EINVAL;
+        }
+        // pending.effect = state->effect;
+        pending.flags |= LIGHTS_TYPE_EFFECT;
     }
 
-    if (update)
-        err = aura_gpu_zone_update(zone, &effect);
+    if (pending.flags)
+        err = aura_gpu_zone_update(zone, &pending);
 
     spin_unlock(&zone->lock);
 
     return err;
-    // return aura_gpu_apply_zone_color(zone, &state->color);
 }
 
 
@@ -661,8 +668,8 @@ static error_t aura_gpu_write (
 static error_t aura_gpu_create_fs (
     struct aura_gpu_controller *ctrl
 ){
-    struct lights_io_attribute attrs[] = {
-        LIGHTS_MODE_ATTR(
+    struct lights_attribute attrs[] = {
+        LIGHTS_EFFECT_ATTR(
             &ctrl->zones[0].thunk,
             aura_gpu_read,
             aura_gpu_write
@@ -681,7 +688,7 @@ static error_t aura_gpu_create_fs (
     error_t err;
 
     ctrl->lights.name = ctrl->lights_name;
-    ctrl->lights.caps = aura_gpu_modes;
+    ctrl->lights.caps = aura_gpu_effects;
 
     for (id = ctrl->id; id < 2; id++) {
         snprintf(ctrl->lights_name, sizeof(ctrl->lights_name), "gpu-%d", id);
@@ -695,7 +702,7 @@ static error_t aura_gpu_create_fs (
     }
 
     /* Create the attributes */
-    err = lights_create_files(&ctrl->lights, attrs, ARRAY_SIZE(attrs));
+    err = lights_device_create_files(&ctrl->lights, attrs, ARRAY_SIZE(attrs));
     if (err)
         goto error_release;
 
@@ -793,8 +800,8 @@ static struct aura_gpu_controller *aura_gpu_controller_create (
         "Detected AURA capable GPU on '%s' at 0x%02x with Color: 0x%06x, Mode: %s",
         i2c_adapter->name,
         ctrl->lights_client.i2c_client.addr,
-        ctrl->zones[0].effect.color.value,
-        ctrl->zones[0].effect.mode.name
+        ctrl->zones[0].state.color.value,
+        ctrl->zones[0].state.effect.name
     );
 
     return ctrl;
@@ -942,7 +949,7 @@ error_t aura_gpu_probe (
     struct i2c_adapter *adapters[MAX_SUPPORTED_GPUS];
     struct aura_gpu_adapter *gpu_adapter = NULL;
     struct aura_gpu_controller *ctrl;
-    struct zone_effect effect;
+    // struct zone_state zone_state;
     int adapter_count = 0;
     int i = 0, found = 0;
     error_t err;
@@ -983,11 +990,11 @@ error_t aura_gpu_probe (
     }
 
     if (!err && found) {
-        effect.mode = state->mode;
-        effect.color = state->color;
-
         list_for_each_entry(ctrl, &aura_gpu_ctrl_list, siblings) {
-            err = aura_gpu_controller_update(ctrl, &effect);
+            struct lights_state copy = lights_state_copy(state, aura_gpu_effects, LIGHTS_TYPE_UPDATE);
+            copy.flags = copy.type;
+            
+            err = aura_gpu_controller_update(ctrl, &copy);
             if (err)
                 goto error;
         }

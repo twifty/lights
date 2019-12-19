@@ -50,11 +50,6 @@ static struct {
     .all = { .name = "all" },
 };
 
-static char *default_color      = "#FF0000";
-static char *default_effect     = "static";
-static char *default_speed      = "2";
-static char *default_direction  = "0";
-
 static struct lights_effect lights_available_effects[] = {
     LIGHTS_EFFECT_NAMED(OFF),
     LIGHTS_EFFECT_NAMED(STATIC),
@@ -94,7 +89,7 @@ struct lights_file {
     struct cdev                         cdev;
     struct device                       *dev;
     struct list_head                    siblings;
-    struct lights_io_attribute     attr;
+    struct lights_attribute     attr;
     struct lights_interface             *intf;
     struct file_operations              fops;
 };
@@ -534,6 +529,9 @@ ssize_t lights_read_color (
     u32 value;
     error_t i;
 
+    if (IS_NULL(buffer, color) || IS_TRUE(len <= 0))
+        return -EINVAL;
+
     count = len < 8 ? len : 8;
     if (is_user_memory(buffer, count)) {
         copy_from_user(kern_buf, buffer, count);
@@ -597,6 +595,12 @@ ssize_t lights_read_effect (
     char kern_buf[LIGHTS_EFFECT_MAX_NAME_LENGTH];
     size_t count;
 
+    if (IS_NULL(buffer, effect) || IS_TRUE(len <= 0))
+        return -EINVAL;
+
+    if (!haystack)
+        haystack = lights_available_effects;
+
     count = len < LIGHTS_EFFECT_MAX_NAME_LENGTH ? len : LIGHTS_EFFECT_MAX_NAME_LENGTH;
     if (is_user_memory(buffer, count)) {
         copy_from_user(kern_buf, buffer, count);
@@ -635,6 +639,9 @@ ssize_t lights_read_speed (
 ){
     char tmp;
 
+    if (IS_NULL(buffer, speed) || IS_TRUE(len <= 0))
+        return -EINVAL;
+
     if (len < 1)
         return -EINVAL;
 
@@ -669,6 +676,9 @@ ssize_t lights_read_direction (
     uint8_t *direction
 ){
     char tmp;
+
+    if (IS_NULL(buffer, direction) || IS_TRUE(len <= 0))
+        return -EINVAL;
 
     if (len < 1)
         return -EINVAL;
@@ -708,6 +718,9 @@ ssize_t lights_read_sync (
     char kern_buf[4];
     uint32_t value;
 
+    if (IS_NULL(buffer, sync) || IS_TRUE(len <= 0))
+        return -EINVAL;
+
     if (len < 4)
         return -EINVAL;
 
@@ -735,6 +748,9 @@ EXPORT_SYMBOL_NS_GPL(lights_read_sync, LIGHTS);
 void lights_get_state (
     struct lights_state *state
 ){
+    if (IS_NULL(state))
+        return;
+
     spin_lock(&lights_global.state_lock);
 
     memcpy(state, &lights_global.state, sizeof(*state));
@@ -744,6 +760,17 @@ void lights_get_state (
 }
 EXPORT_SYMBOL_NS_GPL(lights_get_state, LIGHTS);
 
+/**
+ * lights_get_effects() - Returns a zero terminated array of global effects
+ *
+ * @return: Effect array
+ */
+struct lights_effect const *lights_get_effects (
+    void
+){
+    return lights_available_effects;
+}
+EXPORT_SYMBOL_NS_GPL(lights_get_effects, LIGHTS);
 
 /**
  * find_attribute_for_file() - Finds the user attributes for the given character device
@@ -1698,7 +1725,7 @@ static void lights_device_release (
  */
 static error_t file_operations_create (
     struct lights_file *file,
-    struct lights_io_attribute const *attr
+    struct lights_attribute const *attr
 ){
     memset(&file->fops, 0, sizeof(file->fops));
 
@@ -1826,7 +1853,7 @@ static error_t lights_update_attribute_default(
 static error_t lights_file_init (
     struct lights_file *file,
     struct lights_interface *intf,
-    struct lights_io_attribute const *attr
+    struct lights_attribute const *attr
 ){
     dev_t ver;
     error_t err;
@@ -1905,7 +1932,7 @@ error_exit:
  */
 static struct lights_file *lights_file_create (
     struct lights_interface *intf,
-    struct lights_io_attribute const *attr
+    struct lights_attribute const *attr
 ){
     struct lights_file *file;
     error_t err;
@@ -2041,7 +2068,7 @@ static void lights_interface_destroy (
 static struct lights_interface *lights_interface_create (
     struct lights_dev *lights
 ){
-    struct lights_io_attribute const * const *attr;
+    struct lights_attribute const * const *attr;
     struct lights_interface *intf;
     struct lights_file *file;
     error_t err;
@@ -2190,7 +2217,7 @@ void lights_device_unregister (
 EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
 
 /**
- * lights_create_file() - Adds a file to the devices directory
+ * lights_device_create_file() - Adds a file to the devices directory
  *
  * @dev:  A previously registered device
  * @attr: A description of the file to create
@@ -2200,9 +2227,9 @@ EXPORT_SYMBOL_NS_GPL(lights_device_unregister, LIGHTS);
  * The given attribute may exist on the stack. Internally it is copied
  * so the user need not keep a reference to it.
  */
-error_t lights_create_file (
+error_t lights_device_create_file (
     struct lights_dev const *dev,
-    struct lights_io_attribute const *attr
+    struct lights_attribute const *attr
 ){
     struct lights_interface *intf;
     struct lights_file *file;
@@ -2234,10 +2261,10 @@ exit:
 
     return err;
 }
-EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
+EXPORT_SYMBOL_NS_GPL(lights_device_create_file, LIGHTS);
 
 /**
- * lights_create_file() - Adds a file to the devices directory
+ * lights_device_create_file() - Adds a file to the devices directory
  *
  * @dev:   A previously registered device
  * @attrs: Array of descriptions of the files to create
@@ -2245,9 +2272,9 @@ EXPORT_SYMBOL_NS_GPL(lights_create_file, LIGHTS);
  *
  * @Return: A negative error number on failure
  */
-error_t lights_create_files (
+error_t lights_device_create_files (
     struct lights_dev const *dev,
-    struct lights_io_attribute const * const attrs,
+    struct lights_attribute const * const attrs,
     size_t count
 ){
     LIST_HEAD(file_list);
@@ -2296,70 +2323,8 @@ error:
 
     return err;
 }
-EXPORT_SYMBOL_NS_GPL(lights_create_files, LIGHTS);
+EXPORT_SYMBOL_NS_GPL(lights_device_create_files, LIGHTS);
 
-
-/**
- * init_default_attributes() - Creates the character devices in /dev/lights/all/
- *
- * @return: Zero or a negative error code
- */
-static error_t init_default_attributes (
-    void
-){
-    error_t err;
-    struct lights_io_attribute attrs[] = {
-        LIGHTS_EFFECT_ATTR(NULL, io_read, io_write),
-        LIGHTS_COLOR_ATTR(NULL, io_read, io_write),
-        LIGHTS_SPEED_ATTR(NULL, io_read, io_write),
-        LIGHTS_DIRECTION_ATTR(NULL, io_read, io_write),
-        LIGHTS_UPDATE_ATTR(NULL, io_write),
-        LIGHTS_SYNC_ATTR(NULL, io_write),
-    };
-
-    err = lights_device_register(&lights_global.all);
-    if (err)
-        return err;
-
-    return lights_create_files(&lights_global.all, attrs, ARRAY_SIZE(attrs));
-}
-
-/**
- * lights_destroy() - Destroys everything
- */
-static void lights_destroy (
-    void
-){
-    struct lights_interface *intf;
-    struct lights_interface *intf_safe;
-    dev_t dev_id = MKDEV(lights_global.major, 0);
-
-    lights_device_unregister(&lights_global.all);
-
-    if (!list_empty(&lights_global.interface.list)) {
-        LIGHTS_WARN("Not all interfaces have been unregistered.");
-        spin_lock(&lights_global.interface.lock);
-
-        list_for_each_entry_safe(intf, intf_safe, &lights_global.interface.list, siblings) {
-            list_del(&intf->siblings);
-            kref_put(&intf->refs, lights_interface_put);
-        }
-
-        spin_unlock(&lights_global.interface.lock);
-    }
-
-    // lights_unregister_all_devices();
-    unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
-    class_destroy(lights_global.class);
-}
-
-/**
- * @lights_exit() - Module exit
- */
-static void __exit lights_exit (void)
-{
-    lights_destroy();
-}
 
 /**
  * lights_devnode() - Creates a hierarchy within the /dev directory
@@ -2392,36 +2357,64 @@ static char *lights_devnode (
 }
 
 /**
- * @lights_init() - Module entry
+ * init_default_attributes() - Creates the character devices in /dev/lights/all/
+ *
+ * @return: Zero or a negative error code
  */
-static int __init lights_init (void)
-{
+static error_t init_default_attributes (
+    void
+){
+    error_t err;
+    struct lights_attribute attrs[] = {
+        LIGHTS_EFFECT_ATTR(NULL, io_read, io_write),
+        LIGHTS_COLOR_ATTR(NULL, io_read, io_write),
+        LIGHTS_SPEED_ATTR(NULL, io_read, io_write),
+        LIGHTS_DIRECTION_ATTR(NULL, io_read, io_write),
+        LIGHTS_UPDATE_ATTR(NULL, io_write),
+        LIGHTS_SYNC_ATTR(NULL, io_write),
+    };
+
+    err = lights_device_register(&lights_global.all);
+    if (err)
+        return err;
+
+    return lights_device_create_files(&lights_global.all, attrs, ARRAY_SIZE(attrs));
+}
+
+/**
+ * lights_destroy() - Destroys everything
+ */
+void lights_destroy (
+    void
+){
+    struct lights_interface *intf;
+    struct lights_interface *intf_safe;
+    dev_t dev_id = MKDEV(lights_global.major, 0);
+
+    lights_device_unregister(&lights_global.all);
+
+    if (!list_empty(&lights_global.interface.list)) {
+        LIGHTS_WARN("Not all interfaces have been unregistered.");
+        spin_lock(&lights_global.interface.lock);
+
+        list_for_each_entry_safe(intf, intf_safe, &lights_global.interface.list, siblings) {
+            list_del(&intf->siblings);
+            kref_put(&intf->refs, lights_interface_put);
+        }
+
+        spin_unlock(&lights_global.interface.lock);
+    }
+
+    // lights_unregister_all_devices();
+    unregister_chrdev_region(dev_id, LIGHTS_MAX_DEVICES);
+    class_destroy(lights_global.class);
+}
+
+error_t lights_init (
+    struct lights_state *state
+){
     int err;
     dev_t dev_id;
-
-    err = lights_read_effect(default_effect, strlen(default_effect), lights_available_effects, &lights_global.state.effect);
-    if (err < 0) {
-        LIGHTS_ERR("Invalid effect");
-        return err;
-    }
-
-    err = lights_read_color(default_color, strlen(default_color), &lights_global.state.color);
-    if (err < 0) {
-        LIGHTS_ERR("Invalid color");
-        return err;
-    }
-
-    err = lights_read_speed(default_speed, strlen(default_speed), &lights_global.state.speed);
-    if (err < 0) {
-        LIGHTS_ERR("Invalid speed");
-        return err;
-    }
-
-    err = lights_read_direction(default_direction, strlen(default_direction), &lights_global.state.direction);
-    if (err < 0) {
-        LIGHTS_ERR("Invalid direction");
-        return err;
-    }
 
     err = alloc_chrdev_region(&dev_id, LIGHTS_FIRST_MINOR, LIGHTS_MAX_DEVICES, "lights");
     if (err < 0) {
@@ -2429,6 +2422,7 @@ static int __init lights_init (void)
         return err;
     }
 
+    lights_global.state = *state;
     lights_global.major = MAJOR(dev_id);
     lights_global.class = class_create(THIS_MODULE, "lights");
 
@@ -2447,18 +2441,3 @@ static int __init lights_init (void)
 
     return err;
 }
-
-module_param(default_color,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_effect,      charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_speed,     charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_param(default_direction, charp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-module_init(lights_init);
-module_exit(lights_exit);
-
-MODULE_PARM_DESC(default_color,     "A hexadecimal color code, eg. #00FF00");
-MODULE_PARM_DESC(default_effect,      "The name of a color effect");
-MODULE_PARM_DESC(default_speed,     "The speed of the color cycle, 1-5");
-MODULE_PARM_DESC(default_direction, "The direction of rotation, 0 or 1");
-MODULE_AUTHOR("Owen Parry <twifty@zoho.com>");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RGB Lighting Class Interface");

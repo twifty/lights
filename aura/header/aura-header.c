@@ -26,7 +26,7 @@ static inline int aura_header_controller_put (
     struct aura_header_controller *ctrl
 );
 
-enum aura_header_mode {
+enum aura_mode {
     /* Lights modes */
     AURA_MODE_OFF                   = 0x00,
     AURA_MODE_STATIC                = 0x01,
@@ -53,94 +53,110 @@ enum aura_header_mode {
     INDEX_MODE_DIRECT               = INDEX_MODE_LAST + 2,
 };
 
-static struct lights_mode const aura_header_modes[] = {
-    LIGHTS_MODE(OFF),
-    LIGHTS_MODE(STATIC),
-    LIGHTS_MODE(BREATHING),
-    LIGHTS_MODE(FLASHING),
-    LIGHTS_MODE(CYCLE),
-    LIGHTS_MODE(RAINBOW),
+static struct lights_effect const aura_header_effects[] = {
+    LIGHTS_EFFECT_VALUE(AURA_MODE_OFF, OFF),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_STATIC, STATIC),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_BREATHING, BREATHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_FLASHING, FLASHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_CYCLE, CYCLE),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_RAINBOW, RAINBOW),
 
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CYCLE_BREATHING,       "cycle_breathing"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CHASE_FADE,            "chase_fade"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CYCLE_CHASE_FADE,      "cycle_chase_fade"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CHASE,                 "chase"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CYCLE_CHASE,           "cycle_chase"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CYCLE_WAVE,            "cycle_wave"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CYCLE_RANDOM_FLICKER,  "cycle_random_flicker"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CYCLE_BREATHING,       "cycle_breathing"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CHASE_FADE,            "chase_fade"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CYCLE_CHASE_FADE,      "cycle_chase_fade"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CHASE,                 "chase"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CYCLE_CHASE,           "cycle_chase"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CYCLE_WAVE,            "cycle_wave"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CYCLE_RANDOM_FLICKER,  "cycle_random_flicker"),
 
-    LIGHTS_CUSTOM_MODE(AURA_MODE_DIRECT,                "direct"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_DIRECT,                "direct"),
 
-    LIGHTS_MODE_LAST_ENTRY()
+    {}
 };
 
-static error_t get_header_mode (
-    struct lights_mode const *mode,
-    enum aura_header_mode *header_mode
+static inline error_t lights_effect_to_lights_effect (
+    struct lights_effect const *source,
+    struct lights_effect *target
 ){
-    if (lights_is_custom_mode(mode)) {
-        *header_mode = lights_custom_mode_id(mode);
-
-        if (*header_mode <= INDEX_MODE_LAST)
-            return 0;
-        if (*header_mode <= AURA_MODE_CYCLE_RANDOM_FLICKER)
-            return 0;
-        if (*header_mode <= AURA_MODE_DIRECT)
-            return 0;
-
-        return -ENODATA;
-    }
-
-    switch (lights_mode_id(mode)) {
-        case LIGHTS_MODE_OFF:
-            *header_mode = AURA_MODE_OFF;
-            return 0;
-        case LIGHTS_MODE_STATIC:
-            *header_mode = AURA_MODE_STATIC;
-            return 0;
-        case LIGHTS_MODE_BREATHING:
-            *header_mode = AURA_MODE_BREATHING;
-            return 0;
-        case LIGHTS_MODE_FLASHING:
-            *header_mode = AURA_MODE_FLASHING;
-            return 0;
-        case LIGHTS_MODE_CYCLE:
-            *header_mode = AURA_MODE_CYCLE;
-            return 0;
-        case LIGHTS_MODE_RAINBOW:
-            *header_mode = AURA_MODE_RAINBOW;
-            return 0;
+    source = lights_effect_find_by_id(aura_header_effects, source->id);
+    if (source) {
+        *target = *source;
+        return 0;
     }
 
     return -ENODATA;
 }
 
-static uint8_t get_aura_mode (
-    struct lights_mode const *mode
+static inline error_t lights_effect_to_aura_mode (
+    struct lights_effect const *effect,
+    enum aura_mode *header_mode
 ){
-    enum aura_header_mode aura_mode;
+    effect = lights_effect_find_by_id(aura_header_effects, effect->id);
+    if (effect) {
+        *header_mode = effect->value;
+        return 0;
+    }
 
-    get_header_mode(mode, &aura_mode);
-
-    return (uint8_t)aura_mode;
+    return -ENODATA;
+    // if (lights_is_custom_mode(mode)) {
+    //     *header_mode = lights_custom_mode_id(mode);
+    //
+    //     if (*header_mode <= INDEX_MODE_LAST)
+    //         return 0;
+    //     if (*header_mode <= AURA_MODE_CYCLE_RANDOM_FLICKER)
+    //         return 0;
+    //     if (*header_mode <= AURA_MODE_DIRECT)
+    //         return 0;
+    //
+    //     return -ENODATA;
+    // }
+    //
+    // switch (lights_mode_id(mode)) {
+    //     case LIGHTS_MODE_OFF:
+    //         *header_mode = AURA_MODE_OFF;
+    //         return 0;
+    //     case LIGHTS_MODE_STATIC:
+    //         *header_mode = AURA_MODE_STATIC;
+    //         return 0;
+    //     case LIGHTS_MODE_BREATHING:
+    //         *header_mode = AURA_MODE_BREATHING;
+    //         return 0;
+    //     case LIGHTS_MODE_FLASHING:
+    //         *header_mode = AURA_MODE_FLASHING;
+    //         return 0;
+    //     case LIGHTS_MODE_CYCLE:
+    //         *header_mode = AURA_MODE_CYCLE;
+    //         return 0;
+    //     case LIGHTS_MODE_RAINBOW:
+    //         *header_mode = AURA_MODE_RAINBOW;
+    //         return 0;
+    // }
+    //
+    // return -ENODATA;
 }
 
-static struct lights_mode const *get_lights_mode (
-    enum aura_header_mode header_mode
+static inline error_t aura_mode_to_lights_effect (
+    enum aura_mode header_mode,
+    struct lights_effect const **effect
 ){
-    if (header_mode == AURA_MODE_CYCLE_RANDOM_FLICKER) {
-        return &aura_header_modes[INDEX_MODE_CYCLE_RANDOM_FLICKER];
-    }
+    *effect = lights_effect_find_by_value(aura_header_effects, header_mode);
+    if (*effect)
+        return 0;
 
-    if (header_mode == AURA_MODE_DIRECT) {
-        return &aura_header_modes[INDEX_MODE_DIRECT];
-    }
-
-    if (header_mode >= 0 && header_mode <= INDEX_MODE_LAST) {
-        return &aura_header_modes[header_mode];
-    }
-
-    return NULL;
+    return -ENODATA;
+    // if (header_mode == AURA_MODE_CYCLE_RANDOM_FLICKER) {
+    //     return &aura_header_modes[INDEX_MODE_CYCLE_RANDOM_FLICKER];
+    // }
+    //
+    // if (header_mode == AURA_MODE_DIRECT) {
+    //     return &aura_header_modes[INDEX_MODE_DIRECT];
+    // }
+    //
+    // if (header_mode >= 0 && header_mode <= INDEX_MODE_LAST) {
+    //     return &aura_header_modes[header_mode];
+    // }
+    //
+    // return NULL;
 }
 
 enum HEADER_CONSTS {
@@ -234,26 +250,11 @@ struct packet_data {
         PACKET_SIZE );      \
 })
 
-/**
- * struct aura_effect - All configurable settings
- *
- * @color:     Applied color
- * @mode:      Applied mode
- * @speed:     Applied speed
- * @direction: Applied direction
- */
-struct aura_effect {
-    struct lights_color color;
-    struct lights_mode  mode;
-    uint8_t             speed;
-    uint8_t             direction;
-};
-
-#define effect_dump(_msg, _effect) ( \
+#define state_dump(_msg, _effect) ( \
     AURA_DBG( \
         "%s Mode: '%s', Color: 0x%06x, Speed: 0x%02x, Direction: %d", \
         (_msg), \
-        (_effect)->mode.name, \
+        (_effect)->effect.name, \
         (_effect)->color.value, \
         (_effect)->speed, \
         (_effect)->direction \
@@ -278,7 +279,7 @@ struct aura_header_zone {
     struct aura_header_controller   *ctrl;
 
     struct lights_dev               lights;
-    struct aura_effect              active, pending;
+    struct lights_state             active, pending;
     struct lights_adapter_msg       *msg_buffer;
     struct lights_thunk             thunk;
     spinlock_t                      lock;
@@ -348,16 +349,16 @@ static struct usb_device_id const device_ids[] = {
 
 static struct aura_header_container global;
 
-static struct aura_effect const effect_direct = {
-    .mode = aura_header_modes[INDEX_MODE_DIRECT]
+static struct lights_state const effect_direct = {
+    .effect = aura_header_effects[INDEX_MODE_DIRECT]
 };
 
-static struct aura_effect const effect_off = {
-    .mode = aura_header_modes[AURA_MODE_OFF]
+static struct lights_state const effect_off = {
+    .effect = aura_header_effects[AURA_MODE_OFF]
 };
 
-static struct aura_effect const effect_default = {
-    .mode = aura_header_modes[AURA_MODE_RAINBOW]
+static struct lights_state const effect_default = {
+    .effect = aura_header_effects[AURA_MODE_RAINBOW]
 };
 
 /**
@@ -557,7 +558,7 @@ uint8_t aura_speeds[] = {0xFF, 0xCC, 0x99, 0x66, 0x33, 0x00};
 static int transfer_add_effect (
     struct lights_adapter_msg *msg,
     struct aura_header_zone *zone,
-    struct aura_effect const *effect
+    struct lights_state const *state
 ){
     /*
         The speed given should be an int between 0 (slowest) and 5 (fastest)
@@ -568,12 +569,12 @@ static int transfer_add_effect (
     packet = packet_init(msg, PACKET_CMD_EFFECT);
 
     packet->data.effect.header       = zone->id;
-    packet->data.effect.mode         = get_aura_mode(&effect->mode);
-    packet->data.effect.red          = effect->color.r;
-    packet->data.effect.green        = effect->color.g;
-    packet->data.effect.blue         = effect->color.b;
-    packet->data.effect.direction    = effect->direction & 0x01;
-    packet->data.effect.speed        = aura_speeds[effect->speed];
+    packet->data.effect.mode         = state->effect.value;
+    packet->data.effect.red          = state->color.r;
+    packet->data.effect.green        = state->color.g;
+    packet->data.effect.blue         = state->color.b;
+    packet->data.effect.direction    = state->direction & 0x01;
+    packet->data.effect.speed        = aura_speeds[state->speed];
 
     return 1;
 }
@@ -740,7 +741,7 @@ static int transfer_add_sync (
     packet = packet_init(msg, PACKET_CMD_SYNC);
 
     packet->data.raw[0] = zone->id;
-    packet->data.raw[2] = get_aura_mode(&zone->pending.mode);
+    packet->data.raw[2] = zone->pending.effect.value;
     packet->data.raw[3] = byte;
 
     return 1;
@@ -762,8 +763,9 @@ static void aura_header_zone_update_callback (
     struct aura_header_zone *zone = zone_from_thunk(thunk);
     struct lights_adapter_msg const *iter = result;
     struct packet_data const *packet;
-    struct lights_mode const *mode;
-    struct aura_effect effect = {0};
+    struct lights_effect const *effect;
+    struct lights_state state = {0};
+    enum aura_mode mode;
     bool disable = false;
     int i;
 
@@ -791,38 +793,36 @@ static void aura_header_zone_update_callback (
     }
 
     if (PACKET_CMD_EFFECT == packet->command) {
-        mode = get_lights_mode(disable ? AURA_MODE_OFF : packet->data.effect.mode);
+        mode = disable ? AURA_MODE_OFF : packet->data.effect.mode;
+        if (aura_mode_to_lights_effect(mode, &effect)) {
+            AURA_ERR("Message contains an invalid mode: 0x%02x", mode);
+            return;
+        }
 
-        if (disable || AURA_MODE_DIRECT == get_aura_mode(mode)) {
-            AURA_DBG("Applying mode only: %s", mode->name);
+        if (disable || AURA_MODE_DIRECT == effect->value) {
+            AURA_DBG("Applying mode only: %s", effect->name);
 
             spin_lock(&zone->lock);
-            zone->active.mode = *mode;
+            zone->active.effect = *effect;
             spin_unlock(&zone->lock);
         } else {
-            mode = get_lights_mode(packet->data.effect.mode);
-            if (!mode) {
-                AURA_ERR("Message contains an invalid mode: 0x%02x", packet->data.effect.mode);
-                return;
-            }
-
             for (i = 0; i < ARRAY_SIZE(aura_speeds); i++) {
                 if (packet->data.effect.speed + 0x1A > aura_speeds[i]) {
-                    effect.speed = i;
+                    state.speed = i;
                     break;
                 }
             }
 
-            effect.mode      = *mode;
-            effect.direction = packet->data.effect.direction;
-            effect.color.r   = packet->data.effect.red;
-            effect.color.g   = packet->data.effect.green;
-            effect.color.b   = packet->data.effect.blue;
+            state.effect    = *effect;
+            state.direction = packet->data.effect.direction;
+            state.color.r   = packet->data.effect.red;
+            state.color.g   = packet->data.effect.green;
+            state.color.b   = packet->data.effect.blue;
 
-            effect_dump("Applying effect: ", &effect);
+            state_dump("Applying state: ", &state);
 
             spin_lock(&zone->lock);
-            zone->active = effect;
+            zone->active = state;
             spin_unlock(&zone->lock);
         }
     } else {
@@ -844,7 +844,7 @@ static void aura_header_zone_update_callback (
  */
 static error_t aura_header_zone_update (
     struct aura_header_zone *zone,
-    struct aura_effect const *effect,
+    struct lights_state const *state,
     struct lights_color const *colors
 ){
     bool update_colors = false;
@@ -855,11 +855,11 @@ static error_t aura_header_zone_update (
     if (IS_NULL(zone))
         return -EINVAL;
 
-    if (effect) {
-        effect_dump("aura_header_zone_update() ", effect);
+    if (state) {
+        state_dump("aura_header_zone_update() ", state);
 
         /* If pending.mode is off, send enable */
-        if (AURA_MODE_OFF == get_aura_mode(&zone->pending.mode)) {
+        if (AURA_MODE_OFF == zone->pending.effect.value) {
             count += transfer_add_enable(
                 &zone->msg_buffer[count],
                 zone,
@@ -873,7 +873,7 @@ static error_t aura_header_zone_update (
          * only updates the mode. When a direct mode is being applied, only
          * the mode should update (all other values remain as a cache).
          */
-        switch (get_aura_mode(&effect->mode)) {
+        switch (state->effect.value) {
             case AURA_MODE_OFF:
                 lights_adapter_msg_write_flags(&zone->msg_buffer[0], MSG_FLAG_DISABLE);
                 // Fall-through
@@ -890,7 +890,7 @@ static error_t aura_header_zone_update (
                 count += transfer_add_effect(
                     &zone->msg_buffer[count],
                     zone,
-                    effect
+                    state
                 );
                 break;
         }
@@ -922,9 +922,9 @@ static error_t aura_header_zone_update (
         err = -EINVAL;
     }
 
-    /* Update the pending effect */
-    if (!err && effect)
-        zone->pending = *effect;
+    /* Update the pending state */
+    if (!err && state)
+        zone->pending = *state;
 
     return err;
 }
@@ -946,8 +946,8 @@ static error_t aura_header_zone_write (
 ){
     struct aura_header_zone *zone = zone_from_thunk(thunk);
     struct lights_color const *colors = NULL;
-    struct aura_effect effect;
-    enum aura_header_mode header_mode;
+    struct lights_effect const *effect;
+    struct lights_state pending;
     uint8_t speed, direction;
     bool update_effect = false;
     bool update_colors = false;
@@ -958,11 +958,11 @@ static error_t aura_header_zone_write (
 
     spin_lock(&zone->lock);
 
-    effect = zone->pending;
+    pending = zone->pending;
 
     if (state->type & LIGHTS_TYPE_COLOR) {
-        if (!lights_color_equal(&state->color, &effect.color)) {
-            effect.color = state->color;
+        if (!lights_color_equal(&state->color, &pending.color)) {
+            pending.color = state->color;
             update_effect = true;
         }
     }
@@ -970,9 +970,9 @@ static error_t aura_header_zone_write (
     if (state->type & LIGHTS_TYPE_SPEED) {
         speed = min_t(uint8_t, state->speed, 5);
 
-        AURA_DBG("LIGHTS_TYPE_SPEED detected: new %x old %x", speed, effect.speed);
-        if (speed != effect.speed) {
-            effect.speed = speed;
+        AURA_DBG("LIGHTS_TYPE_SPEED detected: new %x old %x", speed, pending.speed);
+        if (speed != pending.speed) {
+            pending.speed = speed;
             update_effect = true;
         }
     }
@@ -980,30 +980,30 @@ static error_t aura_header_zone_write (
     if (state->type & LIGHTS_TYPE_DIRECTION) {
         direction = max_t(uint8_t, state->direction, 1);
 
-        if (direction != effect.direction) {
-            effect.direction = direction;
+        if (direction != pending.direction) {
+            pending.direction = direction;
             update_effect = true;
         }
     }
 
-    if (state->type & LIGHTS_TYPE_MODE) {
-        err = get_header_mode(&state->mode, &header_mode);
-        if (err) {
+    if (state->type & LIGHTS_TYPE_EFFECT) {
+        effect = lights_effect_find_by_id(aura_header_effects, state->effect.id);
+        if (!effect) {
+            err = -ENODATA;
             AURA_ERR("state.mode is invalid");
             goto exit;
         }
 
         /* Return early if mode isn't changing */
-        if (header_mode != get_aura_mode(&zone->pending.mode)) {
-            /* The given mode contains a pointer which may not be ours */
-            effect.mode = *get_lights_mode(header_mode);
+        if (effect->value != pending.effect.value) {
+            pending.effect = *effect;
             update_effect = true;
         }
     }
 
     if (state->type & LIGHTS_TYPE_LEDS) {
-        if (AURA_MODE_DIRECT != get_aura_mode(&effect.mode)) {
-            AURA_ERR("LED colors cannot be applied to mode '%s'", effect.mode.name);
+        if (AURA_MODE_DIRECT != pending.effect.value) {
+            AURA_ERR("LED colors cannot be applied to mode '%s'", pending.effect.name);
             err = -EPERM;
             goto exit;
         }
@@ -1022,7 +1022,7 @@ static error_t aura_header_zone_write (
     if (update_effect || update_colors) {
         err = aura_header_zone_update(
             zone,
-            update_effect ? &effect : NULL,
+            update_effect ? &pending : NULL,
             update_colors ? colors : NULL
         );
     } else {
@@ -1050,13 +1050,13 @@ static error_t aura_header_zone_read (
 ){
     struct aura_header_zone *zone = zone_from_thunk(thunk);
 
-    if (IS_NULL(thunk, state, zone) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+    if (IS_NULL(thunk, state, zone))
         return -EINVAL;
 
     spin_lock(&zone->lock);
 
-    if (state->type & LIGHTS_TYPE_MODE)
-        state->mode = zone->active.mode;
+    if (state->type & LIGHTS_TYPE_EFFECT)
+        state->effect = zone->active.effect;
 
     if (state->type & LIGHTS_TYPE_COLOR)
         state->color = zone->active.color;
@@ -1112,8 +1112,7 @@ static error_t aura_header_controller_update (
 ){
     struct lights_adapter_msg msg;
     struct lights_state state;
-    struct aura_effect effect;
-    enum aura_header_mode header_mode;
+    struct lights_state pending;
     error_t err = 0;
     int i;
 
@@ -1123,37 +1122,34 @@ static error_t aura_header_controller_update (
     lights_get_state(&state);
 
     for (i = 0; i < ctrl->zone_count && !err; i++) {
-        effect = ctrl->zones[i].pending;
+        pending = ctrl->zones[i].pending;
 
         if (state.type & LIGHTS_TYPE_COLOR)
-            effect.color = state.color;
+            pending.color = state.color;
 
         if (state.type & LIGHTS_TYPE_SPEED)
-            effect.speed = max_t(uint8_t, state.speed, 5);
+            pending.speed = max_t(uint8_t, state.speed, 5);
 
         if (state.type & LIGHTS_TYPE_DIRECTION)
-            effect.direction = max_t(uint8_t, state.direction, 1);
+            pending.direction = max_t(uint8_t, state.direction, 1);
 
-        if (state.type & LIGHTS_TYPE_MODE) {
-            err = get_header_mode(&state.mode, &header_mode);
+        if (state.type & LIGHTS_TYPE_EFFECT) {
+            // err = get_header_mode(&state.mode, &header_mode);
+            err = lights_effect_to_lights_effect(&state.effect, &pending.effect);
             if (err) {
-                AURA_ERR("state.mode is invalid");
+                AURA_ERR("state.effect is invalid");
                 return err;
             }
 
-            switch (header_mode) {
+            switch (pending.effect.value) {
                 case AURA_MODE_OFF:
                     /* Overwrite above changes */
-                    effect = effect_off;
+                    pending = effect_off;
                     break;
 
                 case AURA_MODE_DIRECT:
                     /* Overwrite above changes */
-                    effect = effect_direct;
-                    break;
-
-                default:
-                    effect.mode = state.mode;
+                    pending = effect_direct;
                     break;
             }
         }
@@ -1161,7 +1157,7 @@ static error_t aura_header_controller_update (
         transfer_add_effect(
             &msg,
             &ctrl->zones[i],
-            &effect
+            &pending
         );
 
         err = lights_adapter_xfer(&global.client, &msg, 1);
@@ -1171,8 +1167,8 @@ static error_t aura_header_controller_update (
         }
 
         if (!err) {
-            ctrl->zones[i].active = effect;
-            ctrl->zones[i].pending = effect;
+            ctrl->zones[i].active = pending;
+            ctrl->zones[i].pending = pending;
         }
     }
 
@@ -1207,8 +1203,8 @@ static error_t aura_header_zone_init (
     uint8_t index
 ){
     struct aura_header_zone *zone = &ctrl->zones[index];
-    struct lights_io_attribute const attrs[] = {
-        LIGHTS_MODE_ATTR(
+    struct lights_attribute const attrs[] = {
+        LIGHTS_EFFECT_ATTR(
             &zone->thunk,
             aura_header_zone_read,
             aura_header_zone_write
@@ -1267,14 +1263,14 @@ static error_t aura_header_zone_init (
 
     zone->lights.led_count = zone->led_count;
     zone->lights.name = zone->name;
-    zone->lights.caps = aura_header_modes;
+    zone->lights.caps = aura_header_effects;
 
     err = lights_device_register(&zone->lights);
     if (err)
         return err;
 
     /* Create the attributes */
-    return lights_create_files(&zone->lights, attrs, ARRAY_SIZE(attrs));
+    return lights_device_create_files(&zone->lights, attrs, ARRAY_SIZE(attrs));
 }
 
 /**
@@ -1584,6 +1580,8 @@ void aura_header_release (
         /* This should cause an on_disconnect event */
         lights_adapter_unregister(&global.client);
 
-    cancel_delayed_work_sync(&global.connect);
-    cancel_delayed_work_sync(&global.disconnect);
+    if (global.connect.work.func) {
+        cancel_delayed_work_sync(&global.connect);
+        cancel_delayed_work_sync(&global.disconnect);
+    }
 }

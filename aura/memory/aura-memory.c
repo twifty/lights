@@ -519,7 +519,7 @@ error_t aura_memory_probe (
 
     if (!err && found) {
         list_for_each_entry(ctrl, &aura_memory_controller_list, siblings) {
-            err = aura_controller_update(ctrl->aura, &state->mode, &state->color);
+            err = aura_controller_update(ctrl->aura, &state->effect, &state->color);
             if (err)
                 goto exit;
         }

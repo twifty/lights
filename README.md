@@ -43,12 +43,13 @@ Each module creates one or more directories within the systems `/dev/lights/`
 folder. Each of these directories maps to an RGB *zone* available on the
 hardware. Each zone may contain the files:
 + `color` A read/write hex string color code.
-+ `mode` A read/write string which specifies the zones effect.
++ `effect` A read/write string which specifies the zones effect.
 + `leds` A write only binary string. The enables setting of individual LEDs on
 ARGB peripherals.
 + `speed` A read/write numeric string (between 1 and 5).
 + `sync` A write only single byte value. (Future use).
 + `direction` A read/write value of 1 or 0. The actual value is dependent on fan/ring/glowy thing installation and current hemisphere.
++ `update` A write only method of updating multiple properties. This is intended for future programmatic use.
 
 Each zone also has a directory available in `/sys/class/lights/`. Here, device
 specific settings can be found. For example the `caps` file lists all the

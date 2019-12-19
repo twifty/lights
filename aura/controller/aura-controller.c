@@ -100,7 +100,7 @@ struct aura_zone_context {
  * @ctrl:           Public object
  * @callback_pool:  Reserve of aura_callback_context
  * @lock:           Context spin lock
- * @mode:           Active mode
+ * @effect:         Active effect
  * @zone_all:       One zone to rule them all
  * @zone_contexts:  Array of individual zones
  * @effect_colors:  Array of color objects for each zone
@@ -116,7 +116,7 @@ struct aura_controller_context {
     struct aura_controller          ctrl;
 
     struct mutex                    lock;
-    struct lights_mode const        *mode;
+    struct lights_effect const      *effect;
     struct aura_zone_context        *zone_all;
     struct aura_zone_context        *zone_contexts;
     struct aura_colors              *effect_colors;
@@ -142,25 +142,25 @@ struct aura_controller_context {
     container_of(ptr, struct aura_controller_context, ctrl) \
 )
 
-struct lights_mode aura_available_modes[] = {
-    LIGHTS_MODE(OFF),
-    LIGHTS_MODE(STATIC),
-    LIGHTS_MODE(BREATHING),
-    LIGHTS_MODE(FLASHING),
-    LIGHTS_MODE(CYCLE),
-    LIGHTS_MODE(RAINBOW),
+struct lights_effect aura_available_effects[] = {
+    LIGHTS_EFFECT_VALUE(AURA_MODE_OFF,       OFF),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_STATIC,    STATIC),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_BREATHING, BREATHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_FLASHING,  FLASHING),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_CYCLE,     CYCLE),
+    LIGHTS_EFFECT_VALUE(AURA_MODE_RAINBOW,   RAINBOW),
 
-    LIGHTS_CUSTOM_MODE(AURA_MODE_SPECTRUM_CYCLE_BREATHING,  "spectrum_cycle_breathing"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CHASE_FADE,                "chase_fade"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_SPECTRUM_CYCLE_CHASE_FADE, "spectrum_cycle_chase_fade"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CHASE,                     "chase"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_SPECTRUM_CYCLE_CHASE,      "spectrum_cycle_chase"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_SPECTRUM_CYCLE_WAVE,       "spectrum_cycle_wave"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_CHASE_RAINBOW_PULSE,       "chase_rainbow_pulse"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_RANDOM_FLICKER,            "random_flicker"),
-    LIGHTS_CUSTOM_MODE(AURA_MODE_DIRECT,                    "direct"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_SPECTRUM_CYCLE_BREATHING,  "spectrum_cycle_breathing"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CHASE_FADE,                "chase_fade"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_SPECTRUM_CYCLE_CHASE_FADE, "spectrum_cycle_chase_fade"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CHASE,                     "chase"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_SPECTRUM_CYCLE_CHASE,      "spectrum_cycle_chase"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_SPECTRUM_CYCLE_WAVE,       "spectrum_cycle_wave"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_CHASE_RAINBOW_PULSE,       "chase_rainbow_pulse"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_RANDOM_FLICKER,            "random_flicker"),
+    LIGHTS_EFFECT_CUSTOM(AURA_MODE_DIRECT,                    "direct"),
 
-    LIGHTS_MODE_LAST_ENTRY()
+    {}
 };
 
 /*
@@ -179,10 +179,10 @@ static const char *zone_names[] = {
  *
  * @return: The array of capabilities
  */
-struct lights_mode const *aura_controller_get_caps (
+struct lights_effect const *aura_controller_get_caps (
     void
 ){
-    return aura_available_modes;
+    return aura_available_effects;
 }
 
 /**
@@ -274,48 +274,58 @@ static error_t aura_controller_read_block (
     return err;
 }
 
+
 /**
- * lights_mode_to_aura_mode() - Converts global to local mode
+ * lights_effect_to_aura_mode() - Converts global to local mode
  *
- * @mode:      Global mode
+ * @effect:    Global effect
  * @aura_mode: Target buffer
  *
  * @return: Error code
  */
-static error_t lights_mode_to_aura_mode (
-    struct lights_mode const *mode,
-    enum aura_mode *aura_mode
+static inline error_t lights_effect_to_aura_mode (
+    struct lights_effect const *effect,
+    enum aura_mode *mode
 ){
-    if (lights_is_custom_mode(mode)) {
-        *aura_mode = lights_custom_mode_id(mode);
-        if (*aura_mode <= AURA_MODE_LAST || *aura_mode == AURA_MODE_DIRECT)
-            return 0;
+    struct lights_effect const *found;
 
-        return -ENODATA;
-    }
-
-    switch (lights_mode_id(mode)) {
-        case LIGHTS_MODE_OFF:
-            *aura_mode = AURA_MODE_OFF;
-            return 0;
-        case LIGHTS_MODE_STATIC:
-            *aura_mode = AURA_MODE_STATIC;
-            return 0;
-        case LIGHTS_MODE_BREATHING:
-            *aura_mode = AURA_MODE_BREATHING;
-            return 0;
-        case LIGHTS_MODE_FLASHING:
-            *aura_mode = AURA_MODE_FLASHING;
-            return 0;
-        case LIGHTS_MODE_CYCLE:
-            *aura_mode = AURA_MODE_CYCLE;
-            return 0;
-        case LIGHTS_MODE_RAINBOW:
-            *aura_mode = AURA_MODE_RAINBOW;
-            return 0;
+    found = lights_effect_find_by_id(aura_available_effects, effect->id);
+    if (found) {
+        *mode = found->value;
+        return 0;
     }
 
     return -ENODATA;
+    // if (lights_is_custom_mode(mode)) {
+    //     *aura_mode = lights_custom_mode_id(mode);
+    //     if (*aura_mode <= AURA_MODE_LAST || *aura_mode == AURA_MODE_DIRECT)
+    //         return 0;
+    //
+    //     return -ENODATA;
+    // }
+    //
+    // switch (lights_mode_id(mode)) {
+    //     case LIGHTS_MODE_OFF:
+    //         *aura_mode = AURA_MODE_OFF;
+    //         return 0;
+    //     case LIGHTS_MODE_STATIC:
+    //         *aura_mode = AURA_MODE_STATIC;
+    //         return 0;
+    //     case LIGHTS_MODE_BREATHING:
+    //         *aura_mode = AURA_MODE_BREATHING;
+    //         return 0;
+    //     case LIGHTS_MODE_FLASHING:
+    //         *aura_mode = AURA_MODE_FLASHING;
+    //         return 0;
+    //     case LIGHTS_MODE_CYCLE:
+    //         *aura_mode = AURA_MODE_CYCLE;
+    //         return 0;
+    //     case LIGHTS_MODE_RAINBOW:
+    //         *aura_mode = AURA_MODE_RAINBOW;
+    //         return 0;
+    // }
+    //
+    // return -ENODATA;
 }
 
 /**
@@ -325,19 +335,26 @@ static error_t lights_mode_to_aura_mode (
  *
  * @return: Global Mode
  */
-static struct lights_mode const *chipset_mode_to_lights_mode (
-    uint8_t id
+static inline error_t aura_mode_to_lights_effect (
+    enum aura_mode mode,
+    struct lights_effect const **effect
 ){
-    struct lights_mode const *p;
-    enum aura_mode aura_mode;
+    *effect = lights_effect_find_by_value(aura_available_effects, mode);
+    if (*effect)
+        return 0;
 
-    lights_for_each_mode(p, aura_available_modes) {
-        lights_mode_to_aura_mode(p, &aura_mode);
-        if (aura_mode == id)
-            return p;
-    }
+    return -ENODATA;
 
-    return NULL;
+    // struct lights_effect const *found;
+    // enum aura_mode aura_mode;
+    //
+    // lights_for_each_mode(p, aura_available_modes) {
+    //     lights_mode_to_aura_mode(p, &aura_mode);
+    //     if (aura_mode == id)
+    //         return p;
+    // }
+    //
+    // return NULL;
 }
 
 
@@ -618,20 +635,21 @@ struct aura_controller const *aura_controller_create (
         goto error;
     }
 
-    // Read the configured mode
+    // Read the configured effect
     err = aura_controller_read_byte(client, AURA_REG_MODE, &mode_id);
     if (err) {
-        AURA_ERR("Failed to read device mode");
+        AURA_ERR("Failed to read device effect");
         goto error;
     }
 
-    if (NULL == (context->mode = chipset_mode_to_lights_mode(mode_id))) {
-        AURA_ERR("Failed to translate device mode: 0x%02x", mode_id);
+    err = aura_mode_to_lights_effect(mode_id, &context->effect);
+    if (err) {
+        AURA_ERR("Failed to translate device effect: 0x%02x", mode_id);
         err = -EIO;
         goto error;
     }
 
-    // Detect if direct mode is applied
+    // Detect if direct effect is applied
     err = aura_controller_read_byte(client, AURA_REG_DIRECT, &context->is_direct);
     if (err) {
         AURA_ERR("Failed to read device is_direct");
@@ -648,10 +666,10 @@ struct aura_controller const *aura_controller_create (
             ? context->zone_contexts[i].direct
             : context->zone_contexts[i].effect;
         AURA_DBG(
-            "Detected zone: %s, color: 0x%06x, mode: %s",
+            "Detected zone: %s, color: 0x%06x, effect: %s",
             context->zone_contexts[i].zone.name,
             color->value,
-            context->mode->name
+            context->effect->name
         );
     }
 
@@ -791,43 +809,43 @@ static error_t aura_controller_color_write (
 }
 
 /**
- * aura_controller_mode_read() - Reads the mode of a single zone
+ * aura_controller_effect_read() - Reads the mode of a single zone
  *
  * @thunk: A struct aura_controller_context
  * @state: Buffer to read into
  *
  * @return: Error code
  */
-static error_t aura_controller_mode_read (
+static error_t aura_controller_effect_read (
     struct lights_thunk *thunk,
     struct lights_state *state
 ){
     struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
 
-    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_EFFECT))
         return -EINVAL;
 
-    return aura_controller_get_mode(&ctx->ctrl, &state->mode);
+    return aura_controller_get_effect(&ctx->ctrl, &state->effect);
 }
 
 /**
- * aura_controller_mode_write() - Writes a single zone mode
+ * aura_controller_effect_write() - Writes a single zone mode
  *
  * @thunk: A struct aura_controller_context
  * @state: Buffer to read from
  *
  * @return: Error code
  */
-static error_t aura_controller_mode_write (
+static error_t aura_controller_effect_write (
     struct lights_thunk *thunk,
     struct lights_state const *state
 ){
     struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
 
-    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_MODE))
+    if (IS_NULL(thunk, state, ctx) || IS_FALSE(state->type & LIGHTS_TYPE_EFFECT))
         return -EINVAL;
 
-    return aura_controller_set_mode(&ctx->ctrl, &state->mode);
+    return aura_controller_set_effect(&ctx->ctrl, &state->effect);
 }
 
 /**
@@ -866,22 +884,22 @@ static error_t aura_controller_update_write (
     struct lights_state const *state
 ){
     struct aura_controller_context *ctx = ctrl_from_thunk(thunk);
-    struct lights_mode const *mode = NULL;
+    struct lights_effect const *effect = NULL;
     struct lights_color const *color = NULL;
 
     if (IS_NULL(thunk, state, ctx))
         return -EINVAL;
 
-    if (state->type & LIGHTS_TYPE_MODE)
-        mode = &state->mode;
+    if (state->type & LIGHTS_TYPE_EFFECT)
+        effect = &state->effect;
 
     if (state->type & LIGHTS_TYPE_COLOR)
         color = &state->color;
 
-    if (mode) {
+    if (effect) {
         if (color)
-            return aura_controller_update(&ctx->ctrl, mode, color);
-        return aura_controller_set_mode(&ctx->ctrl, mode);
+            return aura_controller_update(&ctx->ctrl, effect, color);
+        return aura_controller_set_effect(&ctx->ctrl, effect);
     } else if (color) {
         return aura_controller_set_colors(&ctx->ctrl, color, 0);
     }
@@ -904,7 +922,7 @@ error_t aura_controller_register_ctrl (
     const char *name
 ){
     struct aura_controller_context *ctx = ctrl_from_public(ctrl);
-    struct lights_io_attribute attrs[4];
+    struct lights_attribute attrs[4];
     error_t err;
 
     if (IS_NULL(ctrl, lights))
@@ -918,10 +936,10 @@ error_t aura_controller_register_ctrl (
     if (err)
         return err;
 
-    attrs[0] = LIGHTS_MODE_ATTR(
+    attrs[0] = LIGHTS_EFFECT_ATTR(
         &ctx->thunk,
-        aura_controller_mode_read,
-        aura_controller_mode_write
+        aura_controller_effect_read,
+        aura_controller_effect_write
     );
     attrs[1] = LIGHTS_COLOR_ATTR(
         &ctx->zone_all->thunk,
@@ -937,7 +955,7 @@ error_t aura_controller_register_ctrl (
         aura_controller_update_write
     );
 
-    err = lights_create_files(lights, attrs, ARRAY_SIZE(attrs));
+    err = lights_device_create_files(lights, attrs, ARRAY_SIZE(attrs));
     if (!err)
         return 0;
 
@@ -963,7 +981,7 @@ error_t aura_controller_register_zone (
     const char *name
 ){
     struct aura_zone_context *zone = zone_from_public(_zone);
-    struct lights_io_attribute attrs[3];
+    struct lights_attribute attrs[3];
     error_t err;
 
     if (IS_NULL(_zone, lights, zone))
@@ -976,10 +994,10 @@ error_t aura_controller_register_zone (
     if (err)
         return err;
 
-    attrs[0] = LIGHTS_MODE_ATTR(
+    attrs[0] = LIGHTS_EFFECT_ATTR(
         &zone->context->thunk,
-        aura_controller_mode_read,
-        aura_controller_mode_write
+        aura_controller_effect_read,
+        aura_controller_effect_write
     );
     attrs[1] = LIGHTS_COLOR_ATTR(
         &zone->thunk,
@@ -991,7 +1009,7 @@ error_t aura_controller_register_zone (
         aura_controller_update_write
     );
 
-    err = lights_create_files(lights, attrs, ARRAY_SIZE(attrs));
+    err = lights_device_create_files(lights, attrs, ARRAY_SIZE(attrs));
     if (!err)
         return 0;
 
@@ -1317,20 +1335,20 @@ error_t aura_controller_set_colors (
 
 
 /**
- * aura_controller_set_zone_color_callback() - Async handler for mode setting
+ * aura_controller_set_zeffect_callback() - Async handler for mode setting
  *
  * @result: Messages sent to the device
  * @thunk:  Context of the call
  * @error:  A negative error number if async failed
  */
-static void aura_controller_set_mode_callback (
+static void aura_controller_set_effect_callback (
     struct lights_adapter_msg const * const result,
     struct lights_thunk *thunk,
     error_t error
 ){
     struct aura_controller_context *ctrl = ctrl_from_thunk(thunk);
     struct lights_adapter_msg const *mode_msg;
-    struct lights_mode const *lights_mode;
+    struct lights_effect const *lights_effect;
     enum aura_mode aura_mode;
 
     if (IS_NULL(result, thunk, ctrl))
@@ -1348,8 +1366,7 @@ static void aura_controller_set_mode_callback (
     }
 
     aura_mode = mode_msg->data.byte;
-    lights_mode = chipset_mode_to_lights_mode(aura_mode);
-    if (!lights_mode) {
+    if (aura_mode_to_lights_effect(aura_mode, &lights_effect)) {
         AURA_ERR("Message contains an invalid mode '0x%02x'", aura_mode);
         return;
     }
@@ -1359,14 +1376,14 @@ static void aura_controller_set_mode_callback (
     if (aura_mode == AURA_MODE_DIRECT) {
         ctrl->is_direct = true;
     } else {
-        ctrl->mode = lights_mode;
+        ctrl->effect = lights_effect;
     }
 
     mutex_unlock(&ctrl->lock);
 }
 
 /**
- * aura_controller_set_mode() - Applies a mode to all zones
+ * aura_controller_set_effect() - Applies a mode to all zones
  *
  * @ctrl:  Previously allocated with @aura_controller_create
  * @color: Mode to apply
@@ -1375,9 +1392,9 @@ static void aura_controller_set_mode_callback (
  *
  * NOTE: A single zone cannot have its own mode.
  */
-error_t aura_controller_set_mode (
+error_t aura_controller_set_effect (
     struct aura_controller const *ctrl,
-    struct lights_mode const *mode
+    struct lights_effect const *effect
 ){
     struct aura_controller_context *context = ctrl_from_public(ctrl);
     enum aura_mode aura_mode;
@@ -1386,12 +1403,12 @@ error_t aura_controller_set_mode (
 
     struct lights_adapter_msg msgs[4];
 
-    if (IS_NULL(ctrl, mode))
+    if (IS_NULL(ctrl, effect))
         return -EINVAL;
-    if (IS_NULL(context, context->mode))
+    if (IS_NULL(context, context->effect))
         return -EINVAL;
 
-    err = lights_mode_to_aura_mode(mode, &aura_mode);
+    err = lights_effect_to_aura_mode(effect, &aura_mode);
     if (err)
         return err;
 
@@ -1407,7 +1424,7 @@ error_t aura_controller_set_mode (
             msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_DIRECT);
             msgs[1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, 0x00);
         }
-        if (mode->id != context->mode->id) {
+        if (effect->id != context->effect->id) {
             msgs[count]     = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_MODE);
             msgs[count + 1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, aura_mode);
             count += 2;
@@ -1425,7 +1442,7 @@ error_t aura_controller_set_mode (
             msgs,
             count,
             &context->thunk,
-            aura_controller_set_mode_callback
+            aura_controller_set_effect_callback
         );
     }
 
@@ -1433,25 +1450,25 @@ error_t aura_controller_set_mode (
 }
 
 /**
- * aura_controller_get_mode() - Reads the mode of all zones
+ * aura_controller_get_effect() - Reads the mode of all zones
  *
- * @ctrl: Previously allocated with @aura_controller_create
- * @mode: Buffer to read into
+ * @ctrl:   Previously allocated with @aura_controller_create
+ * @effect: Buffer to read into
  *
  * @return: Zero or negative error number
  */
-error_t aura_controller_get_mode (
+error_t aura_controller_get_effect (
     struct aura_controller const *ctrl,
-    struct lights_mode *mode
+    struct lights_effect *effect
 ){
     struct aura_controller_context *ctx = ctrl_from_public(ctrl);
 
-    if (IS_NULL(ctrl, mode))
+    if (IS_NULL(ctrl, effect))
         return -EINVAL;
 
     mutex_lock(&ctx->lock);
 
-    *mode = *ctx->mode;
+    *effect = *ctx->effect;
 
     mutex_unlock(&ctx->lock);
 
@@ -1474,7 +1491,7 @@ static void aura_controller_update_callback (
     struct aura_controller_context *context = ctrl_from_thunk(thunk);
     struct lights_adapter_msg const *msg;
     struct aura_colors *target;
-    struct lights_mode const *lights_mode = NULL;
+    struct lights_effect const *lights_effect = NULL;
     enum aura_mode aura_mode;
     bool is_direct = false;
     int i;
@@ -1505,9 +1522,8 @@ static void aura_controller_update_callback (
                 aura_mode = msg->data.byte;
                 msg = msg->next;
 
-                lights_mode = chipset_mode_to_lights_mode(aura_mode);
-                if (!lights_mode) {
-                    AURA_ERR("Message contains an invalid mode '0x%02x'", aura_mode);
+                if (aura_mode_to_lights_effect(aura_mode, &lights_effect)) {
+                    AURA_ERR("Message contains an invalid effect '0x%02x'", aura_mode);
                     return;
                 }
             }
@@ -1525,8 +1541,8 @@ static void aura_controller_update_callback (
         for (i = 0; i <= context->zone_count; i++)
             lights_color_read_rbg(&target->zone[i], &msg->data.block[i * 3]);
 
-        if (lights_mode)
-            context->mode = lights_mode;
+        if (lights_effect)
+            context->effect = lights_effect;
 
         mutex_unlock(&context->lock);
     } else {
@@ -1537,15 +1553,15 @@ static void aura_controller_update_callback (
 /**
  * aura_controller_update() - Writes a mode and color to all zones
  *
- * @ctrl:  Previously allocated with aura_controller_create()
- * @mode:  New mode to apply
- * @color: New color to apply
+ * @ctrl:   Previously allocated with aura_controller_create()
+ * @effect: New mode to apply
+ * @color:  New color to apply
  *
  * @return: Error code
  */
 error_t aura_controller_update (
     struct aura_controller const *ctrl,
-    struct lights_mode const *mode,
+    struct lights_effect const *effect,
     struct lights_color const *color
 ){
     struct aura_controller_context *context = ctrl_from_public(ctrl);
@@ -1556,10 +1572,10 @@ error_t aura_controller_update (
     int i;
     error_t err;
 
-    if (IS_NULL(ctrl, mode, color))
+    if (IS_NULL(ctrl, effect, color))
         return -EINVAL;
 
-    err = lights_mode_to_aura_mode(mode, &aura_mode);
+    err = lights_effect_to_aura_mode(effect, &aura_mode);
     if (err)
         return err;
 
@@ -1577,7 +1593,7 @@ error_t aura_controller_update (
             msgs[0] = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_DIRECT);
             msgs[1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, 0x00);
         }
-        if (mode->id != context->mode->id) {
+        if (effect->id != context->effect->id) {
             msgs[count]     = ADAPTER_WRITE_WORD_DATA_SWAPPED(CMD_SET_ADDR, AURA_REG_MODE);
             msgs[count + 1] = ADAPTER_WRITE_BYTE_DATA(CMD_WRITE_BYTE, aura_mode);
             count += 2;

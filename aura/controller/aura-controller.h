@@ -42,7 +42,7 @@ struct aura_zone {
  *
  * @return: The array of capabilities
  */
-struct lights_mode const *aura_controller_get_caps (
+struct lights_effect const *aura_controller_get_caps (
     void
 );
 
@@ -193,45 +193,45 @@ static inline error_t aura_controller_set_color (
 };
 
 /**
- * aura_controller_set_mode() - Applies a mode to all zones
+ * aura_controller_set_effect() - Applies an effect to all zones
  *
- * @ctrl:  Previously allocated with aura_controller_create()
- * @color: Mode to apply
+ * @ctrl:   Previously allocated with aura_controller_create()
+ * @effect: Effect to apply
  *
  * @return: Zero or negative error number
  *
- * NOTE: A single zone cannot have its own mode.
+ * NOTE: A single zone cannot have its own effect.
  */
-error_t aura_controller_set_mode (
+error_t aura_controller_set_effect (
     struct aura_controller const *ctrl,
-    struct lights_mode const *mode
+    struct lights_effect const *effect
 );
 
 /**
- * aura_controller_get_mode() - Reads the mode of all zones
+ * aura_controller_get_effect() - Reads the effect of all zones
  *
- * @ctrl: Previously allocated with aura_controller_create()
- * @mode: Buffer to read into
+ * @ctrl:   Previously allocated with aura_controller_create()
+ * @effect: Buffer to read into
  *
  * @return: Zero or negative error number
  */
-error_t aura_controller_get_mode (
+error_t aura_controller_get_effect (
     struct aura_controller const *ctrl,
-    struct lights_mode *mode
+    struct lights_effect *effect
 );
 
 /**
- * aura_controller_update() - Writes a mode and color to all zones
+ * aura_controller_update() - Writes an effect and color to all zones
  *
- * @ctrl:  Previously allocated with aura_controller_create()
- * @mode:  New mode to apply
- * @color: New color to apply
+ * @ctrl:   Previously allocated with aura_controller_create()
+ * @effect: New effect to apply
+ * @color:  New color to apply
  *
  * @return: Error code
  */
 error_t aura_controller_update (
     struct aura_controller const *ctrl,
-    struct lights_mode const *mode,
+    struct lights_effect const *effect,
     struct lights_color const *color
 );
 

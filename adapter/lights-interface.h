@@ -47,7 +47,7 @@ enum lights_state_type {
     LIGHTS_TYPE_LEDS        = 0x10,
     LIGHTS_TYPE_CUSTOM      = 0x20,
     LIGHTS_TYPE_SYNC        = 0x40,
-    LIGHTS_TYPE_UPDATE      = 0x80,
+    LIGHTS_TYPE_UPDATE      = (LIGHTS_TYPE_EFFECT|LIGHTS_TYPE_COLOR|LIGHTS_TYPE_SPEED|LIGHTS_TYPE_DIRECTION),
 };
 
 /**
@@ -67,6 +67,8 @@ enum lights_state_type {
  *             effects run for the same duration. The helps keep those devices
  *             on different busses in sync with each other.
  * @type:      One or more type values.
+ * @flags:     User specified flags, may be helpful when using this struct as
+ *             a cache within a larger object.
  */
 struct lights_state {
     struct lights_effect    effect;
@@ -75,14 +77,53 @@ struct lights_state {
     uint8_t                 speed;
     uint8_t                 direction;
     uint8_t                 sync;
-    enum lights_state_type  type;
+    enum lights_state_type  type:16;
+    uint16_t                flags;
+};
+
+static inline struct lights_state lights_state_copy (
+    struct lights_state const *source,
+    struct lights_effect const *effects,
+    enum lights_state_type members
+){
+    struct lights_effect const *found;
+    struct lights_state state = {0};
+
+    members &= source->type;
+
+    if (members & LIGHTS_TYPE_EFFECT) {
+        found = lights_effect_find_by_id(effects, source->effect.id);
+        if (found)
+            state.effect = *found;
+        else
+            members &= ~(LIGHTS_TYPE_EFFECT);
+    }
+
+    if (members & LIGHTS_TYPE_COLOR)
+        state.color = source->color;
+
+    if (members & LIGHTS_TYPE_SPEED)
+        state.speed = source->speed;
+
+    if (members & LIGHTS_TYPE_DIRECTION)
+        state.direction = source->direction;
+
+    if (members & (LIGHTS_TYPE_LEDS|LIGHTS_TYPE_CUSTOM))
+        state.raw = source->raw;
+
+    if (members & LIGHTS_TYPE_SYNC)
+        state.sync = source->sync;
+
+    state.type = members;
+
+    return state;
 };
 
 typedef error_t (*lights_read_t)(struct lights_thunk *, struct lights_state *);
 typedef error_t (*lights_write_t)(struct lights_thunk *, struct lights_state const *);
 
 /**
- * struct lights_io_attribute - Specifies how a file is to be created
+ * struct lights_attribute - Specifies how a file is to be created
  *
  * @owner: The owning module (THIS_MODULE)
  * @attr:  Specifies the name and mode of a file
@@ -94,7 +135,7 @@ typedef error_t (*lights_write_t)(struct lights_thunk *, struct lights_state con
  * The @private_thunk member is passed to the callbacks. This allows
  * for extensions to associate arbitrary data with each file.
  */
-struct lights_io_attribute {
+struct lights_attribute {
     struct module           *owner;
     struct attribute        attr;
     enum lights_state_type  type;
@@ -123,17 +164,17 @@ struct lights_dev {
     const char                                  *name;
     uint16_t                                    led_count;
     struct lights_effect const                  *caps;
-    struct lights_io_attribute const * const    *attrs;
+    struct lights_attribute const * const    *attrs;
 };
 
 #define VERIFY_LIGHTS_TYPE(_type) ( \
     BUILD_BUG_ON_ZERO(((_type) & ((_type) - 1)) != 0) + \
-    BUILD_BUG_ON_ZERO((_type) > LIGHTS_TYPE_UPDATE) + \
+    BUILD_BUG_ON_ZERO((_type) > LIGHTS_TYPE_SYNC) + \
     (_type) \
 )
 
 #define LIGHTS_ATTR(_name, _mode, _type, _thunk, _read, _write)     \
-(struct lights_io_attribute) {                                      \
+(struct lights_attribute) {                                         \
     .owner = THIS_MODULE,                                           \
     .attr = {.name = _name,                                         \
              .mode = VERIFY_OCTAL_PERMISSIONS(_mode) },             \
@@ -144,7 +185,7 @@ struct lights_dev {
 }
 
 /**
- * Helper macros for creating lights_io_attribute instances.
+ * Helper macros for creating lights_attribute instances.
  */
 #define LIGHTS_ATTR_RO(_name, _type, _thunk, _read) ( \
     LIGHTS_ATTR(_name, 0444, _type, _thunk, _read, NULL) \
@@ -186,9 +227,15 @@ struct lights_dev {
     LIGHTS_ATTR_WO(LIGHTS_IO_SYNC, LIGHTS_TYPE_SYNC, _thunk, _write) \
 )
 
-#define LIGHTS_UPDATE_ATTR(_thunk, _write) ( \
-    LIGHTS_ATTR_WO(LIGHTS_IO_UPDATE, LIGHTS_TYPE_UPDATE, _thunk, _write) \
-)
+#define LIGHTS_UPDATE_ATTR(_thunk, _write) \
+(struct lights_attribute) {                                         \
+    .owner = THIS_MODULE,                                           \
+    .attr = {.name = LIGHTS_IO_UPDATE,                              \
+             .mode = VERIFY_OCTAL_PERMISSIONS(0200) },              \
+    .type          = LIGHTS_TYPE_UPDATE,                            \
+    .thunk         = _thunk,                                        \
+    .write         = _write,                                        \
+}
 
 /**
  * lights_device_register() - Registers a new lights device
@@ -214,7 +261,7 @@ void lights_device_unregister (
 );
 
 /**
- * lights_create_file() - Adds a file to the devices directory
+ * lights_device_create_file() - Adds a file to the devices directory
  *
  * @dev:  A previously registered device
  * @attr: A description of the file to create
@@ -224,13 +271,13 @@ void lights_device_unregister (
  * The given attribute may exist on the stack. Internally it is copied
  * so the user need not keep a reference to it.
  */
-error_t lights_create_file (
+error_t lights_device_create_file (
     struct lights_dev const *dev,
-    struct lights_io_attribute const *attr
+    struct lights_attribute const *attr
 );
 
 /**
- * lights_create_file() - Adds a file to the devices directory
+ * lights_device_create_file() - Adds a file to the devices directory
  *
  * @dev:   A previously registered device
  * @attrs: Array of descriptions of the files to create
@@ -241,25 +288,10 @@ error_t lights_create_file (
  * The given attribute may exist on the stack. Internally it is copied
  * so the user need not keep a reference to it.
  */
-error_t lights_create_files (
+error_t lights_device_create_files (
     struct lights_dev const *dev,
-    struct lights_io_attribute const * const attrs,
+    struct lights_attribute const * const attrs,
     size_t count
-);
-
-/**
- * lights_read_color() - Helper for reading color value strings
- *
- * @buffer: A kernel/user buffer containing the string
- * @len:    The length of the buffer
- * @color:  A color object to populate
- *
- * @Return: The number of characters read or a negative error number
- */
-ssize_t lights_read_color (
-    const char *buffer,
-    size_t len,
-    struct lights_color *color
 );
 
 /**
@@ -280,6 +312,21 @@ ssize_t lights_read_effect (
 );
 
 /**
+ * lights_read_color() - Helper for reading color value strings
+ *
+ * @buffer: A kernel/user buffer containing the string
+ * @len:    The length of the buffer
+ * @color:  A color object to populate
+ *
+ * @Return: The number of characters read or a negative error number
+ */
+ssize_t lights_read_color (
+    const char *buffer,
+    size_t len,
+    struct lights_color *color
+);
+
+/**
  * lights_read_speed() - Helper for reading speed value strings
  *
  * @buffer: A kernel/user buffer containing the string
@@ -292,6 +339,45 @@ ssize_t lights_read_speed (
     const char *buffer,
     size_t len,
     uint8_t *speed
+);
+
+/**
+ * lights_read_direction - Helper for reading direction value strings
+ *
+ * @buffer:    A kernel/user buffer containing the string
+ * @len:       The length of the buffer
+ * @direction: A value to populate with the direction
+ *
+ * @Return: The number of characters read or a negative error number
+ */
+ssize_t lights_read_direction (
+    const char *buffer,
+    size_t len,
+    uint8_t *direction
+);
+
+/**
+ * lights_read_sync - Helper for reading sync value strings
+ *
+ * @buffer: A kernel/user buffer containing the string
+ * @len:    The length of the buffer
+ * @sync:   A value to populate with the speed
+ *
+ * @Return: The number of characters read or a negative error number
+ */
+ssize_t lights_read_sync (
+    const char *buffer,
+    size_t len,
+    uint8_t *sync
+);
+
+/**
+ * lights_get_effects() - Returns a zero terminated array of global effects
+ *
+ * @return: Effect array
+ */
+struct lights_effect const *lights_get_effects (
+    void
 );
 
 /**

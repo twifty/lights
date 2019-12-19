@@ -2,6 +2,7 @@ CONFIG_MODULE_SIG=n
 MODULE_NAME = lights
 
 SRCS = \
+	lights-module.c \
 	lights-interface.c \
 	lights-adapter.c \
 	lib/async.c \

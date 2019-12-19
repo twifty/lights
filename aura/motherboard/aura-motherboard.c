@@ -399,7 +399,7 @@ error_t aura_motherboard_probe (
         aura_motherboard_release();
     } else {
         list_for_each_entry(ctrl, &aura_motherboard_ctrl_list, siblings)
-            aura_controller_update(ctrl->aura, &state->mode, &state->color);
+            aura_controller_update(ctrl->aura, &state->effect, &state->color);
     }
 
     return 0;
