@@ -363,8 +363,6 @@ static error_t aura_memory_controller_create (
         goto error;
     }
 
-    // snprintf(ctrl->name, sizeof(ctrl->name), "dimm-%d", ctrl->spd.slot);
-
     err = aura_controller_register_ctrl(ctrl->aura, &ctrl->lights, NULL);
     if (err) {
         AURA_DBG("aura_controller_register_ctrl() failed: %s", ERR_NAME(err));
@@ -382,7 +380,6 @@ error:
     return err;
 }
 
-
 /**
  * aura_memory_select_page() - Select page, based on ee1004 driver from Linux
  *
@@ -391,29 +388,36 @@ error:
  *
  * @return: Error code
  */
-static error_t aura_memory_set_page(struct i2c_adapter *smbus, uint8_t page) {
+static error_t aura_memory_set_page (
+    struct i2c_adapter *smbus,
+    uint8_t page
+){
     uint8_t data;
     error_t err;
-    switch(page) {
-        case 0:
-            err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
-            if (err && err != -ENXIO)
-                return err;
-            break;
-        case 1:
-            err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
-            if (err && err != -ENXIO)
-                return err;
-            break;
-        default:
-            return -EFAULT;
+
+    if (page > 1)
+        return -EINVAL;
+
+    err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
+
+    /* Some DIMMs will not ack the command */
+    if (err == -ENXIO) {
+        err = smbus_read_byte(smbus, 0x36, 0x00, &data);
+
+        /* Nack means page 1 is selected */
+        if (err == -ENXIO && page == 1) {
+            err = 0;
+        }
+
+        /* Ack means page 0 is selected, returned value meaningless */
+        else if (err >= 0 && page == 0) {
+            err = 0;
+        }
+
+        /* Anything else is a real error, bail out */
     }
-    err = smbus_read_byte(smbus, 0x36, 0x00, &data);
-    if(err == -ENXIO && page == 1)
-        return 0;
-    else if(err < 0)
-        return err;
-    return 0;
+
+    return err;
 }
 
 /**
@@ -517,6 +521,8 @@ static error_t aura_memory_probe_adapter (
         if (page == 1) {
             // AURA_DBG("Selecting page 0 for all DIMMs");
             err = aura_memory_set_page(smbus, 0);
+            if (err)
+                goto error;
         }
 
         // Check if they are known values
@@ -528,6 +534,8 @@ static error_t aura_memory_probe_adapter (
             }
 
             *(int*)found += 1;
+        } else {
+            AURA_DBG("Triplet not found: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
         }
     }
 

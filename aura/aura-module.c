@@ -12,10 +12,10 @@ static error_t aura_module_probe_all (
 ){
     probe_func_t *iter;
     probe_func_t funcs[] = {
-        aura_motherboard_probe,
+        // aura_motherboard_probe,
         aura_memory_probe,
-        aura_gpu_probe,
-        aura_header_probe,
+        // aura_gpu_probe,
+        // aura_header_probe,
         NULL
     };
     error_t err = 0;
