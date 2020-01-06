@@ -585,7 +585,7 @@ struct aura_controller const *aura_controller_create (
         return NULL;
     }
 
-    if (zone_count == 0 || zone_count > 8) {
+    if (zone_count == 0 || zone_count >= 8) {
         AURA_DBG("Invalid zone count (%d)", zone_count);
         return NULL;
     }
