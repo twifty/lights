@@ -382,6 +382,40 @@ error:
     return err;
 }
 
+
+/**
+ * aura_memory_select_page() - Select page, based on ee1004 driver from Linux
+ *
+ * @i2c_adapter: i2c adapter
+ * @page: page
+ *
+ * @return: Error code
+ */
+static error_t aura_memory_set_page(struct i2c_adapter *smbus, uint8_t page) {
+    uint8_t data;
+    error_t err;
+    switch(page) {
+        case 0:
+            err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
+            if (err && err != -ENXIO)
+                return err;
+            break;
+        case 1:
+            err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
+            if (err && err != -ENXIO)
+                return err;
+            break;
+        default:
+            return -EFAULT;
+    }
+    err = smbus_read_byte(smbus, 0x36, 0x00, &data);
+    if(err == -ENXIO && page == 1)
+        return 0;
+    else if(err < 0)
+        return err;
+    return 0;
+}
+
 /**
  * aura_memory_probe_adapter() - Reads all SPDs and creates a controller for each
  *
@@ -408,9 +442,9 @@ static error_t aura_memory_probe_adapter (
     for (count = 0, addr = 0x50; addr <= 0x5F; addr++) {
 
         // Select page 0 on all DIMMs
-        err = smbus_write_byte(smbus, 0x36, 0x00, 0x00);
+        err = aura_memory_set_page(smbus, 0);
         if (err) {
-            /* No pager on this bus indicates no DIMMs */
+            /* Page set error on this bus indicates no DIMMs */
             return 0;
         }
 
@@ -465,9 +499,9 @@ static error_t aura_memory_probe_adapter (
 
     for (i = 0; i < count; i++) {
         // Select page according to size
-        page = spd[i].size >= 0x100 ? 0x37 : 0x36;
-        // AURA_DBG("Selecting page %d for all DIMMs", page == 0x36 ? 0 : 1);
-        err = smbus_write_byte(smbus, page, 0x00, 0x00);
+        page = spd[i].size >= 0x100 ? 1 : 0;
+        // AURA_DBG("Selecting page %d for all DIMMs", page);
+        err = aura_memory_set_page(smbus, page);
         if (err)
             goto error;
 
@@ -480,9 +514,9 @@ static error_t aura_memory_probe_adapter (
         // AURA_DBG("Found RGB triplet: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
 
         // Return to page 1
-        if (page == 0x37) {
+        if (page == 1) {
             // AURA_DBG("Selecting page 0 for all DIMMs");
-            smbus_write_byte(smbus, 0x36, 0x00, 0x00);
+            err = aura_memory_set_page(smbus, 0);
         }
 
         // Check if they are known values
