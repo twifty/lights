@@ -59,6 +59,7 @@ static const uint8_t aura_memory_rgb_triplets[] = {
     0x07, 0x02, 0x01,  0x08, 0x02, 0x01,  0x09, 0x02, 0x01,  0x10, 0x02, 0x01,
     0x11, 0x02, 0x01,  0x12, 0x01, 0x01,  0x12, 0x02, 0x01,  0x10, 0x02, 0x01,
     0x04, 0x02, 0x01,  0x02, 0x02, 0x01,  0x05, 0x02, 0x01,  0x06, 0x02, 0x01,
+    0x01, 0x02, 0x01,
     0x00, };
 
 /*
@@ -162,6 +163,7 @@ static error_t smbus_read_byte (
  *
  * @return: Error code
  */
+__used
 static error_t smbus_write_byte (
     struct i2c_adapter *adapter,
     uint8_t addr,
@@ -199,14 +201,14 @@ struct aura_controller const *aura_controller_load (
     error_t err;
     int i;
 
-    // Attempt to write a word to 0x80F8
-    err = lights_adapter_xfer(&manager, &ADAPTER_WRITE_WORD_DATA_SWAPPED(0x00, 0x80F8), 1);
-    if (err) {
-        AURA_DBG("Slot manager is not available. Are the slots already registered?");
-        return NULL;
-    }
-
     for (i = 0; i < sizeof(aura_memory_available_addresses); i++) {
+        // Attempt to write a word to 0x80F8
+        err = lights_adapter_xfer(&manager, &ADAPTER_WRITE_WORD_DATA_SWAPPED(0x00, 0x80F8), 1);
+        if (err) {
+            AURA_DBG("Slot manager is not available. Are the slots already registered?");
+            return NULL;
+        }
+
         err = aura_memory_next_aura_address(spd);
         if (err) {
             AURA_ERR("Failed to allocated bus address: %s", ERR_NAME(err));
@@ -384,7 +386,7 @@ error:
  * aura_memory_select_page() - Select page, based on ee1004 driver from Linux
  *
  * @i2c_adapter: i2c adapter
- * @page: page
+ * @page:        page
  *
  * @return: Error code
  */
@@ -392,17 +394,20 @@ static error_t aura_memory_set_page (
     struct i2c_adapter *smbus,
     uint8_t page
 ){
-    uint8_t data;
+    struct lights_adapter_msg msg;
+    // uint8_t data;
     error_t err;
 
     if (page > 1)
         return -EINVAL;
 
-    err = smbus_write_byte(smbus, 0x36 + page, 0x00, 0x00);
+    msg = ADAPTER_WRITE_BYTE(0x00);
+    err = lights_adapter_xfer(&LIGHTS_I2C_CLIENT(smbus, 0x36 + page, 0), &msg, 1);
 
     /* Some DIMMs will not ack the command */
     if (err == -ENXIO) {
-        err = smbus_read_byte(smbus, 0x36, 0x00, &data);
+        msg = ADAPTER_READ_BYTE();
+        err = lights_adapter_xfer(&LIGHTS_I2C_CLIENT(smbus, 0x36, 0), &msg, 1);
 
         /* Nack means page 1 is selected */
         if (err == -ENXIO && page == 1) {
@@ -515,7 +520,7 @@ static error_t aura_memory_probe_adapter (
                 goto error;
         }
 
-        // AURA_DBG("Found RGB triplet: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
+        AURA_DBG("Found RGB triplet: 0x%02x 0x%02x 0x%02x", rgb[0], rgb[1], rgb[2]);
 
         // Return to page 1
         if (page == 1) {
